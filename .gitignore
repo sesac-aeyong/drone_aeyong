@@ -1,0 +1,14 @@
+__pycache__/
+_installers/
+instance_segmentation/
+lane_detection/
+paddle_ocr/
+pose_estimation/
+rpi_examples/
+speech_recognition/
+super_resolution/
+.hailo/
+
+*.pyc
+*.swp
+
