@@ -155,7 +155,9 @@ class BoTSORT: # 헝가리안 + IoU + (Track 내부의 고정 임베딩) 으로 
         매칭 안 된 detection은 새 track 생성
     최종적으로 track_id 기준의 “현재 프레임 트랙들” 반환
     """
-    def __init__(self, max_age=60, min_hits=3, use_reid=True, iou_threshold=0.2, reid_weight=2.0, reid_gate=0.3, high_thresh=0.8, low_thresh=0.5):
+    def __init__(self, max_age=60, min_hits=3, use_reid=True, 
+                 iou_threshold=0.2, reid_weight=2.0, reid_gate=0.3, 
+                 high_thresh=0.7, low_thresh=0.3):
         self.max_age = max_age
         self.min_hits = min_hits
         self.use_reid = use_reid
@@ -411,7 +413,7 @@ class LongTermBoTSORT: # 각 track의 초기 임베딩과 “갤러리에 이미
     """
     def __init__(self, bot_sort_tracker, embedding_threshold=0.1,       # ID 매칭용 threshold (feat vs gallery)
                  max_memory=1000, max_proto_per_id=5,                   # ID 하나당 갤러리에 저장할 임베딩 개수 
-                 conf_thresh=0.9, iou_no_overlap=0.1,                   # YOLO conf 0.9 이상 & IOU 겹침 0.1 이하일 때만 인정 
+                 conf_thresh=0.7, iou_no_overlap=0.1,                   # YOLO conf 이상 & IOU 겹침 이하일 때만 인정 
                  proto_min_dist=0.02, proto_max_dist=0.06,              # 기존과 0.02 이하로 차이나면 같아서 업뎃X, 0.06 이상 차이나면 다른 사람이라 업뎃X
                  ):
         self.tracker = bot_sort_tracker           # BoTSORT 인스턴스
