@@ -21,8 +21,7 @@ class Track:  # 이전(t-1) 프레임에서의 위치/임베딩으로 kalman 예
     - frame_conf     : match_frames >= min_match_frames인지 여부
     """
 
-    def __init__(self, last_bbox_tlbr, track_id, score, emb=None,
-                 max_kf_life=30, min_match_frames=3):
+    def __init__(self, last_bbox_tlbr, track_id, score, emb, max_kf_life, min_match_frames):
         # ---- 기본 메타 ----
         self.last_bbox_tlbr = np.array(last_bbox_tlbr, dtype=np.float32)  # 마지막 보정 결과
         self.kf_bbox_tlbr = self.last_bbox_tlbr.copy()                  # 첫 프레임 초기값 = last
@@ -189,17 +188,17 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
 
     최종 반환:
       - frame_conf == True (충분히 연속 매칭된 애들)
-      - kf_life <= 1 (이번 프레임 기준으로 너무 오래 사라지지 않은 애들)
+      - kf_life <= 10 (이번 프레임 기준으로 너무 오래 사라지지 않은 애들)
     """
 
     def __init__(self,
-                 max_kf_life=60,          # 관측 없이 예측만 허용할 최대 프레임 수
-                 min_match_frames=10,     # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
+                 max_kf_life=30,          # 관측 없이 예측만 허용할 최대 프레임 수
+                 min_match_frames=3,      # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
                  iou_gate=0.2,            # IoU 기준 최소값
                  reid_gate=0.3,           # ReID 거리 기준 최대값 (None 이면 사용 안 함)
                  reid_weight=2.0,         # cost에 들어가는 ReID 거리 가중치
-                 high_yolo_thresh=0.7,    # 새 Track 생성에 쓸 최소 YOLO score
-                 low_yolo_thresh=0.4):    # 기존 Track 연결에만 쓸 YOLO score 하한
+                 high_yolo_thresh=0.5,    # 새 Track 생성에 쓸 최소 YOLO score
+                 low_yolo_thresh=0.3):    # 기존 Track 연결에만 쓸 YOLO score 하한
 
         # Track 생성 시 넘겨줄 공통 하이퍼파라미터
         self.max_kf_life      = max_kf_life
@@ -326,8 +325,8 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
 
             # 여전히 살아있는 것 중에서:
             # - frame_conf == True (충분히 연속 매칭된 트랙)
-            # - kf_life <= 1 (지금 프레임 기준으로 너무 오래 사라지지 않은)
-            return [t for t in self.tracks if t.frame_conf and t.kf_life <= 1]
+            # - kf_life <= 10 (지금 프레임 기준으로 너무 오래 사라지지 않은)
+            return [t for t in self.tracks if t.frame_conf and t.kf_life <= 10]
 
         now_scores = now_dets[:, 4]
 
@@ -484,8 +483,8 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
         # 최종 반환
         # ==============================
         # “충분히 연속 매칭(frame_conf=True)” 이면서
-        # “이번 프레임 기준으로 너무 오래 사라지지 않은(kf_life <= 1)” Track만 화면에 보이게
-        return [t for t in self.tracks if t.frame_conf and t.kf_life <= 1]
+        # “이번 프레임 기준으로 너무 오래 사라지지 않은(kf_life <= 10)” Track만 화면에 보이게
+        return [t for t in self.tracks if t.frame_conf and t.kf_life <= 10]
 
 
 
