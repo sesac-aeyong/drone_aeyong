@@ -1,85 +1,131 @@
 ## 1. 📌 Pipeline Overview
 
-YOLOv8 감지 → ReID 임베딩 → BoTSORT 단기 추적 → LongTermBoTSORT 장기 ID 재사용
-- 목표: 같은 사람에게 **일관된 track_id + identity_id**를 유지하는 사람 추적 파이프라인
+YOLOv8 Detection → ReID Embedding → **BoTSORT 단기 추적(track_id)** → **LongTermBoTSORT 장기 ID(identity_id)**  
+- 최종 목표: **동일 인물에 대해 장시간 일관된 track_id + identity_id 부여**
+- BoTSORT는 프레임 간 단기 연결(칼만필터 + IoU + ReID)
+- LongTermBoTSORT는 과거 임베딩 갤러리를 이용해 **동일 인물 ID 재사용**
 
+
+---
 
 ## 2. 📦 Class Structure
 
-### Class Track
-"한 사람에 대한 Kalman + 단일(1회) 임베딩 저장용 구조체"
+### **Class Track**
+“사람 한 명”의 **로컬 상태 버퍼 + 칼만 필터**
 
-YOLO가 낸 bbox(tlbr)를 입력받아 Kalman state로 변환
-x = [cx, cy, w, h, vx, vy]
+**저장 역할**
+- `last_bbox_tlbr` : 마지막 보정된 실제 위치(t-1)
+- `kf_bbox_tlbr`   : t 기준 칼만 예측 위치(pred)
+- `last_emb` : 마지막으로 매칭된 프레임의 ReID 임베딩
+- `kf_life` : 관측 없이 예측만 한 프레임 수
+- `match_frames` : 연속 매칭된 프레임 수
+- `frame_conf` : `match_frames ≥ min_match_frames` 이면 True → 화면에 표시 가능
 
-매 프레임 Kalman predict → update
+**칼만 상태**
+- x = [cx, cy, w, h, vx, vy]^T  
+- predict() → 관측 없이 1프레임 예측  
+- update() → detection으로 보정  
 
-추적 상태 플래그:
-- time_since_update
-- hit_streak
-- confirmed
-
-유틸:
-- self.embeddings → 최초 등장 시 딱 1번 임베딩 저장
-(장기 갤러리에서 ID 재사용할 때만 의미 있음)
-- get_feature() → embeddings의 평균을 대표벡터로 반환
-- mark_missed() → max_age 이상 안보이면 track 삭제
-
-
-### Class BoTSORT
-"프레임 간 단기 연결 (Kalman + Hungarian + IoU + ReID)"
-
-입력: YOLO bbox + ReID embedding
-
-Matching Logic
-1. High-confidence detections만 먼저 매칭 (conf > high_thresh)
-2. Kalman filter로 모든 기존 track을 predict
-3. Yolo dets + ReID embs 거리 기반 cost matrix 생성 
-    - 많이 겹칠수록(IoU ↑), feature가 비슷할수록(거리 ↓) → 비용이 낮다(좋은 매칭)
-4. Hungarian algorithm으로 최소 비용 매칭
-    - 매칭됨 → update
-    - 매칭 안됨 →
-        - bbox가 high_conf면 새 track 생성
-        - low_conf면 2차 매칭 시도 (low_thresh ~ high_thresh)
+**주요 기능**
+- `predict()` : t-1 → t 위치 예측  
+- `update(now_bbox, score, now_emb)`  
+  - 칼만 보정  
+  - 최신 bbox/score/embedding 저장  
+  - match_frames 증가  
+- `mark_missed()`  
+  - `kf_life > max_kf_life` 면 삭제 대상
 
 
-### Class LongTermBoTSORT
-"갤러리 기반 장기 ID 재사용 & 갱신"
+---
 
-🔹 ID 재사용 결정 _assign_identity()
+### **Class BoTSORT**
+YOLO + ReID 기반 **단기 추적기 → track_id 관리**
 
-새 Track의 feature가 다음 조건이면 새 ID 발급:
-- feat is None
-- 갤러리가 비어 있음
-- 모든 갤러리 ID와의 거리 best_dist ≥ embedding_threshold → “누구와도 비슷하지 않음 = 새로운 사람”
+### 🔹 매 프레임 동작 요약
+1. **모든 Track.predict()**
+2. now_dets vs predicted_track 위치 + 임베딩 기반 cost matrix 구성
+3. **1단계: high confidence dets(≥ high_thresh) ↔ 모든 Track 매칭**
+4. **2단계: 남은 Track ↔ low confidence dets 매칭**
+5. 매칭된 Track.update()
+6. 매칭되지 않은 Track은 kf_life 증가 → 오래되면 제거
+7. 끝까지 매칭 안 된 high_yolo det → **새 Track 생성**
 
-그 외에는 가장 가까운 ID 재사용
-
-🔹 갤러리 프로토타입 저장 _should_add_proto()
-
-해당 track의 임베딩을 갤러리에 추가하는 조건: 
-- YOLO conf ≥ conf_thresh                   → 흐린 프레임(롤링셔터 등) 배제
-- IoU ≤ iou_no_overlap                      → 다른 사람과 붙어 있는 경우 배제
-- proto 개수 < max_proto_per_id              → 너무 많이 저장 금지
-- proto_min_dist < dist < proto_max_dist    → 너무 비슷(중복)하지 않고, 너무 다르지도 않을 때만 저장
+### 🔹 Cost 구성
+cost = (1 - IoU(pred_bbox, now_bbox))
++ reid_weight * L2(last_emb, now_emb) (둘 다 존재할 때만)
 
 
+
+### 🔹 출력
+다음 조건을 만족한 Track만 반환:
+- `frame_conf == True` (연속 매칭으로 안정적)
+- `kf_life <= 1` (이번 프레임 기준으로 거의 사라지지 않음)
+
+
+---
+
+### **Class LongTermBoTSORT**
+ReID embedding 기반 **장기 identity_id 관리 + 갤러리 메모리**
+
+단기 track_id는 프레임 중간에 바뀔 수 있으므로,  
+**identity_id를 통해 오랜 시간 같은 사람임을 보장**.
+
+### 🔹 주요 개념
+- **gallery:**  
+  `{ identity_id: { "gal_embs": [prototype embeddings...] } }`
+
+- 새 사람 등장 시:
+  - 갤러리에 유사한 embedding 없음 → 새 identity_id 발급
+- 이미 있던 사람이라면:
+  - 갤러리 벡터와의 cosine distance가 `threshold` 이내 → ID 재사용
+
+### 🔹 Prototype 저장 조건 (매우 Conservative)
+Track 임베딩을 갤러리에 저장하려면:
+
+- YOLO score ≥ `conf_thresh`
+- 다른 Track과 IoU ≤ `iou_no_overlap`  → occlusion 제거
+- 기존 prototype 수 < `max_gal_emb_per_id`
+- 기존 prototype과의 최소 거리:
+  - 너무 비슷하면(`min_dist < min_dist_thr`) → 중복이므로 불가
+  - 너무 다르면(`min_dist > max_dist_thr`) → 잘못된 ID일 확률 → 불가
+
+**→ 안전한 프로토타입만 갤러리에 저장**
+
+### 🔹 출력
+BoTSORT online_tracks에  
+`.identity_id` 필드를 추가한 Track 리스트 반환
+
+
+---
 
 ## 3. ▶️ 실행 방법
+```bash
 python main_xpu.py --display
 
+- YOLO + ReID 모델 로딩
+- LongTermBoTSORT가 track_id + identity_id 부여
+- 화면에 bbox + (track_id, identity_id) 표시
+```
 
+
+---
 
 ## 4. 🧪 Known Behaviors
 
 👍 잘 되는 상황
-- 사람이 1명만 있을 때 포즈 변경, 뒷모습, 얼굴 가려도 ID 유지
 
-⚠️ 잘 안 되는 상황
-- ?
+- 한 명일 때: 포즈 변화, 뒷모습, 부분 가림에서도 ID 유지
+- 두 명일 때: 겹친채 지나가도 ㄱㅊ
+- 오랜 시간 사라졌다가 재탐지되어도 갤러리를 이용해 identity_id 재사용됨
 
 
-❓️ 테스트 필요한 상황
-- 프레임 드랍(저 FPS) / 저해상도에서 ReID 성능 유지되는지(라베파 올렸을때 가정..)
-- 완전 다른 배경/조명 조건에서 같은 사람을 재탐지했을 때 ID 재사용이 되는지
-- 두 사람이 겹쳐 지나갈 때 ID가 뒤바뀌는지 여부
+⚠️ 취약한 상황
+- 매우 낮은 해상도 / 임베딩 품질 저하
+- 1명 나가고 다른 사람들어오면 기존 사람으로 인식? 
+- 프레임 드랍 발생 시 칼만 예측 불확실성 커짐
+
+
+❓ 테스트 필요
+- FPS가 매우 낮을 때 ReID 품질 유지?
+- 조명/배경 크게 바뀌어도 identity_id 재사용 잘 되는지
+- 겹침 후 분리되는 상황에서 swap 방지 능력
