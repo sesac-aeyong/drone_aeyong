@@ -1,36 +1,54 @@
 # tracker_botsort.py
+"""
+Track이 이전 프레임 상태 저장 
+→ YOLO/REID가 현재 프레임 상태(now) 뽑음 
+→ BoTSORT가 pred vs now 비교해서 track_id 유지/부여 
+→ LongTermBoTSORT가 각 Track의 last_emb를 갤러리 gal_emb들과 비교해서 identity_id 부여
+"""
 import numpy as np
 from collections import deque
 from scipy.optimize import linear_sum_assignment  # pip install scipy 필요
 
-class Track: # 이 사람은 어디고, 얼마 동안 잘 보였고, 어떤 모양/임베딩을 가진 애냐
+class Track:  # 이전(t-1) 프레임에서의 위치/임베딩으로 kalman 예측
     """
-    “사람 한 명”에 대한 로컬 상태
-    Kalman 필터로 위치/크기를 예측/보정
-    ReID 임베딩들을 저장해서 평균 feature 제공
-    time_since_update, hit_streak 등 수명 관리
+    “사람 한 명”에 대한 로컬 **상태** 버퍼.
+
+    - last_bbox_tlbr : 마지막 Kalman 보정값 (t-1 기준 “진짜 위치”)
+    - kf_bbox_tlbr   : t-1 상태로 t 프레임을 Kalman 예측한 bbox (pred)
+    - last_emb       : 마지막으로 매칭된 프레임의 임베딩 (t-1 기준 최신 emb)
+    - kf_life        : 보정 없이 예측만 한 프레임 수
+    - match_frames   : 연속 매칭된 프레임 수
+    - frame_conf     : match_frames >= min_match_frames인지 여부
     """
-    def __init__(self, tlbr, track_id, score, emb=None, max_age=30, min_hits=3):
-        self.tlbr = np.array(tlbr, dtype=np.float32)
+
+    def __init__(self, last_bbox_tlbr, track_id, score, emb=None,
+                 max_kf_life=30, min_match_frames=3):
+        # ---- 기본 메타 ----
+        self.last_bbox_tlbr = np.array(last_bbox_tlbr, dtype=np.float32)  # 마지막 보정 결과
+        self.kf_bbox_tlbr = self.last_bbox_tlbr.copy()                  # 첫 프레임 초기값 = last
+
         self.track_id = track_id
-        self.score = float(score)
-        self.max_age = max_age
-        self.min_hits = min_hits
+        self.score    = float(score)
 
-        self.time_since_update = 0
-        self.hit_streak = 0
-        self.history = deque(maxlen=max_age)
-        self.confirmed = False
+        # Kalman 수명 / “확실한 트랙” 판단 파라미터
+        # (보통 BoTSORT에서 생성할 때 넘겨줌)
+        self.max_kf_life      = max_kf_life        # kf_life > max_kf_life → 삭제
+        self.min_match_frames = min_match_frames   # match_frames ≥ 이 값 → frame_conf=True
 
-        # BoT-SORT style embedding gallery
-        self.embeddings = []
-        if emb is not None:
-            self.embeddings.append(emb)
+        # ---- 상태 관리 ----
+        self.kf_life      = 0                       # 관측 없이 예측만 한 프레임 수
+        self.match_frames = 0                       # 연속 매칭 프레임 수
+        self.history      = deque(maxlen=max_kf_life)
+        self.frame_conf   = False                   # 예전 confirmed
 
-        # === Kalman filter 상태 초기화 ===
+        # ---- ReID 임베딩 (이전 프레임까지의 최신 것 한 장) ----
+        self.last_emb = emb   # None 이거나 (D,) 벡터
+
+        # ---- Kalman Filter 초기화 ----
         # 상태벡터 x = [cx, cy, w, h, vx, vy]^T
-        cx, cy, w, h = self._tlbr_to_cxcywh(self.tlbr)
-        self.x = np.array([[cx], [cy], [w], [h], [0.0], [0.0]], dtype=np.float32)
+        cx, cy, w, h = self._bbox_tlbr_to_cxcywh(self.last_bbox_tlbr)
+        self.kf = np.array([[cx], [cy], [w], [h], [0.0], [0.0]],
+                           dtype=np.float32)
 
         # 상태전이 행렬 (dt=1 가정)
         self.F = np.array([
@@ -49,388 +67,470 @@ class Track: # 이 사람은 어디고, 얼마 동안 잘 보였고, 어떤 모�
         self.H[2, 2] = 1.0
         self.H[3, 3] = 1.0
 
-        # 공분산 / 잡음 (값은 대충 reasonable 수준)
-        self.P = np.eye(6, dtype=np.float32) * 10.0      # 초기 불확실성
-        self.Q = np.eye(6, dtype=np.float32) * 1e-2      # 시스템 잡음
-        self.R = np.eye(4, dtype=np.float32) * 1.0       # 관측 잡음
+        # 공분산 / 잡음
+        self.P = np.eye(6, dtype=np.float32) * 10.0   # 초기 불확실성
+        self.Q = np.eye(6, dtype=np.float32) * 1e-2   # 시스템 잡음
+        self.R = np.eye(4, dtype=np.float32) * 1.0    # 관측 잡음
 
-    # --- bbox <-> 상태 변환 유틸 ---
+    # ================== bbox <-> 상태 변환 유틸 ==================
 
     @staticmethod
-    def _tlbr_to_cxcywh(tlbr):
-        x1, y1, x2, y2 = tlbr
-        w = x2 - x1
-        h = y2 - y1
+    def _bbox_tlbr_to_cxcywh(bbox_tlbr):
+        x1, y1, x2, y2 = bbox_tlbr
+        w  = x2 - x1
+        h  = y2 - y1
         cx = x1 + 0.5 * w
         cy = y1 + 0.5 * h
         return float(cx), float(cy), float(w), float(h)
 
     @staticmethod
-    def _cxcywh_to_tlbr(cx, cy, w, h):
+    def _cxcywh_to_bbox_tlbr(cx, cy, w, h):
         x1 = cx - 0.5 * w
         y1 = cy - 0.5 * h
         x2 = cx + 0.5 * w
         y2 = cy + 0.5 * h
         return np.array([x1, y1, x2, y2], dtype=np.float32)
 
-    # --- Kalman predict / correct ---
+    # ================== Kalman predict / correct ==================
 
     def predict(self):
-        """다음 프레임 위치 예측 (measurement 없이)"""
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
+        """
+        1프레임 뒤 위치 예측 (관측 없이).
 
-        cx, cy, w, h = self.x[:4, 0]
-        self.tlbr = self._cxcywh_to_tlbr(cx, cy, w, h)
+        - kf        : F @ kf
+        - kf_bbox_tlbr 를 예측 결과로 갱신
+        - kf_life  += 1
+        - last_bbox_tlbr 는 '마지막 보정값'으로 그대로 유지
+        """
+        self.kf = self.F @ self.kf
+        self.P  = self.F @ self.P @ self.F.T + self.Q
 
-        # 업데이트 안 된 프레임 카운트 증가
-        self.time_since_update += 1
+        cx, cy, w, h = self.kf[:4, 0]
+        self.kf_bbox_tlbr = self._cxcywh_to_bbox_tlbr(cx, cy, w, h)
 
-    def _correct_kf(self, tlbr_meas):
-        """새 detection 박스로 Kalman 보정"""
-        cx, cy, w, h = self._tlbr_to_cxcywh(tlbr_meas)
+        # 관측 없이 예측만 했으므로 수명 +1
+        self.kf_life += 1
+
+    def _correct_kf(self, now_bbox_tlbr):
+        """
+        새 detection bbox(now_bbox_tlbr)로 Kalman 보정.
+
+        - kf / P 업데이트
+        - last_bbox_tlbr 를 '보정된 값'으로 갱신
+        - kf_bbox_tlbr 도 last_bbox_tlbr 로 동기화
+        - kf_life 를 0으로 리셋
+        """
+        cx, cy, w, h = self._bbox_tlbr_to_cxcywh(now_bbox_tlbr)
         z = np.array([[cx], [cy], [w], [h]], dtype=np.float32)
 
         # y = z - Hx
-        y = z - (self.H @ self.x)
+        y = z - (self.H @ self.kf)
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
 
         # 상태 / 공분산 업데이트
-        self.x = self.x + K @ y
+        self.kf = self.kf + K @ y
         I = np.eye(6, dtype=np.float32)
         self.P = (I - K @ self.H) @ self.P
 
-        # tlbr 갱신
-        cx, cy, w, h = self.x[:4, 0]
-        self.tlbr = self._cxcywh_to_tlbr(cx, cy, w, h)
+        # 보정된 bbox_tlbr → last_bbox_tlbr 로 저장
+        cx, cy, w, h = self.kf[:4, 0]
+        self.last_bbox_tlbr = self._cxcywh_to_bbox_tlbr(cx, cy, w, h)
+        self.kf_bbox_tlbr = self.last_bbox_tlbr.copy()
 
-        # 방금 업데이트 됐으니 0으로
-        self.time_since_update = 0
+        # 이제 막 관측으로 보정했으므로 0으로 리셋
+        self.kf_life = 0
 
-    # --- 원래 로직 수정 ---
+    # ================== 업데이트 & 수명 관리 ==================
 
-    def update(self, tlbr, score, emb=None):
-        """새 detection으로 트랙 갱신 (Kalman + ReID)"""
-        # 1) 칼만 보정으로 위치/크기 업데이트
-        self._correct_kf(tlbr)
+    def update(self, now_bbox_tlbr, score, now_emb=None):
+        """
+        BoTSORT에서 detection과 매칭된 뒤 호출.
 
-        # 2) 나머지 메타 정보
+        - Kalman 보정 (now_bbox_tlbr 사용)
+        - score / match_frames / history 갱신
+        - last_emb 를 이번 프레임 now_emb 로 교체
+        - match_frames ≥ min_match_frames → frame_conf = True
+        """
+        # 1) 칼만 보정 (last → now)
+        self._correct_kf(now_bbox_tlbr)
+
+        # 2) 메타 정보 갱신
         self.score = float(score)
-        self.hit_streak += 1
-        self.history.append(self.tlbr.copy())
+        self.match_frames += 1
+        self.history.append(self.last_bbox_tlbr.copy())
 
-        # 🔥 임베딩 갤러리 업데이트: → '처음 한 번만' 저장. 이후에는 그대로 둔다.
-        if emb is not None and not self.embeddings:
-            # 첫 프레임 또는 첫 유효 임베딩일 때만
-            self.embeddings.append(emb)
+        # 3) 최신 emb로 교체 (직전 프레임 emb는 덮어씀)
+        if now_emb is not None:
+            self.last_emb = now_emb
 
-        if self.hit_streak >= self.min_hits:
-            self.confirmed = True
+        # 4) 충분히 오래 안정적으로 매칭되었으면 “확신”
+        if self.match_frames >= self.min_match_frames:
+            self.frame_conf = True
 
     def mark_missed(self):
         """
         이번 프레임에 detection과 매칭 안 된 경우:
-        - time_since_update는 predict()에서 이미 +1 됨
-        - 여기서는 '삭제할지 여부'만 판단
+        - kf_life가 max_kf_life를 넘으면 True (삭제 대상)
         """
-        return self.time_since_update > self.max_age
-
-    def get_feature(self):
-        """갤러리 평균 임베딩 반환 (없으면 None)"""
-        if self.embeddings:
-            return np.mean(self.embeddings, axis=0)
-        return None
+        return self.kf_life > self.max_kf_life
 
 
-class BoTSORT: # 헝가리안 + IoU + (Track 내부의 고정 임베딩) 으로 프레임 간 트랙을 이어서 track_id 를 유지
+class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프레임 상태(YOLO now_bbox + REID now_emb)를 비교해서 **track_id**를 부여
     """
-    프레임 간 단기 MOT 추적기
-    매 프레임:
-        모든 track Kalman predict()
-        detector 출력 박스들과 IoU + ReID 기반 cost matrix 생성
-        Hungarian 매칭
-        매칭된 track은 Track.update()로 Kalman 보정/임베딩 업데이트
-        매칭 안 된 track은 age 증가 후 삭제
-        매칭 안 된 detection은 새 track 생성
-    최종적으로 track_id 기준의 “현재 프레임 트랙들” 반환
+    매 프레임(t)에서 수행 절차:
+      1) 모든 Track.predict() 호출
+      2) 예측된 kf_bbox_tlbr vs YOLO now_dets + ReID now_embs 로 cost matrix 생성
+      3) high_yolo_thresh 이상 now_dets ↔ 모든 Track 매칭 (Hungarian 후보 뽑고 gate로 거르기)
+      4) 남은 Track ↔ [low_yolo_thresh, high_yolo_thresh) 구간 now_dets 매칭 연결
+      5) 최종 매칭된 쌍에 대해 Track.update(now_bbox_tlbr, now_score, now_emb) 호출
+      6) 이번 프레임에서도 끝내 매칭 안 된 Track에 대해서는 Track.mark_missed() 호출
+      7) 끝까지 매칭 안 된 "high_yolo" now_dets → 새 Track으로 생성
+
+    최종 반환:
+      - frame_conf == True (충분히 연속 매칭된 애들)
+      - kf_life <= 1 (이번 프레임 기준으로 너무 오래 사라지지 않은 애들)
     """
-    def __init__(self, max_age=60, min_hits=3, use_reid=True, 
-                 iou_threshold=0.2, reid_weight=2.0, reid_gate=0.3, 
-                 high_thresh=0.7, low_thresh=0.3):
-        self.max_age = max_age
-        self.min_hits = min_hits
-        self.use_reid = use_reid
-        self.iou_threshold = float(iou_threshold)
+
+    def __init__(self,
+                 max_kf_life=60,          # 관측 없이 예측만 허용할 최대 프레임 수
+                 min_match_frames=10,     # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
+                 iou_gate=0.2,            # IoU 기준 최소값
+                 reid_gate=0.3,           # ReID 거리 기준 최대값 (None 이면 사용 안 함)
+                 reid_weight=2.0,         # cost에 들어가는 ReID 거리 가중치
+                 high_yolo_thresh=0.7,    # 새 Track 생성에 쓸 최소 YOLO score
+                 low_yolo_thresh=0.4):    # 기존 Track 연결에만 쓸 YOLO score 하한
+
+        # Track 생성 시 넘겨줄 공통 하이퍼파라미터
+        self.max_kf_life      = max_kf_life
+        self.min_match_frames = min_match_frames
+
+        # 매칭 cost / gate 파라미터
+        self.iou_gate    = float(iou_gate)
+        self.reid_gate   = reid_gate   # None 이면 ReID gate는 생략
         self.reid_weight = float(reid_weight)
-        self.reid_gate = reid_gate
-        self.high_thresh = high_thresh    # 새 트랙 생성용
-        self.low_thresh  = low_thresh     # 기존 트랙 연결용
 
-        self.tracks = []
-        self.next_id = 1
+        # ByteTrack 스타일: YOLO confidence 분리
+        self.high_yolo_thresh = float(high_yolo_thresh)
+        self.low_yolo_thresh  = float(low_yolo_thresh)
+
+        # 내부 상태
+        self.tracks = []   # Track 객체 리스트 (last_* + kf_* 들을 들고 있는 친구들)
+        self.next_id = 1   # 새 Track에 부여할 track_id
 
     # ----------------- 유틸 함수들 -----------------
 
-    def iou(self, bb_test, bb_gt):
-        """두 박스의 IoU 계산 (tlbr 포맷)"""
-        xx1 = np.maximum(bb_test[0], bb_gt[0])
-        yy1 = np.maximum(bb_test[1], bb_gt[1])
-        xx2 = np.minimum(bb_test[2], bb_gt[2])
-        yy2 = np.minimum(bb_test[3], bb_gt[3])
+    @staticmethod
+    def iou_bbox(bbox_a, bbox_b):
+        """두 bbox_tlbr (x1,y1,x2,y2) 사이의 IoU 계산."""
+        xx1 = np.maximum(bbox_a[0], bbox_b[0])
+        yy1 = np.maximum(bbox_a[1], bbox_b[1])
+        xx2 = np.minimum(bbox_a[2], bbox_b[2])
+        yy2 = np.minimum(bbox_a[3], bbox_b[3])
 
         w = np.maximum(0.0, xx2 - xx1)
         h = np.maximum(0.0, yy2 - yy1)
-        wh = w * h
+        inter = w * h
 
-        area_test = (bb_test[2] - bb_test[0]) * (bb_test[3] - bb_test[1])
-        area_gt = (bb_gt[2] - bb_gt[0]) * (bb_gt[3] - bb_gt[1])
+        if inter <= 0:
+            return 0.0
 
-        o = wh / (area_test + area_gt - wh + 1e-16)
-        return float(o)
+        area_a = (bbox_a[2] - bbox_a[0]) * (bbox_a[3] - bbox_a[1])
+        area_b = (bbox_b[2] - bbox_b[0]) * (bbox_b[3] - bbox_b[1])
+        union = area_a + area_b - inter + 1e-16
+        return float(inter / union)
 
-    def compute_cost_matrix(self, dets, embs):
+    def compute_cost_matrix(self, now_dets, now_embs):
         """
-        dets: (N,5) [x1,y1,x2,y2,score]
-        embs: list/array of N embeddings or None
+        현재 프레임 YOLO detection vs 이전 프레임 Track(pred 상태) 사이의 cost matrix 계산.
+
+        Parameters
+        ----------
+        now_dets : np.ndarray
+            shape (N,5), [x1, y1, x2, y2, score]
+        now_embs : list[np.ndarray] or None
+            길이 N, 각 detection의 현재 프레임 ReID 임베딩.
+
+        cost(d, t) = (1 - IoU(Track.kf_bbox_tlbr, now_bbox_d))
+                     + reid_weight * ||Track.last_emb - now_emb_d||
+                     (단, last_emb와 now_emb 둘 다 있을 때만 ReID 항 추가)
         """
-        N = len(dets)
+        N = len(now_dets)
         M = len(self.tracks)
         cost_matrix = np.zeros((N, M), dtype=np.float32)
 
-        for d in range(N):
-            det = dets[d]
-            for t in range(M):
-                track = self.tracks[t]
-                iou_score = self.iou(det[:4], track.tlbr)
+        for det_idx in range(N):
+            now_bbox = now_dets[det_idx, :4]
+            now_emb  = None if now_embs is None else now_embs[det_idx]
+
+            for track_idx in range(M):
+                last_track = self.tracks[track_idx]
+
+                # 1) 위치 기반 IoU cost (예측 위치(pred) vs 현재 bbox(now))
+                iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                 cost = 1.0 - iou_score
 
-                if self.use_reid and embs is not None and len(embs) > d:
-                    track_feat = track.get_feature()
-                    if track_feat is not None:
-                        dist = np.linalg.norm(track_feat - embs[d])
-                        cost += dist * self.reid_weight
+                # 2) ReID 기반 거리 cost (항상 ReID는 쓰되, 임베딩이 둘 다 있을 때만)
+                if last_track.last_emb is not None and now_emb is not None:
+                    dist = np.linalg.norm(last_track.last_emb - now_emb)
+                    cost += dist * self.reid_weight
 
-                cost_matrix[d, t] = cost
+                cost_matrix[det_idx, track_idx] = cost
 
         return cost_matrix
 
     # ----------------- 메인 update -----------------
 
-    def update(self, dets, embs=None):
+    def update(self, now_dets, now_embs=None):
         """
+        한 프레임(t)의 YOLO 결과(now_dets, now_embs)를 받아 BoTSORT 상태를 갱신.
+
         ByteTrack 스타일 2단계 매칭:
-          1단계: high_conf dets vs 모든 track  → 매칭 + 새 track 생성
-          2단계: 남은 track vs low_conf dets → 연결만, 새 track 생성은 금지
-        dets: [[x1,y1,x2,y2,score], ...]
-        embs: len(dets) 와 동일한 리스트 (또는 None)
+          1단계: high_yolo_thresh 이상 now_dets ↔ 모든 Track 매칭
+          2단계: 남은 Track ↔ [low_yolo_thresh ~ high_yolo_thresh) 구간 now_dets 매칭
+                 (여기서는 새 Track 생성 없이 연결만 수행)
+
+        Parameters
+        ----------
+        now_dets : np.ndarray
+            shape (N,5) 배열, 각 행은 [x1, y1, x2, y2, score]
+        now_embs : list(np.ndarray) 또는 None
+            길이 N 리스트, 각 detection에 대한 현재 프레임 ReID 임베딩.
         """
-        # 0) 기존 트랙 Kalman 예측
-        for trk in self.tracks:
-            trk.predict()
+        # 0) 이전 프레임 Track들을 t 프레임으로 Kalman 예측 (last → pred)
+        for last_track in self.tracks:
+            last_track.predict()
 
-        # numpy array normalize
-        if dets is None:
-            dets = np.zeros((0, 5), dtype=np.float32)
-        dets = np.asarray(dets, dtype=np.float32)
+        # now_dets shape 정규화 (0개 / 1개 예외 처리)
+        if now_dets is None:
+            now_dets = np.zeros((0, 5), dtype=np.float32)
+        now_dets = np.asarray(now_dets, dtype=np.float32)
 
-        if dets.ndim == 1:
-            if dets.size == 0:
-                dets = dets.reshape(0, 5)
+        if now_dets.ndim == 1:
+            if now_dets.size == 0:
+                now_dets = now_dets.reshape(0, 5)
             else:
-                dets = dets.reshape(1, -1)
+                now_dets = now_dets.reshape(1, -1)
 
-        num_dets = len(dets)
+        num_now_dets = len(now_dets)
 
-        # ReID 안 쓰면 embs도 무시
-        if not self.use_reid:
-            embs = None
+        # detection이 하나도 없는 프레임인 경우:
+        if num_now_dets == 0:
+            # Kalman 예측만 한 상태에서, 너무 오래 안 보인 Track들을 정리
+            removed_indices = []
+            for idx, last_track in enumerate(self.tracks):
+                if last_track.mark_missed():
+                    removed_indices.append(idx)
+            for idx in reversed(removed_indices):
+                self.tracks.pop(idx)
 
-        # detection이 하나도 없으면: age 증가 후 삭제만
-        if num_dets == 0:
-            removed = []
-            for i, trk in enumerate(self.tracks):
-                if trk.mark_missed():
-                    removed.append(i)
-            for i in reversed(removed):
-                self.tracks.pop(i)
-            return [t for t in self.tracks if t.confirmed and t.time_since_update <= 1]
+            # 여전히 살아있는 것 중에서:
+            # - frame_conf == True (충분히 연속 매칭된 트랙)
+            # - kf_life <= 1 (지금 프레임 기준으로 너무 오래 사라지지 않은)
+            return [t for t in self.tracks if t.frame_conf and t.kf_life <= 1]
 
-        scores = dets[:, 4]
+        now_scores = now_dets[:, 4]
 
-        # ★ ByteTrack: high / low 분리
-        high_inds = np.where(scores >= self.high_thresh)[0]
-        low_inds  = np.where((scores >= self.low_thresh) & (scores < self.high_thresh))[0]
-
-        # 편의를 위해 subset용 emb 배열 생성
-        def subset_emb(idx_list):
-            if embs is None:
-                return None
-            return [embs[i] for i in idx_list]
+        # ByteTrack: high / low confidence 분리
+        high_yolo_inds = np.where(now_scores >= self.high_yolo_thresh)[0]
+        low_yolo_inds  = np.where(
+            (now_scores >= self.low_yolo_thresh) &
+            (now_scores <  self.high_yolo_thresh)
+        )[0]
 
         # =========================================
-        # 1단계: high_conf dets vs 모든 tracks
+        # 1단계: high_yolo dets vs 모든 Track
         # =========================================
-        matches = []              # (global_det_idx, track_idx)
-        matched_det = set()
-        matched_trk = set()
+        matches = []          # (global_now_det_idx, track_idx)
+        matched_now_det = set()
+        matched_track   = set()
 
         if len(self.tracks) == 0:
-            # 트랙이 하나도 없으면 → high_conf dets로만 새 트랙 생성
-            unmatched_high = list(high_inds)
-            unmatched_tracks = []
+            # 아직 Track이 하나도 없으면 → high_yolo det 전체가 새 Track 후보
+            unmatched_high_yolo = list(high_yolo_inds)
+            unmatched_tracks    = []
         else:
             unmatched_tracks = list(range(len(self.tracks)))
 
-            if len(high_inds) > 0:
-                dets_high = dets[high_inds]
-                embs_high = subset_emb(high_inds)
+            if len(high_yolo_inds) > 0:
+                now_dets_high = now_dets[high_yolo_inds]
 
-                cost_high = self.compute_cost_matrix(dets_high, embs_high)
+                # subset용 now_embs 리스트 준비
+                now_embs_high = None
+                if now_embs is not None:
+                    now_embs_high = [now_embs[i] for i in high_yolo_inds]
+
+                cost_high = self.compute_cost_matrix(now_dets_high, now_embs_high)
                 row_ind, col_ind = linear_sum_assignment(cost_high)
 
                 for r, c in zip(row_ind, col_ind):
-                    global_d = high_inds[r]
-                    trk_idx  = c
+                    global_now_idx = high_yolo_inds[r]
+                    track_idx      = c
 
-                    # IoU 게이트
-                    iou_score = self.iou(dets[global_d, :4], self.tracks[trk_idx].tlbr)
-                    if iou_score < self.iou_threshold:
+                    now_bbox   = now_dets[global_now_idx, :4]
+                    last_track = self.tracks[track_idx]
+
+                    # IoU gate (pred vs now)
+                    iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
+                    if iou_score < self.iou_gate:
                         continue
 
-                    # ReID 게이트
-                    if (
-                        self.use_reid and embs is not None and
-                        self.reid_gate is not None and
-                        global_d < len(embs)
-                    ):
-                        track_feat = self.tracks[trk_idx].get_feature()
-                        if track_feat is not None:
-                            dist = np.linalg.norm(track_feat - embs[global_d])
+                    # ReID gate (옵션: reid_gate가 None이면 스킵)
+                    if self.reid_gate is not None and now_embs is not None:
+                        now_emb = now_embs[global_now_idx]
+                        if last_track.last_emb is not None and now_emb is not None:
+                            dist = np.linalg.norm(last_track.last_emb - now_emb)
                             if dist > self.reid_gate:
                                 continue
 
-                    matches.append((global_d, trk_idx))
-                    matched_det.add(global_d)
-                    matched_trk.add(trk_idx)
+                    matches.append((global_now_idx, track_idx))
+                    matched_now_det.add(global_now_idx)
+                    matched_track.add(track_idx)
 
-            # 1단계 이후 아직 안 붙은 high det / tracks 정리
-            unmatched_high = [d for d in high_inds if d not in matched_det]
-            unmatched_tracks = [t for t in unmatched_tracks if t not in matched_trk]
+            # 1단계 이후 아직 안 붙은 high_yolo det / Track 정리
+            unmatched_high_yolo = [d for d in high_yolo_inds if d not in matched_now_det]
+            unmatched_tracks    = [t for t in unmatched_tracks if t not in matched_track]
 
         # =========================================
-        # 2단계: 남은 tracks vs low_conf dets (연결만, 새 track 생성 X)
+        # 2단계: 남은 Track vs low_yolo dets (연결만, 새 Track 생성 X)
         # =========================================
-        if len(unmatched_tracks) > 0 and len(low_inds) > 0:
-            dets_low = dets[low_inds]
-            embs_low = subset_emb(low_inds)
+        if len(unmatched_tracks) > 0 and len(low_yolo_inds) > 0:
+            now_dets_low = now_dets[low_yolo_inds]
+            now_embs_low = None
+            if now_embs is not None:
+                now_embs_low = [now_embs[i] for i in low_yolo_inds]
 
-            # 전체 트랙 기준 cost 계산 후, 사용하고 싶은 트랙 column만 슬라이스
-            cost_low_full = self.compute_cost_matrix(dets_low, embs_low)
+            cost_low_full = self.compute_cost_matrix(now_dets_low, now_embs_low)
             # columns만 unmatched_tracks에 해당하는 것만 남김
-            cost_low = cost_low_full[:, unmatched_tracks]  # shape: (len(low_inds), len(unmatched_tracks))
+            cost_low = cost_low_full[:, unmatched_tracks]  # (len(low), len(unmatched_tracks))
 
             row2, col2 = linear_sum_assignment(cost_low)
 
             for r, c in zip(row2, col2):
-                global_d = low_inds[r]
-                trk_idx  = unmatched_tracks[c]
+                global_now_idx = low_yolo_inds[r]
+                track_idx      = unmatched_tracks[c]
 
-                # IoU 게이트
-                iou_score = self.iou(dets[global_d, :4], self.tracks[trk_idx].tlbr)
-                if iou_score < self.iou_threshold:
+                now_bbox   = now_dets[global_now_idx, :4]
+                last_track = self.tracks[track_idx]
+
+                # IoU gate (pred vs now)
+                iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
+                if iou_score < self.iou_gate:
                     continue
 
-                # ReID 게이트
-                if (
-                    self.use_reid and embs is not None and
-                    self.reid_gate is not None and
-                    global_d < len(embs)
-                ):
-                    track_feat = self.tracks[trk_idx].get_feature()
-                    if track_feat is not None:
-                        dist = np.linalg.norm(track_feat - embs[global_d])
+                # ReID gate
+                if self.reid_gate is not None and now_embs is not None:
+                    now_emb = now_embs[global_now_idx]
+                    if last_track.last_emb is not None and now_emb is not None:
+                        dist = np.linalg.norm(last_track.last_emb - now_emb)
                         if dist > self.reid_gate:
                             continue
 
-                matches.append((global_d, trk_idx))
-                matched_det.add(global_d)
-                matched_trk.add(trk_idx)
+                matches.append((global_now_idx, track_idx))
+                matched_now_det.add(global_now_idx)
+                matched_track.add(track_idx)
 
-        # 최종 unmatched track / det 정리
-        all_track_indices = set(range(len(self.tracks)))
-        unmatched_tracks_final = [t for t in all_track_indices if t not in matched_trk]
+        # 최종 unmatched Track / now_det 정리
+        all_track_indices      = set(range(len(self.tracks)))
+        unmatched_tracks_final = [t for t in all_track_indices if t not in matched_track]
 
-        # ★ 새 트랙은 "high_conf 중에서도 끝까지 매칭 안 된 것"만 사용
-        new_track_det_indices = unmatched_high
-
-        # ==============================
-        # 매칭된 트랙 업데이트
-        # ==============================
-        for d_idx, t_idx in matches:
-            emb_d = embs[d_idx] if (embs is not None and d_idx < len(embs)) else None
-            self.tracks[t_idx].update(dets[d_idx, :4], dets[d_idx, 4], emb_d)
+        # 새 Track 생성은 “high_yolo 중에서도 끝까지 매칭되지 않은” now_det만 사용
+        new_track_now_det_indices = unmatched_high_yolo
 
         # ==============================
-        # 매칭 안 된 트랙 age 증가 & 삭제
+        # 매칭된 Track 업데이트 (last ← now)
         # ==============================
-        removed_tracks = []
-        for t_idx in unmatched_tracks_final:
-            if self.tracks[t_idx].mark_missed():
-                removed_tracks.append(t_idx)
-        for t_idx in reversed(removed_tracks):
-            self.tracks.pop(t_idx)
+        for now_idx, track_idx in matches:
+            now_bbox  = now_dets[now_idx, :4]
+            now_score = now_dets[now_idx, 4]
+            now_emb   = None if now_embs is None else now_embs[now_idx]
+
+            self.tracks[track_idx].update(
+                now_bbox_tlbr=now_bbox,
+                score=now_score,
+                now_emb=now_emb,
+            )
 
         # ==============================
-        # high_conf 남은 detection → 새 트랙 생성
+        # 매칭 안 된 Track 정리 (Kalman 수명 기준)
         # ==============================
-        for d_idx in new_track_det_indices:
-            emb_d = embs[d_idx] if (embs is not None and d_idx < len(embs)) else None
+        removed_indices = []
+        for track_idx in unmatched_tracks_final:
+            if self.tracks[track_idx].mark_missed():
+                removed_indices.append(track_idx)
+        for idx in reversed(removed_indices):
+            self.tracks.pop(idx)
+
+        # ==============================
+        # high_yolo 남은 now_det → 새 Track 생성
+        # ==============================
+        for now_idx in new_track_now_det_indices:
+            now_bbox  = now_dets[now_idx, :4]
+            now_score = now_dets[now_idx, 4]
+            now_emb   = None if now_embs is None else now_embs[now_idx]
+
             new_track = Track(
-                dets[d_idx, :4],
-                self.next_id,
-                dets[d_idx, 4],
-                emb_d,
-                max_age=self.max_age,
-                min_hits=self.min_hits,
+                last_bbox_tlbr=now_bbox,
+                track_id=self.next_id,
+                score=now_score,
+                emb=now_emb,
+                max_kf_life=self.max_kf_life,
+                min_match_frames=self.min_match_frames,
             )
             self.next_id += 1
             self.tracks.append(new_track)
 
+        # ==============================
         # 최종 반환
-        return [t for t in self.tracks if t.confirmed and t.time_since_update <= 1]
+        # ==============================
+        # “충분히 연속 매칭(frame_conf=True)” 이면서
+        # “이번 프레임 기준으로 너무 오래 사라지지 않은(kf_life <= 1)” Track만 화면에 보이게
+        return [t for t in self.tracks if t.frame_conf and t.kf_life <= 1]
 
 
 
-class LongTermBoTSORT: # 각 track의 초기 임베딩과 “갤러리에 이미 저장된 고정 임베딩들” 을 비교해서... 비슷하면 ID 재사용 vs 다르면 새 ID 부여 후 갤러리 저장
+class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러리 gal_emb와 비교해서 **identity_id**를 부여
     """
-    BoTSORT 위에 얹는 “장기 ID 레이어” → 갤러리는 한 번 신중하게 저장 후 업데이트 금지
-    단기 트랙의 ReID feature를 갤러리와 비교해서:
-        같으면 기존 identity_id 재사용
-        다르면 새 identity_id 부여
-    최종적으로 track.identity_id를 단기 트랙에 붙여서 반환
-        main에서는 이 identity를 화면에 표시해서 “나갔다 와도, 겹쳐도 가능하면 같은 번호 유지”를 노리는 구조
+    각 Track.last_emb 를 identity 갤러리의 gal_emb들과 비교해서 identity_id 할당
+    갤러리는 한 번 신중하게 저장 후 업데이트 금지
     """
-    def __init__(self, bot_sort_tracker, embedding_threshold=0.1,       # ID 매칭용 threshold (feat vs gallery)
-                 max_memory=1000, max_proto_per_id=5,                   # ID 하나당 갤러리에 저장할 임베딩 개수 
-                 conf_thresh=0.7, iou_no_overlap=0.1,                   # YOLO conf 이상 & IOU 겹침 이하일 때만 인정 
-                 proto_min_dist=0.02, proto_max_dist=0.06,              # 기존과 0.02 이하로 차이나면 같아서 업뎃X, 0.06 이상 차이나면 다른 사람이라 업뎃X
-                 ):
-        self.tracker = bot_sort_tracker           # BoTSORT 인스턴스
-        self.embedding_threshold = embedding_threshold
+    def __init__(self, bot_sort_tracker,
+        gallery_match_threshold=0.4,   # Track.last_emb vs gal_emb 최소 코사인 거리 한계
+        max_memory=20,                 # 전체 identity 갯수 상한
+        max_gal_emb_per_id=5,          # ID 하나당 gal_emb 최대 개수
+        conf_thresh=0.7,               # YOLO score 이 이상일 때만 prototype 후보로 인정
+        iou_no_overlap=0.1,            # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
+        gal_update_min_dist=0.1,       # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
+        gal_update_max_dist=0.3,       # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
+    ):
+        # 단기 추적기 (BoTSORT 인스턴스)
+        self.tracker = bot_sort_tracker
+
+        # ID 매칭 기준 (Track.last_emb ↔ gallery.gal_embs)
+        self.gallery_match_threshold = gallery_match_threshold
+
+        # 전체 메모리 상한
         self.max_memory = max_memory
 
-        # identity 갤러리: identity_id -> "embs": [ .. ]
+        # identity 갤러리: identity_id -> {"gal_embs": [..]}
         self.gallery = {}
         self.next_identity = 1
-        self.max_proto_per_id = max_proto_per_id
+
+        # prototype(= gal_emb) 저장 정책
+        self.max_gal_emb_per_id = max_gal_emb_per_id
         self.conf_thresh = conf_thresh
         self.iou_no_overlap = iou_no_overlap
-        self.proto_min_dist = proto_min_dist
-        self.proto_max_dist = proto_max_dist
-        
+        self.gal_update_min_dist = gal_update_min_dist
+        self.gal_update_max_dist = gal_update_max_dist
+
+    # ================== 거리 / IoU 유틸 ==================
+
     @staticmethod
     def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """
+        코사인 거리 = 1 - cos(a, b)
+        a 또는 b가 None / 거의 0벡터이면 1.0 (매우 멀다)로 반환
+        """
         if a is None or b is None:
             return 1.0
         na = np.linalg.norm(a)
@@ -439,54 +539,22 @@ class LongTermBoTSORT: # 각 track의 초기 임베딩과 “갤러리에 이미
             return 1.0
         return 1.0 - float(np.dot(a, b) / (na * nb + 1e-6))
 
-    def _min_cos_dist_to_list(self, feat, emb_list):
-        """feat vs emb_list 중 최소 코사인 거리"""
-        if feat is None or not emb_list:
+    def _min_cos_dist_to_gal(self, cand_emb, gal_emb_list):
+        """
+        cand_emb vs gal_emb_list 중 최소 코사인 거리.
+        갤러리 비어있으면 1.0
+        """
+        if cand_emb is None or not gal_emb_list:
             return 1.0
-        dists = [self.cosine_distance(feat, e) for e in emb_list]
+        dists = [self.cosine_distance(cand_emb, g) for g in gal_emb_list]
         return min(dists)
 
-    def _assign_identity(self, feat, active_identity_ids):
-        """
-        feat와 가장 가까운 gallery ID를 찾고,
-        embedding_threshold 이하면 그 ID 재사용, 아니면 새 ID 생성.
-        active_identity_ids: 이번 프레임에 이미 쓰인 ID (한 프레임 내 중복 방지)
-        """
-        # 갤러리가 비어있거나 feat 없음 → 무조건 새 ID
-        if feat is None or len(self.gallery) == 0:
-            identity_id = self.next_identity
-            self.next_identity += 1
-            # ★ 여기서는 갤러리에 바로 넣지 않는다 (조건 체크는 나중에 따로)
-            self.gallery.setdefault(identity_id, {"embs": []})
-            return identity_id
-
-        best_id = None
-        best_dist = self.embedding_threshold
-
-        for mem_id, info in self.gallery.items():
-            if mem_id in active_identity_ids:
-                continue
-            emb_list = info.get("embs", [])
-            if not emb_list:
-                continue
-            dist = self._min_cos_dist_to_list(feat, emb_list)
-            print(f"[GALLERY] id={mem_id} dist={dist:.3f}")
-            if dist < best_dist:
-                best_dist = dist
-                best_id = mem_id
-
-        if best_id is None:
-            # 비슷한 ID 없음 → 새 ID 부여
-            identity_id = self.next_identity
-            self.next_identity += 1
-            self.gallery.setdefault(identity_id, {"embs": []})
-            return identity_id
-        else:
-            return best_id
-
-
     @staticmethod
-    def _iou(box_a, box_b):
+    def _iou_bbox(box_a, box_b):
+        """
+        두 bbox_tlbr (x1,y1,x2,y2) 사이의 IoU.
+        갤러리 프로토타입 후보 추가 시, 트랙끼리 얼마나 겹치는지(occlusion) 체크에 사용.
+        """
         x1 = max(box_a[0], box_b[0])
         y1 = max(box_a[1], box_b[1])
         x2 = min(box_a[2], box_b[2])
@@ -501,99 +569,190 @@ class LongTermBoTSORT: # 각 track의 초기 임베딩과 “갤러리에 이미
         area_b = max(0.0, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
         return float(inter / (area_a + area_b - inter + 1e-6))
 
-    def _should_add_proto(self, identity_id, track, feat, all_tracks):
+    # ================== ID 매칭 / prototype 추가 로직 ==================
+
+    def _assign_identity(self, last_emb, active_identity_ids):
         """
-        갤러리에 이 feat를 identity_id의 프로토타입으로 추가할지 여부 판단.
+        Track.last_emb 를 받아서,
+          - gallery 안의 gal_emb들과 비교 → 가장 가까운 identity_id 찾기
+          - 최소 거리 <= gallery_match_threshold 이면 그 ID 재사용
+          - 아니면 새 identity_id 발급
+
+        active_identity_ids:
+          - 이번 프레임에 이미 사용된 ID 리스트 (한 프레임 내 중복 방지용)
+        """
+        # 1) 갤러리가 비었거나, 이 트랙에 last_emb가 없으면 → 무조건 새 ID
+        if last_emb is None or len(self.gallery) == 0:
+            identity_id = self.next_identity
+            self.next_identity += 1
+            # 아직 gal_emb는 넣지 않음. 실제로 추가할지는 나중에 _should_add_gal_emb에서 판단
+            self.gallery.setdefault(identity_id, {"gal_embs": []})
+            ###print(f"[LT-ID] new identity={identity_id} (gallery empty or emb is None)")
+            return identity_id
+
+        best_id = None
+        best_dist = self.gallery_match_threshold  # 이 값보다 가까워야 매칭 인정
+
+        for mem_id, info in self.gallery.items():
+            if mem_id in active_identity_ids:
+                continue  # 한 프레임 안에서 ID 중복 사용 금지
+
+            gal_emb_list = info.get("gal_embs", [])
+            if not gal_emb_list:
+                continue
+
+            dist = self._min_cos_dist_to_gal(last_emb, gal_emb_list)
+            ###print(f"[LT-ID] candidate id={mem_id} dist={dist:.3f}")
+
+            if dist < best_dist:
+                best_dist = dist
+                best_id = mem_id
+
+        if best_id is None:
+            # 2) threshold 안에 들어온 갤러리 ID가 없으면 → 새 ID 발급
+            identity_id = self.next_identity
+            self.next_identity += 1
+            self.gallery.setdefault(identity_id, {"gal_embs": []})
+            ###print(f"[LT-ID] new identity={identity_id} (no id under thr {self.gallery_match_threshold})")
+            return identity_id
+        else:
+            # 3) 충분히 가까운 ID가 있으면 그 ID 재사용
+            ###print(f"[LT-ID] reuse identity={best_id} (min_dist={best_dist:.3f})")
+            return best_id
+
+    def _should_add_gal_emb(self, identity_id, track, cand_emb, all_tracks):
+        """
+        cand_emb 를 identity_id의 gal_emb로 추가할지 여부 판단.
 
         조건:
-          - feat None → 추가 X
-          - conf(=track.score) >= conf_thresh
-          - 다른 트랙과 IoU < iou_no_overlap (겹치지 않을 때만)
-          - 이미 max_proto_per_id 개수만큼 저장되어 있으면 더 이상 추가 X
-          - 기존 프로토타입과의 거리:
-              너무 비슷(proto_min_dist 미만) → 새로 안 넣음
-              너무 다름(proto_max_dist 초과) → 위험하니 안 넣음
+          - cand_emb(None) → 추가 X
+          - track.score >= conf_thresh (YOLO confidence 충분히 높을 때만)
+          - 다른 트랙들과 IoU(last_bbox_tlbr 기준)가 iou_no_overlap 이하 (겹치지 않을 때만)
+          - identity_id에 이미 max_gal_emb_per_id 개수만큼 저장되어 있으면 추가 X
+          - 기존 gal_emb들과의 거리:
+              * min_dist <  gal_update_min_dist  → 거의 같은 포즈/상태 → 굳이 추가 X
+              * min_dist >  gal_update_max_dist → 너무 다른 벡터 → 잘못된 매칭일 가능성 높음 → 추가 X
         """
-        if feat is None:
+        if cand_emb is None:
+            ###print(f"[LT-GAL] skip add (id={identity_id}): cand_emb is None")
             return False
 
         # YOLO confidence 체크
         if getattr(track, "score", 0.0) < self.conf_thresh:
+            ###print(f"[LT-GAL] skip add (id={identity_id}): low conf={track.score:.2f} < {self.conf_thresh}")
             return False
 
-        # 다른 사람과 겹치는지 체크
+        # 다른 Track들과 겹치는지 체크 (occlusion 가능성 제거)
         for other in all_tracks:
             if other is track:
                 continue
-            iou_val = self._iou(track.tlbr, other.tlbr)
+            iou_val = self._iou_bbox(track.last_bbox_tlbr, other.last_bbox_tlbr)
             if iou_val > self.iou_no_overlap:
                 # 꽤 겹친다고 판단 → occlusion 가능성 있음
+                ###print(f"[LT-GAL] skip add (id={identity_id}): IoU with track {other.track_id} = {iou_val:.3f} > {self.iou_no_overlap}")
                 return False
 
-        # 갤러리에 이미 있는 프로토타입 개수 확인
-        info = self.gallery.setdefault(identity_id, {"embs": []})
-        emb_list = info["embs"]
+        # 갤러리에 이미 있는 gal_emb 개수 확인
+        info = self.gallery.setdefault(identity_id, {"gal_embs": []})
+        gal_emb_list = info["gal_embs"]
 
-        if len(emb_list) >= self.max_proto_per_id:
-            # 이미 최대 개수만큼 저장됨 → 더 안 넣음 (업데이트 금지!)
+        if len(gal_emb_list) >= self.max_gal_emb_per_id:
+            # 이미 identity_id 당 허용한 최대 개수만큼 저장됨 → 더 안 넣음 (업데이트 금지!)
             return False
 
-        if not emb_list:
-            # 첫 프로토타입은 위 조건만 통과하면 허용
+        if not gal_emb_list:
+            # 첫 gal_emb는 위 조건만 통과하면 허용
+            ###print(f"[LT-GAL] allow add (id={identity_id}): first gal_emb")
             return True
 
-        # 기존 프로토타입들과의 거리 검사
-        min_dist = self._min_cos_dist_to_list(feat, emb_list)
-        if min_dist < self.proto_min_dist:
-            # 거의 같은 포즈/상태 → 굳이 추가 X
+        # 기존 gal_emb들과의 거리 검사
+        min_dist = self._min_cos_dist_to_gal(cand_emb, gal_emb_list)
+        if min_dist < self.gal_update_min_dist:
+            # 거의 같은 포즈/상태 → 새 벡터 추가할 필요 없음
+            ###print(f"[LT-GAL] skip add (id={identity_id}): too similar min_dist={min_dist:.3f} < {self.gal_update_min_dist}")
             return False
-        if min_dist > self.proto_max_dist:
-            # 너무 다른 벡터 → 잘못된 매칭 가능성 높음
+        if min_dist > self.gal_update_max_dist:
+            # 너무 다른 벡터 → 잘못된 매칭일 가능성 높음
+            ###print(f"[LT-GAL] skip add (id={identity_id}): too different min_dist={min_dist:.3f} > {self.gal_update_max_dist}")
             return False
 
+        ###print(f"[LT-GAL] allow add (id={identity_id}): min_dist={min_dist:.3f}")
         return True
 
-    def _add_proto(self, identity_id, feat):
-        info = self.gallery.setdefault(identity_id, {"embs": []})
-        info["embs"].append(feat.copy())
+    def _add_gal_emb(self, identity_id, cand_emb):
+        """
+        실제로 gallery[identity_id]["gal_embs"]에 cand_emb를 복사해서 추가.
+        """
+        info = self.gallery.setdefault(identity_id, {"gal_embs": []})
+        info["gal_embs"].append(cand_emb.copy())
+        ###print(f"[LT-GAL] added gal_emb for id={identity_id}: {len(info["gal_embs"])}/{self.max_gal_emb_per_id} stored")
 
+    # ================== 메인 update ==================
 
     def update(self, detections: np.ndarray, embeddings: list):
         """
-        detections: [N,5] (x1,y1,x2,y2,score)
-        embeddings: 길이 N, 각 요소는 L2 정규화된 임베딩 (또는 None)
-        반환: base BoTSORT의 Track 리스트 (각 track에 identity_id 속성 추가)
+        LongTermBoTSORT의 메인 엔트리.
+
+        Parameters
+        ----------
+        detections : np.ndarray
+            shape (N,5) = [x1, y1, x2, y2, score]
+        embeddings : list[np.ndarray] or None
+            길이 N, YOLO 각 bbox에 대응하는 현재 프레임 ReID 임베딩 (now_emb).
+            → 이 값은 BoTSORT.update(now_dets, now_embs) 에 그대로 넘겨짐.
+
+        반환값
+        ------
+        online_tracks : List[Track]
+            - BoTSORT가 t 프레임까지 추적을 마친 Track 리스트
+            - 각 Track 에는 .identity_id 가 추가됨
         """
-        # 1) BoTSORT로 단기 추적
+        # 1) BoTSORT 단기 추적으로 Track 리스트 갱신 (last_* 업데이트 포함)
         online_tracks = self.tracker.update(detections, embeddings)
 
-        # 이번 프레임에서 이미 사용된 identity_id들 (중복 방지)
+        # 이번 프레임에서 이미 사용된 identity_id들 (중복 방지용)
         active_identity_ids = set()
 
         for track in online_tracks:
-            feat = track.get_feature()
+            # 이 프레임 기준 “해당 사람의 대표 벡터”는 Track.last_emb (RepVGG 결과 한 장)
+            last_emb = track.last_emb
 
-            # 2) 항상 갤러리 vs feat로 ID 결정
-            identity_id = self._assign_identity(feat, active_identity_ids)
+            # 2) 항상 갤러리 vs last_emb 로 ID 결정
+            identity_id = self._assign_identity(last_emb, active_identity_ids)
 
-            # 3) "한 번만, 아주 신중하게" 갤러리에 추가할지 판단
-            if self._should_add_proto(identity_id, track, feat, online_tracks):
-                self._add_proto(identity_id, feat)
+            # 3) 갤러리(Prototype) 갱신 후보라면, 매우 신중하게 gal_emb로 추가
+            if self._should_add_gal_emb(identity_id, track, last_emb, online_tracks):
+                self._add_gal_emb(identity_id, last_emb)
 
             # 이번 프레임 중복 방지
             active_identity_ids.add(identity_id)
 
-            # track 객체에 표시용 ID 저장
+            # Track 객체에 표시용 ID 저장 → main에서 이걸 그려주면 됨
             track.identity_id = identity_id
+            
+            # 디버그용
+            info = self.gallery.get(identity_id, {"gal_embs": []})
+            gal_emb_list = info.get("gal_embs", [])
+            min_dist = self._min_cos_dist_to_gal(last_emb, gal_emb_list) if gal_emb_list else 1.0
+            print(
+                f"[LT-FRAME] track_id={track.track_id:3d} "
+                f"identity_id={identity_id:3d} "
+                f"conf={track.score:.2f} "
+                f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
+                f"min_cos_dist={min_dist:.3f}"
+            )
 
-        # 4) 메모리 관리 (선택 사항) – 이번 프레임에 쓰이지 않은 오래된 ID 일부 제거
+        # 4) 메모리 관리 – 이번 프레임에 쓰이지 않은 오래된 identity 일부 제거 (선택)
         if len(self.gallery) > self.max_memory:
             unused_ids = [iid for iid in self.gallery.keys()
                           if iid not in active_identity_ids]
-            for iid in unused_ids[: max(0, len(self.gallery) - self.max_memory)]:
+            # 너무 많이 넘친 만큼만 앞에서부터 제거
+            over = max(0, len(self.gallery) - self.max_memory)
+            for iid in unused_ids[:over]:
+                ###print(f"[LT-MEM] remove identity_id={iid} from gallery (memory limit)")
                 self.gallery.pop(iid, None)
 
-        # 디버그: 프레임 내 ID 중복 여부 확인
+        # 디버그: 한 프레임 안에서 identity 중복이 있으면 경고
         ids_this_frame = [getattr(t, "identity_id", t.track_id) for t in online_tracks]
         if len(ids_this_frame) != len(set(ids_this_frame)):
             print("[WARN] duplicate identity in this frame:", ids_this_frame)
