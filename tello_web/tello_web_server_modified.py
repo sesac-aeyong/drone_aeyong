@@ -383,6 +383,7 @@ class TelloWebServer:
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
+                print(frame.shape[:])
                 
                 if frame is not None:
                     error_count = 0  # 정상 프레임 수신시 에러 카운트 리셋
@@ -395,9 +396,9 @@ class TelloWebServer:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
                     # 첫 번째 프레임에서만 크기 출력
-                    if not hasattr(self, '_frame_size_logged'):
-                        print(f"📐 Frame size after resize: {frame.shape} (H={frame.shape[0]}, W={frame.shape[1]})")
-                        self._frame_size_logged = True
+                    # if not hasattr(self, '_frame_size_logged'):
+                    #     print(f"📐 Frame size after resize: {frame.shape} (H={frame.shape[0]}, W={frame.shape[1]})")
+                    #     self._frame_size_logged = True
                     
                     # 추론 실행 (bbox는 640x480 기준으로 반환됨)
                     detections, depth_map = self.process_frame_with_inference(frame)

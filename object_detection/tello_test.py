@@ -56,8 +56,8 @@ def connect_to_tello():
         #     print(ssid)
         for ssid in networks:
             if ssid.startswith('TELLO-'):
-                if ssid == 'TELLO-5FD7AB': # blue tello 
-                    continue
+#                if ssid == 'TELLO-5FD7AB': # blue tello 
+#                    continue
                 print('connecting to',ssid)
                 return connect_to_wifi(ssid)
         print('try again')
@@ -69,6 +69,7 @@ def main():
     disconnect_wifi()
     if not connect_to_tello():
         print('failed to connect to a tello.')
+        close()
         return
     tello = Tello()
     tello.connect()
