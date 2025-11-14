@@ -1,11 +1,11 @@
 {
   "visualization_params": {
-    "score_thres": 0.6,
+    "score_thres": 0.7,
     "max_boxes_to_draw": 500,
     "tracker": {
-      "track_thresh": 0.6,
+      "track_thresh": 0.7,
       "track_buffer": 30,
-      "match_thresh": 0.8,
+      "match_thresh": 0.7,
       "aspect_ratio_thresh": 2.0,
       "min_box_area": 500,
       "mot20": false
