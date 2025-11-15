@@ -1,3 +1,19 @@
+# tellomon
+웹캠 입력으로 테스트
+>python main.py test [fps, show]  
+
+fps: fps 콘솔 출력  
+show: 결과 이미지 출력  
+
+  
+
+
+
+
+
+
+
+
 # drone_aeyong
 sesac final project using dji tello drone
 

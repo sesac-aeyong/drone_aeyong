@@ -11,4 +11,4 @@ super_resolution/
 
 *.pyc
 *.swp
-
+*.log
