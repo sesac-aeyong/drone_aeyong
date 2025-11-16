@@ -56,8 +56,8 @@ def crop_safe(img, box):
 # ------------------------------
 def parse():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="0")
-    ap.add_argument("--display", action="store_true")
+    ap.add_argument("--source", default="0", help="int:webcam/tello:tello_udp/str:local_file")
+    ap.add_argument("--display", action="store_true", help="imshow")
     ap.add_argument("--det-backend", choices=["ultra", "ov"], default="ov")
     ap.add_argument("--device", default="GPU", help="OpenVINO device: CPU/GPU")
     ap.add_argument("--onnx", default=None, help="YOLO raw-head ONNX")
