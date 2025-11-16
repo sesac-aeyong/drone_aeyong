@@ -12,16 +12,16 @@ class Settings:
     """
     """Hailo"""
     vis_model: str = 'models/yolov11s.hef'
-    embed_model: str = 'models/repvgg_a0_person_reid_512.hef'
+    embed_model: str = 'models/repvgg_a0_person_reid_2048.hef'
     _emb_out_size: int = 2048 if '2048' in embed_model else 512 
     """Hmm. Perhaps there is a way to get this info"""
     depth_model: str = 'models/scdepthv3.hef'
 
     max_vis_detections: int = 30
     """vision model max detections"""
-    min_vis_score_threshold: float = 0.5
+    min_vis_score_threshold: float = 0.6
     """vision model confidence threshold"""
-    min_emb_confidence: float = 0.5
+    min_emb_confidence: float = min_vis_score_threshold
     """minimum vis_model confidence to update embedding"""
     max_emb_threads: int = 4
     """max number of threads to run embedding on"""
@@ -31,10 +31,10 @@ class Settings:
 
     ###WIP
     track_high_emb_confidence: float = min_emb_confidence
-    """high confidence threshold trackre expects to get embeddings of"""
+    """high confidence threshold tracker expects to get embeddings of"""
     track_low_emb_confidence: float = 0.4
-    """"""
-    track_new_threshold: float = 0.6
+    """this probably is not used"""
+    track_new_threshold: float = min_emb_confidence + 0.15
     """threshold for vision model confidence to create a new track"""
     track_buffer: int = 600
     """# of frames lost tracks will be kept"""

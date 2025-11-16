@@ -1,9 +1,11 @@
 # tellomon
 웹캠 입력으로 테스트
->python main.py test [fps, show]  
+>python main.py test [fps, show, yolo file.mp4]  
 
 fps: fps 콘솔 출력  
 show: 결과 이미지 출력  
+yolo: 파란색 yolo bbox. show 옵션이 있어야 작동.   
+file.mp4: .mp4 파일 사용, 없을 시 웹캠 사용.  
 
   
 

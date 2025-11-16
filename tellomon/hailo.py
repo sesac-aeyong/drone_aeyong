@@ -5,19 +5,14 @@ import time
 from types import SimpleNamespace
 from typing import Tuple
 import numpy as np
+import cv2
+
 from common.hailo_inference import HailoInfer
 from tracker.bot_sort import BoTSORT
 from settings import settings as S
-import cv2
+from yolo_tools import extract_detections
 
 ### TODO:: create and reuse buffer instead of creating lists every frame
-
-
-# def l2_norm(x, eps=1e-10):
-#     norm = np.linalg.norm(x)
-#     if norm < eps:
-#         return x
-#     return (x / norm).astype(np.float32)
 
 
 class Hailo():
@@ -31,6 +26,9 @@ class Hailo():
     def __init__(self):
         ct = time.time()
         print('loading Hailo models')
+        print('vis model:', S.vis_model)
+        print('dep model:', S.depth_model)
+        print('emb model:', S.embed_model)
         self.vis_m = HailoInfer(S.vis_model)
         self.dep_m = HailoInfer(S.depth_model)
         self.emb_m = HailoInfer(S.embed_model, output_type='FLOAT32')
@@ -78,8 +76,9 @@ class Hailo():
 
         # wait for both models to finish and enque
         vision = self.vis_q.get()
+        del vision[1:] # 0 is person, remove all other classes.
 
-        detections = _extract_detections(frame, vision)
+        detections = extract_detections(frame, vision)
 
         boxes = detections['detection_boxes']
         scores = detections['detection_scores']
@@ -87,7 +86,7 @@ class Hailo():
         classes = detections['detection_classes']
 
         # collect only person class in detections. Perhaps finetune only for person class?
-        persons = [i for i in range(num_detections) if classes[i] == 0] # class 0 is person on coco.txt 
+        # persons = [i for i in range(num_detections) if classes[i] == 0] # class 0 is person on coco.txt 
         # perhaps detect knife or weapons? 
 
         ### thread embedding part to do cv2 ops while waiting
@@ -98,7 +97,7 @@ class Hailo():
 
         with ThreadPoolExecutor(max_workers=S.max_emb_threads) as executor:
             futures = []
-            for i in persons:
+            for i in range(num_detections):
                 if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
                     continue
                 x1, y1, x2, y2 = self._safe_box(boxes[i])
@@ -156,7 +155,7 @@ class Hailo():
             
             rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
 
-        return rets, self.dep_q.get()
+        return rets, self.dep_q.get(), boxes
         
 
     def _submit_embedding(self, crop: np.ndarray, det_id:int):
@@ -169,7 +168,7 @@ class Hailo():
         expetcs str box in shape of y1, x1, y2, y1 
         returns bound safe x1, y1, x2, y2. 
         """
-        y1, x1, y2, x2 = map(int, box)
+        x1, y1, x2, y2 = map(int, box)
         y1 = max(0, y1)
         x1 = max(0, x1)
         y2 = min(S.frame_height, y2)
@@ -184,10 +183,6 @@ class Hailo():
 
     def __del__(self):
         self.close()
-
-
-
-
 
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:
@@ -208,7 +203,7 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
         return
     # embedding callback
     # L2 vectorize
-    # result = l2_norm(np.asarray(result).flatten())
+    # result = l2_norm(np.asarray(result).flatten()) ## BoT-SORT normalizes vector, skip.
     result = np.asarray(result).flatten()
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
@@ -227,77 +222,4 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
 
 
 
-
-
-### from object_detection_postprocessing.py
-
-
-
-def _denormalize_and_rm_pad(box: list, size: int, padding_length: int, input_height: int, input_width: int) -> list:
-    """
-    Denormalize bounding box coordinates and remove padding.
-
-    Args:
-        box (list): Normalized bounding box coordinates.
-        size (int): Size to scale the coordinates.
-        padding_length (int): Length of padding to remove.
-        input_height (int): Height of the input image.
-        input_width (int): Width of the input image.
-
-    Returns:
-        list: Denormalized bounding box coordinates with padding removed.
-    """
-    for i, x in enumerate(box):
-        box[i] = int(x * size)
-        if (input_width != size) and (i % 2 != 0):
-            box[i] -= padding_length
-        if (input_height != size) and (i % 2 == 0):
-            box[i] -= padding_length
-
-    return box
-
-
-def _extract_detections(image: np.ndarray, detections: list) -> dict:
-    """
-    Extract detections from the input data.
-
-    Args:
-        image (np.ndarray): Image to draw on.
-        detections (list): Raw detections from the model.
-
-    Returns:
-        dict: Filtered detection results containing 'detection_boxes', 'detection_classes', 'detection_scores', and 'num_detections'.
-    """
-
-    score_threshold = S.min_vis_score_threshold
-    max_detections = S.max_vis_detections
-
-    #values used for scaling coords and removing padding
-    img_height, img_width = image.shape[:2]
-    size = max(img_height, img_width)
-    padding_length = int(abs(img_height - img_width) / 2)
-
-    all_detections = []
-
-    for class_id, detection in enumerate(detections):
-        for det in detection:
-            bbox, score = det[:4], det[4]
-            if score >= score_threshold:
-                denorm_bbox = _denormalize_and_rm_pad(bbox, size, padding_length, img_height, img_width)
-                all_detections.append((score, class_id, denorm_bbox))
-
-    #sort all detections by score descending
-    all_detections.sort(reverse=True, key=lambda x: x[0])
-
-    #take top max_boxes
-    top_detections = all_detections[:max_detections]
-
-    scores, class_ids, boxes = zip(*top_detections) if top_detections else ([], [], [])
-
-    return {
-        'detection_boxes': list(boxes),
-        'detection_classes': list(class_ids),
-        'detection_scores': list(scores),
-        'num_detections': len(top_detections)
-    }
 
