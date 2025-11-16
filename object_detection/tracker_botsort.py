@@ -67,9 +67,9 @@ class Track:  # 이전(t-1) 프레임에서의 위치/임베딩으로 kalman 예
         self.H[3, 3] = 1.0
 
         # 공분산 / 잡음
-        self.P = np.eye(6, dtype=np.float32) * 10.0   # 초기 불확실성
-        self.Q = np.eye(6, dtype=np.float32) * 1e-2   # 시스템 잡음
-        self.R = np.eye(4, dtype=np.float32) * 1.0    # 관측 잡음
+        self.P = np.eye(6, dtype=np.float32) * 10.0   # 초기 불확실성: 작을수록 예측값 신뢰
+        self.Q = np.eye(6, dtype=np.float32) * 0.1    # 시스템 잡음: 작을수록 등속도 가정 신뢰   → 크게: 운동이 불규칙하니까 관측을 더 따라가라
+        self.R = np.eye(4, dtype=np.float32) * 1.0    # 관측 잡음: 작을수록 yolo 신뢰         → 크게: 관측을 믿을수없으니 예측을 더 따라가라
 
     # ================== bbox <-> 상태 변환 유틸 ==================
 
@@ -191,8 +191,8 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                  max_kf_life=30,          # 관측 없이 예측만 허용할 최대 프레임 수
                  min_match_frames=3,      # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
                  iou_gate=0.1,            # IoU 기준 최소값
-                 l2_gate=0.3,           # ReID 거리 기준 최대값 (None 이면 사용 안 함)
-                 l2_weight=2.0,         # cost에 들어가는 ReID 거리 가중치
+                 l2_gate=1.0,             # ReID 거리 기준 최대값 (None 이면 사용 안 함)
+                 l2_weight=2.0,           # cost에 들어가는 ReID 거리 가중치
                  high_yolo_thresh=0.5,    # 새 Track 생성에 쓸 최소 YOLO score
                  low_yolo_thresh=0.3):    # 기존 Track 연결에만 쓸 YOLO score 하한
 
@@ -490,13 +490,13 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
     갤러리는 한 번 신중하게 저장 후 업데이트 금지
     """
     def __init__(self, bot_sort_tracker,
-        gal_match_cos_dist=0.3,   # Track.last_emb vs gal_emb 최소 코사인 거리 한계
+        gal_match_cos_dist=0.4,        # 기존 ID 재사용 한계 
         max_memory=20,                 # 전체 identity 갯수 상한
-        max_gal_emb_per_id=5,          # ID 하나당 gal_emb 최대 개수
+        max_gal_emb_per_id=10,         # ID 하나당 gal_emb 최대 개수
         conf_thresh=0.7,               # YOLO score 이 이상일 때만 prototype 후보로 인정
         iou_no_overlap=0.1,            # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
-        gal_update_min_cos_dist=0.15,      # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
-        gal_update_max_cos_dist=0.3,       # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
+        gal_update_min_cos_dist=0.15,  # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
+        gal_update_max_cos_dist=0.3,   # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
     ):
         # 단기 추적기 (BoTSORT 인스턴스)
         self.tracker = bot_sort_tracker
