@@ -8,6 +8,7 @@ Track이 이전 프레임 상태 저장
 import numpy as np
 from collections import deque
 from scipy.optimize import linear_sum_assignment  # pip install scipy 필요
+from utils.metrics import iou_bbox, cosine_distance
 
 class Track:  # 이전(t-1) 프레임에서의 위치/임베딩으로 kalman 예측
     """
@@ -215,26 +216,6 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
 
     # ----------------- 유틸 함수들 -----------------
 
-    @staticmethod
-    def iou_bbox(bbox_a, bbox_b):
-        """두 bbox_tlbr (x1,y1,x2,y2) 사이의 IoU 계산."""
-        xx1 = np.maximum(bbox_a[0], bbox_b[0])
-        yy1 = np.maximum(bbox_a[1], bbox_b[1])
-        xx2 = np.minimum(bbox_a[2], bbox_b[2])
-        yy2 = np.minimum(bbox_a[3], bbox_b[3])
-
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-
-        if inter <= 0:
-            return 0.0
-
-        area_a = (bbox_a[2] - bbox_a[0]) * (bbox_a[3] - bbox_a[1])
-        area_b = (bbox_b[2] - bbox_b[0]) * (bbox_b[3] - bbox_b[1])
-        union = area_a + area_b - inter + 1e-16
-        return float(inter / union)
-
     def compute_cost_matrix(self, now_dets, now_embs):
         """
         현재 프레임 YOLO detection vs 이전 프레임 Track(pred 상태) 사이의 cost matrix 계산.
@@ -262,7 +243,7 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                 last_track = self.tracks[track_idx]
 
                 # 1) 위치 기반 IoU cost (예측 위치(pred) vs 현재 bbox(now))
-                iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
+                iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                 cost = 1.0 - iou_score
 
                 # 2) ReID 기반 거리 cost (항상 ReID는 쓰되, 임베딩이 둘 다 있을 때만)
@@ -366,7 +347,7 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                     last_track = self.tracks[track_idx]
 
                     # IoU gate (pred vs now)
-                    iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
+                    iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                     if iou_score < self.iou_gate:
                         continue
 
@@ -409,7 +390,7 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                 last_track = self.tracks[track_idx]
 
                 # IoU gate (pred vs now)
-                iou_score = self.iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
+                iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                 if iou_score < self.iou_gate:
                     continue
 
@@ -520,20 +501,6 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
 
     # ================== 거리 / IoU 유틸 ==================
 
-    @staticmethod
-    def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-        """
-        코사인 거리 = 1 - cos(a, b)
-        a 또는 b가 None / 거의 0벡터이면 1.0 (매우 멀다)로 반환
-        """
-        if a is None or b is None:
-            return 1.0
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-6 or nb < 1e-6:
-            return 1.0
-        return 1.0 - float(np.dot(a, b) / (na * nb + 1e-6))
-
     def _min_cos_dist_to_gal(self, cand_emb, gal_emb_list):
         """
         cand_emb vs gal_emb_list 중 최소 코사인 거리.
@@ -541,28 +508,8 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         """
         if cand_emb is None or not gal_emb_list:
             return 1.0
-        cos_dists = [self.cosine_distance(cand_emb, g) for g in gal_emb_list]
+        cos_dists = [cosine_distance(cand_emb, g) for g in gal_emb_list]
         return min(cos_dists)
-
-    @staticmethod
-    def _iou_bbox(box_a, box_b):
-        """
-        두 bbox_tlbr (x1,y1,x2,y2) 사이의 IoU.
-        갤러리 프로토타입 후보 추가 시, 트랙끼리 얼마나 겹치는지(occlusion) 체크에 사용.
-        """
-        x1 = max(box_a[0], box_b[0])
-        y1 = max(box_a[1], box_b[1])
-        x2 = min(box_a[2], box_b[2])
-        y2 = min(box_a[3], box_b[3])
-
-        w = max(0.0, x2 - x1)
-        h = max(0.0, y2 - y1)
-        inter = w * h
-        if inter <= 0:
-            return 0.0
-        area_a = max(0.0, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
-        area_b = max(0.0, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
-        return float(inter / (area_a + area_b - inter + 1e-6))
 
     # ================== ID 매칭 / prototype 추가 로직 ==================
 
@@ -641,7 +588,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         for other in all_tracks:
             if other is track:
                 continue
-            iou_val = self._iou_bbox(track.last_bbox_tlbr, other.last_bbox_tlbr)
+            iou_val = iou_bbox(track.last_bbox_tlbr, other.last_bbox_tlbr)
             if iou_val > self.iou_no_overlap:
                 # 꽤 겹친다고 판단 → occlusion 가능성 있음
                 ###print(f"[LT-GAL] skip add (id={identity_id}): IoU with track {other.track_id} = {iou_val:.3f} > {self.iou_no_overlap}")
@@ -680,7 +627,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         """
         info = self.gallery.setdefault(identity_id, {"gal_embs": []})
         info["gal_embs"].append(cand_emb.copy())
-        ###print(f"[LT-GAL] added gal_emb for id={identity_id}: {len(info["gal_embs"])}/{self.max_gal_emb_per_id} stored")
+        ###print(f"[LT-GAL] added gal_emb for id={identity_id}: {len(info['gal_embs'])}/{self.max_gal_emb_per_id} stored")
 
     # ================== 메인 update ==================
 
