@@ -3,7 +3,7 @@ from functools import partial
 import queue
 import time
 from types import SimpleNamespace
-from typing import Tuple
+from typing import List, Tuple
 import numpy as np
 import cv2
 
@@ -20,7 +20,7 @@ class Hailo():
     Hailo pipeline class.
 
     Hailo.run(frame):
-    frame -> vis_model -> emb_model -> (dets, depth)
+    frame -> vis_model -> emb_model -> (dets, depth, yolobox)
           \\_ dep_model              /
     """
     def __init__(self):
@@ -61,9 +61,10 @@ class Hailo():
         self._emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
-    def run(self, frame: np.ndarray) -> Tuple[np.array, np.ndarray]:
+    def run(self, frame: np.ndarray) -> Tuple[np.array, np.ndarray, List]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
+        output is detections, depth, list of yolo boxes
         """
         # prepare frames
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
