@@ -17,11 +17,13 @@ t-1 = last frame
 """
 
 import cv2, argparse
-from config import ULTRA_MODEL, DETECTOR_ONNX, DETECTOR_NMS_JSON, PERSON_CLASS_ID, TELLO_UDP
+from utils.config import ULTRA_MODEL, DETECTOR_ONNX, DETECTOR_NMS_JSON, PERSON_CLASS_ID, TELLO_UDP
 from utils.draw import draw_track
 from tracker_botsort import BoTSORT, LongTermBoTSORT
-from reid_repVGG_ov import OVReID
+from utils.reid_repVGG_ov import OVReID
 
+from utils.gallery_io import save_gallery, load_gallery
+GALLERY_PATH = "cache/longterm_gallery.npy" 
 
 # ------------------------------
 # 영상 입력
@@ -76,11 +78,11 @@ def main():
     # ------------------------
     if args.det_backend == "ultra":
         print("[Detector] Using Ultralytics:", ULTRA_MODEL)
-        from detector_yolo_ultra import UltraYoloDetector
+        from utils.detector_yolo_ultra import UltraYoloDetector
         detector = UltraYoloDetector(model=ULTRA_MODEL)
     else:
         print(f"[Detector] Using OV ONNX: {args.onnx or DETECTOR_ONNX}")
-        from detector_yolo_ov import OVYoloDetector
+        from utils.detector_yolo_ov import OVYoloDetector
         detector = OVYoloDetector(
             onnx_path=args.onnx or DETECTOR_ONNX,
             nms_json=args.nms_json or DETECTOR_NMS_JSON,
@@ -93,6 +95,17 @@ def main():
     # Tracker: BoTSORT + LongTerm
     base_tracker = BoTSORT()
     tracker = LongTermBoTSORT(base_tracker)
+
+    # 🔹 시작할 때: 갤러리 파일이 있으면 불러오기
+    gallery = load_gallery(GALLERY_PATH)
+    if len(gallery) > 0:
+        tracker.gallery = gallery
+        tracker.next_identity = max(gallery.keys()) + 1
+        print("[LT-GAL] start AGAIN with saved gallery")
+    else:
+        tracker.gallery = {}
+        tracker.next_identity = 1
+        print("[LT-GAL] NEW start with empty gallery")
 
     cap = open_source(args.source)
     if not cap.isOpened():
@@ -152,6 +165,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
+    # 🔹 종료할 때: 현재 갤러리 저장
+    save_gallery(GALLERY_PATH, tracker.gallery)
 
 if __name__ == "__main__":
     main()

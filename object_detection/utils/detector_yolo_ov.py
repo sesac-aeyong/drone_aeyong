@@ -2,7 +2,7 @@
 import os, json
 import numpy as np, cv2
 from openvino.runtime import Core
-from config import DET_IMG_SIZE, DET_CONF_TH, DET_NMS_TH, PERSON_CLASS_ID
+from utils.config import DET_IMG_SIZE, DET_CONF_TH, DET_NMS_TH, PERSON_CLASS_ID
 
 # YOLOv8 strides (640 기준 80x80, 40x40, 20x20 → 8400)
 STRIDES = [8, 16, 32]

@@ -1,6 +1,5 @@
 # Detector using Ultralytics (PyTorch). Easiest for correctness checks.
 from ultralytics import YOLO
-import numpy as np
 
 class UltraYoloDetector:
     def __init__(self, model="yolov8n.pt", imgsz=640, conf=0.35):

@@ -1,7 +1,7 @@
 # ReID using OpenVINO (reads ONNX).
 import numpy as np, cv2
 from openvino.runtime import Core
-from config import REID_ONNX
+from utils.config import REID_ONNX
 
 class OVReID:
     def __init__(self, onnx_path=REID_ONNX, device="GPU"):
