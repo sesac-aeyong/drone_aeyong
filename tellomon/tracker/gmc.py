@@ -3,10 +3,11 @@ import cv2
 import numpy as np
 import copy
 import time
+from settings import settings as S
 
-
+### GMC seems quite heavy. 
 class GMC:
-    def __init__(self, method='sparseOptFlow', downscale=2, verbose=None):
+    def __init__(self, method='sparseOptFlow', downscale=S.gmc_downscale, verbose=None):
         super(GMC, self).__init__()
 
         self.method = method
@@ -29,7 +30,7 @@ class GMC:
             self.criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations, termination_eps)
 
         elif self.method == 'sparseOptFlow':
-            self.feature_params = dict(maxCorners=1000, qualityLevel=0.01, minDistance=1, blockSize=3,
+            self.feature_params = dict(maxCorners=S.gmc_sof_maxcorners, qualityLevel=S.gmc_sof_quality, minDistance=S.gmc_sof_mindist, blockSize=S.gmc_sof_blocksize,
                                        useHarrisDetector=False, k=0.04)
             # self.gmc_file = open('GMC_results.txt', 'w')
 

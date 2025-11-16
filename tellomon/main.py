@@ -21,7 +21,7 @@ class TelloMon():
 
 
 def main():
-    raise NotImplementedError('Usage: python main.py test [fps, show]')
+    raise NotImplementedError('Usage: python main.py test [fps, show, yolo, file.mp4]')
     config = load_json_file('config.json')
     tello = TelloMon(config)
     hailo = Hailo()

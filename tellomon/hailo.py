@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import queue
+import threading
 import time
 from types import SimpleNamespace
 from typing import List, Tuple
@@ -11,8 +12,6 @@ from common.hailo_inference import HailoInfer
 from tracker.bot_sort import BoTSORT
 from settings import settings as S
 from yolo_tools import extract_detections
-
-### TODO:: create and reuse buffer instead of creating lists every frame
 
 
 class Hailo():
@@ -58,7 +57,19 @@ class Hailo():
             ablation=False
         )) # do configs 
 
-        self._emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
+        # optimizations
+        self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
+        self.emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
+        """embeddings buffer"""
+        self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
+        """vision model framebuffer"""
+        self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
+        """depth model framebuffer"""
+        self.crop_fbs = [np.empty((self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
+                          for _ in range(S.max_emb_threads)]
+        """crop framebuffer per thread"""
+
+        self._thread_local = threading.local()
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
     def run(self, frame: np.ndarray) -> Tuple[np.array, np.ndarray, List]:
@@ -68,14 +79,14 @@ class Hailo():
         """
         # prepare frames
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        vis_frame = np.ascontiguousarray(cv2.resize(frame, self.vm_shape))
-        dep_frame = np.ascontiguousarray(cv2.resize(frame, self.dm_shape))
+        cv2.resize(frame, self.vm_shape, self.vis_fb, interpolation=cv2.INTER_LINEAR)
+        cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
 
         # run vis and dep models
-        self.vis_m.run([vis_frame], self.vis_cb)
-        self.dep_m.run([dep_frame], self.dep_cb)
+        self.vis_m.run([self.vis_fb], self.vis_cb)
+        self.dep_m.run([self.dep_fb], self.dep_cb)
 
-        # wait for both models to finish and enque
+        # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
         del vision[1:] # 0 is person, remove all other classes.
 
@@ -94,23 +105,20 @@ class Hailo():
         ### perhaps try multiprocess if not performant enough.
         ### is this fruitless?
 
-        embeddings = [np.zeros((S._emb_out_size,), dtype=np.float32) for _ in range(num_detections)]
-
-        with ThreadPoolExecutor(max_workers=S.max_emb_threads) as executor:
-            futures = []
-            for i in range(num_detections):
-                if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
-                    continue
-                x1, y1, x2, y2 = self._safe_box(boxes[i])
-                crop = frame[y1:y2, x1:x2]
-                if crop.size < S.min_emb_cropsize:
-                    continue
-                
-                crop = cv2.resize(crop, self.em_shape)
-                crop = np.ascontiguousarray(crop)
-                futures.append(executor.submit(self._submit_embedding, crop, i))
+        futures = []
+        emb_ids = []
+        for i in range(num_detections):
+            if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
+                continue
+            x1, y1, x2, y2 = self._safe_box(boxes[i])
+            crop = frame[y1:y2, x1:x2]
+            if crop.size < S.min_emb_cropsize:
+                continue
+            buf = self._get_thread_buffer()
+            cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
+            futures.append(self.executor.submit(self._submit_embedding, buf, i))
+            emb_ids.append(i)
         
-
         ### Tried batch processing, it's actually slower than threaded async. 
         # person_crops = []
         # det_ids = []
@@ -141,12 +149,12 @@ class Hailo():
 
         for _ in range(len(futures)):
             det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
-            embeddings[det_id] = emb
+            self.emb_buf[det_id] = emb
 
         targets = self.tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), # _extract_detections already took care of min conf. 
             frame,
-            embeddings
+            self.emb_buf[:num_detections]
             )
         
         rets = []
@@ -156,8 +164,19 @@ class Hailo():
             
             rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
 
+        # clean up used embedding buffers 
+        for i in emb_ids:
+            self.emb_buf[i].fill(0)
+
         return rets, self.dep_q.get(), boxes
         
+    def _get_thread_buffer(self):
+        if not hasattr(self._thread_local, 'buf'):
+            # pick a buffer based on thread id
+            tid = threading.get_ident() % S.max_emb_threads
+            self._thread_local.buf = self.crop_fbs[tid]
+        return self._thread_local.buf
+
 
     def _submit_embedding(self, crop: np.ndarray, det_id:int):
         self.emb_m.run([crop], 
@@ -166,7 +185,7 @@ class Hailo():
 
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
         """
-        expetcs str box in shape of y1, x1, y2, y1 
+        expetcs str box in shape of y1, x1, y2, y2 
         returns bound safe x1, y1, x2, y2. 
         """
         x1, y1, x2, y2 = map(int, box)
@@ -190,22 +209,13 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     result = None
 
     for bindings in bindings_list:
-        if len(bindings._output_names) == 1:
-            result = bindings.output().get_buffer()
-        else:
-            result = {
-                name: np.expand_dims(
-                    bindings.output(name).get_buffer(), axis=0
-                )
-                for name in bindings._output_names
-            }
+        result = bindings.output().get_buffer()
     if 'det_id' not in kwargs: # vis/dep callback
         output_queue.put_nowait(result)
         return
     # embedding callback
     # L2 vectorize
-    # result = l2_norm(np.asarray(result).flatten()) ## BoT-SORT normalizes vector, skip.
-    result = np.asarray(result).flatten()
+    result = np.asarray(result).flatten() ## BoT-SORT normalizes vector, skip norm.
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
 

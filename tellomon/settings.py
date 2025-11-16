@@ -39,6 +39,12 @@ class Settings:
     track_buffer: int = 600
     """# of frames lost tracks will be kept"""
 
+    ##GMC(BOTSORT)
+    gmc_sof_maxcorners:int = 250 # was 1000 by default
+    gmc_downscale:int = 3 # was 2 by default 
+    gmc_sof_quality:float = 0.03 # was 0.01 by default
+    gmc_sof_mindist:int = 3 # was 1 by default
+    gmc_sof_blocksize:int = 5 # was 3 by default
 
     """General"""
     frame_width: int = 960
@@ -59,6 +65,7 @@ class Settings:
             print('failed to load config.json, using defaults!')
         except json.JSONDecodeError:
             print('failed to convert config.json to json. Using defaults!')
+        self._emb_out_size: int = 2048 if '2048' in self.embed_model else 512 
 
 settings = Settings()
 
