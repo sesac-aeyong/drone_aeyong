@@ -40,6 +40,8 @@ class STrack(BaseTrack):
         return lv
 
     def update_features(self, feat, eps=1e-10):
+        if feat is None:
+            return
         self._safe_ndivide(feat, feat)
 
         self.curr_feat = feat
@@ -327,7 +329,7 @@ class BoTSORT(object):
             ious_dists = matching.fuse_score(ious_dists, detections)
 
         if self.args.with_reid:
-            emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
+            emb_dists = matching.embedding_distance(strack_pool, detections)# / 2.0
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0

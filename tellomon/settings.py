@@ -19,7 +19,7 @@ class Settings:
 
     max_vis_detections: int = 30
     """vision model max detections"""
-    min_vis_score_threshold: float = 0.6
+    min_vis_score_threshold: float = 0.7
     """vision model confidence threshold"""
     min_emb_confidence: float = min_vis_score_threshold
     """minimum vis_model confidence to update embedding"""
@@ -34,13 +34,13 @@ class Settings:
     """high confidence threshold tracker expects to get embeddings of"""
     track_low_emb_confidence: float = 0.4
     """this probably is not used"""
-    track_new_threshold: float = min_emb_confidence + 0.15
+    track_new_threshold: float = min_emb_confidence + 0.1
     """threshold for vision model confidence to create a new track"""
     track_buffer: int = 600
     """# of frames lost tracks will be kept"""
 
     ##GMC(BOTSORT)
-    gmc_sof_maxcorners:int = 250 # was 1000 by default
+    gmc_sof_maxcorners:int = 200 # was 1000 by default
     gmc_downscale:int = 3 # was 2 by default 
     gmc_sof_quality:float = 0.03 # was 0.01 by default
     gmc_sof_mindist:int = 3 # was 1 by default
@@ -66,6 +66,7 @@ class Settings:
         except json.JSONDecodeError:
             print('failed to convert config.json to json. Using defaults!')
         self._emb_out_size: int = 2048 if '2048' in self.embed_model else 512 
+        self.min_emb_confidence: float = self.min_vis_score_threshold
 
 settings = Settings()
 

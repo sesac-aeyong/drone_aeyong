@@ -4,39 +4,29 @@ import cv2
 import numpy as np
 from settings import settings as S
 
-
 def _denormalize_and_rm_pad(box: list, size: int, padding_length: int, input_height: int, input_width: int) -> list:
     """
     Denormalize bounding box coordinates and remove padding.
 
     Args:
-        box (list): Normalized bounding box coordinates in [y1, x1, y2, x2] format. Dunno why but hailo yolo seems to return it this way.
+        box (list): Normalized bounding box coordinates.
         size (int): Size to scale the coordinates.
         padding_length (int): Length of padding to remove.
         input_height (int): Height of the input image.
         input_width (int): Width of the input image.
 
     Returns:
-        list: Denormalized bounding box coordinates in [x1, y1, x2, y2] format with padding removed.
+        list: Denormalized bounding box coordinates with padding removed.
     """
-    # Convert from [y1, x1, y2, x2] to [x1, y1, x2, y2]
+    for i, x in enumerate(box):
+        box[i] = int(x * size)
+        if (input_width != size) and (i % 2 != 0):
+            box[i] -= padding_length
+        if (input_height != size) and (i % 2 == 0):
+            box[i] -= padding_length
     y1, x1, y2, x2 = box
-    # Denormalize all coordinates
-    x1 = int(x1 * size)
-    y1 = int(y1 * size)
-    x2 = int(x2 * size)
-    y2 = int(y2 * size)
-    
-    # Remove padding - adjust coordinates based on which dimension was padded
-    if input_width != size:  # Image was padded horizontally
-        x1 -= padding_length
-        x2 -= padding_length
-    
-    if input_height != size:  # Image was padded vertically
-        y1 -= padding_length
-        y2 -= padding_length
-    
-    return [x1, y1, x2, y2]
+    return x1, y1, x2, y2
+    # return y1, x1, y2, x2
 
 
 def extract_detections(image: np.ndarray, detections: list) -> dict:

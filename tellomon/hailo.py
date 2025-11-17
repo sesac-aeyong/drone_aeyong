@@ -48,14 +48,14 @@ class Hailo():
             new_track_thresh=S.track_new_threshold,
             track_buffer=S.track_buffer,
             proximity_thresh=0.8,
-            appearance_thresh=0.5,
-            match_thresh=0.8,
+            appearance_thresh=0.4,
+            match_thresh=0.9,
             mot20=False,
             with_reid=True,  # set True if you have ReID embeddings
             cmc_method='sparseOptFlow',  # for GMC
             name='BoTSORT',
             ablation=False
-        )) # do configs 
+        ))
 
         # optimizations
         self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
@@ -72,14 +72,44 @@ class Hailo():
         self._thread_local = threading.local()
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
+
+    def letterbox_buffer(self, src, dst, new_shape=640, color=(114,114,114)):
+        """
+        src: input image (H, W, 3)
+        dst: preallocated buffer (new_shape, new_shape, 3)
+        returns: scale, (left, top)
+        """
+
+        h, w = src.shape[:2]
+        scale = min(new_shape / w, new_shape / h)
+        nh, nw = int(h * scale), int(w * scale)
+
+        # Fill destination with padding color
+        dst[:] = color
+
+        # Resize into a temporary buffer on the fly
+        resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        # Compute padding
+        top = (new_shape - nh) // 2
+        left = (new_shape - nw) // 2
+
+        # Copy resized into letterboxed area of dst
+        dst[top:top+nh, left:left+nw] = resized
+
+        return scale, (left, top)
+    
+
     def run(self, frame: np.ndarray) -> Tuple[np.array, np.ndarray, List]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
         # prepare frames
+        # print(self.dm_shape)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        cv2.resize(frame, self.vm_shape, self.vis_fb, interpolation=cv2.INTER_LINEAR)
+        # cv2.resize(frame, self.vm_shape, self.vis_fb, interpolation=cv2.INTER_LINEAR)
+        self.letterbox_buffer(frame, self.vis_fb)
         cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
 
         # run vis and dep models
@@ -116,6 +146,7 @@ class Hailo():
                 continue
             buf = self._get_thread_buffer()
             cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
+            cv2.imshow('buf', buf)
             futures.append(self.executor.submit(self._submit_embedding, buf, i))
             emb_ids.append(i)
         
@@ -215,7 +246,10 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
         return
     # embedding callback
     # L2 vectorize
-    result = np.asarray(result).flatten() ## BoT-SORT normalizes vector, skip norm.
+    result = np.asarray(result).flatten() 
+    # print(result)
+    norm = np.linalg.norm(result)
+    result = result / norm if norm > 0 else result
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
 
