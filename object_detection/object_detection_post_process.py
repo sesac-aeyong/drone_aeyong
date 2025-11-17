@@ -28,7 +28,7 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
 
     Args:
         image (np.ndarray): Image to draw on.
-        box (list): Bounding box coordinates.
+        box (list): Bounding box coordinates in [ymin, xmin, ymax, xmax] format.
         labels (list): List of labels (1 or 2 elements).
         score (float): Detection score.
         color (tuple): Color for the bounding box.
@@ -59,34 +59,32 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
 
     # Draw bottom text if exists
     if bottom_text:
-        # pos = (xmax - 50, ymax - 6)
         pos = (xmin + 4, ymin + 40)
         cv2.putText(image, bottom_text, pos, font, 0.5, border_color, 2, cv2.LINE_AA)
         cv2.putText(image, bottom_text, pos, font, 0.5, text_color, 1, cv2.LINE_AA)
 
 
-def denormalize_and_rm_pad(box: list, size: int, padding_length: int, input_height: int, input_width: int) -> list:
+def denormalize_and_rm_pad(box: list, img_height=720, img_width=960) -> list:
     """
-    Denormalize bounding box coordinates and remove padding.
+    Denormalize bounding box coordinates.
 
     Args:
-        box (list): Normalized bounding box coordinates.
-        size (int): Size to scale the coordinates.
-        padding_length (int): Length of padding to remove.
-        input_height (int): Height of the input image.
-        input_width (int): Width of the input image.
+        box (list): Normalized bounding box coordinates from YOLO model.
+                    Could be [x1_norm, y1_norm, x2_norm, y2_norm] or [y1_norm, x1_norm, y2_norm, x2_norm].
+        img_height (int): Height of the original image.
+        img_width (int): Width of the original image.
 
     Returns:
-        list: Denormalized bounding box coordinates with padding removed.
+        list: Denormalized bounding box coordinates in [ymin, xmin, ymax, xmax] format.
     """
-    for i, x in enumerate(box):
-        box[i] = int(x * size)
-        if (input_width != size) and (i % 2 != 0):
-            box[i] -= padding_length
-        if (input_height != size) and (i % 2 == 0):
-            box[i] -= padding_length
-
-    return box
+    # YOLO outputs in [y1, x1, y2, x2] format (normalized)
+    y1 = int(box[0] * img_height)
+    x1 = int(box[1] * img_width)
+    y2 = int(box[2] * img_height)
+    x2 = int(box[3] * img_width)
+    
+    # draw_detection expects [ymin, xmin, ymax, xmax]
+    return [y1, x1, y2, x2]
 
 
 def extract_detections(image: np.ndarray, detections: list, config_data) -> dict:
@@ -106,19 +104,16 @@ def extract_detections(image: np.ndarray, detections: list, config_data) -> dict
     score_threshold = visualization_params.get("score_thres", 0.5)
     max_boxes = visualization_params.get("max_boxes_to_draw", 50)
 
-
-    #values used for scaling coords and removing padding
     img_height, img_width = image.shape[:2]
-    size = max(img_height, img_width)
-    padding_length = int(abs(img_height - img_width) / 2)
 
     all_detections = []
 
     for class_id, detection in enumerate(detections):
         for det in detection:
             bbox, score = det[:4], det[4]
+    
             if score >= score_threshold:
-                denorm_bbox = denormalize_and_rm_pad(bbox, size, padding_length, img_height, img_width)
+                denorm_bbox = denormalize_and_rm_pad(bbox, img_height=img_height, img_width=img_width)
                 all_detections.append((score, class_id, denorm_bbox))
 
     #sort all detections by score descending
@@ -153,7 +148,7 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None)
     """
 
     #extract detection data from the dictionary
-    boxes = detections["detection_boxes"]  # List of [xmin,ymin,xmaxm, ymax] boxes
+    boxes = detections["detection_boxes"]  # List of [ymin, xmin, ymax, xmax] boxes
     scores = detections["detection_scores"]  # List of detection confidences
     num_detections = detections["num_detections"]  # Total number of valid detections
     classes = detections["detection_classes"]  # List of class indices per detection
@@ -161,11 +156,13 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None)
     if tracker:
         dets_for_tracker = []
 
-        #Convert detection format to [xmin,ymin,xmaxm ymax,score] for tracker
+        # Convert detection format to [x1, y1, x2, y2, score] for tracker
         for idx in range(num_detections):
-            box = boxes[idx]  #[x, y, w, h]
+            box = boxes[idx]  # [ymin, xmin, ymax, xmax]
+            ymin, xmin, ymax, xmax = box
             score = scores[idx]
-            dets_for_tracker.append([*box, score])
+            # Tracker expects [x1, y1, x2, y2, score]
+            dets_for_tracker.append([xmin, ymin, xmax, ymax, score])
 
         #skip tracking if no detections passed
         if not dets_for_tracker:
@@ -177,18 +174,22 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None)
         #draw tracked bounding boxes with ID labels
         for track in online_targets:
             track_id = track.track_id  #unique tracker ID
-            x1, y1, x2, y2 = track.tlbr  #bounding box (top-left, bottom-right)
+            x1, y1, x2, y2 = track.tlbr  #bounding box (top-left, bottom-right) in [x1, y1, x2, y2]
             xmin, ymin, xmax, ymax = map(int, [x1, y1, x2, y2])
-            best_idx = find_best_matching_detection_index(track.tlbr, boxes)
-            color = tuple(id_to_color(classes[best_idx]).tolist())  # color based on class
+            
+            # Convert to [ymin, xmin, ymax, xmax] for find_best_matching_detection_index
+            track_box_yx = [ymin, xmin, ymax, xmax]
+            best_idx = find_best_matching_detection_index(track_box_yx, boxes)
+            
+            color = tuple(id_to_color(classes[best_idx]).tolist()) if best_idx is not None else (255, 255, 255)
+            
+            # draw_detection expects [ymin, xmin, ymax, xmax]
             if best_idx is None:
-                draw_detection(img_out, [xmin, ymin, xmax, ymax], f"ID {track_id}",
+                draw_detection(img_out, [ymin, xmin, ymax, xmax], [f"ID {track_id}"],
                                track.score * 100.0, color, track=True)
             else:
-                draw_detection(img_out, [xmin, ymin, xmax, ymax], [labels[classes[best_idx]], f"ID {track_id}"],
+                draw_detection(img_out, [ymin, xmin, ymax, xmax], [labels[classes[best_idx]], f"ID {track_id}"],
                                track.score * 100.0, color, track=True)
-
-
 
     else:
         #No tracking — draw raw model detections
@@ -206,8 +207,8 @@ def find_best_matching_detection_index(track_box, detection_boxes):
     Finds the index of the detection box with the highest IoU relative to the given tracking box.
 
     Args:
-        track_box (list or tuple): The tracking box in [x_min, y_min, x_max, y_max] format.
-        detection_boxes (list): List of detection boxes in [x_min, y_min, x_max, y_max] format.
+        track_box (list or tuple): The tracking box in [ymin, xmin, ymax, xmax] format.
+        detection_boxes (list): List of detection boxes in [ymin, xmin, ymax, xmax] format.
 
     Returns:
         int or None: Index of the best matching detection, or None if no match is found.
@@ -233,15 +234,22 @@ def compute_iou(boxA, boxB):
     Values range from 0 (no overlap) to 1 (perfect overlap).
 
     Args:
-        boxA (list or tuple): [x_min, y_min, x_max, y_max]
-        boxB (list or tuple): [x_min, y_min, x_max, y_max]
+        boxA (list or tuple): [ymin, xmin, ymax, xmax]
+        boxB (list or tuple): [ymin, xmin, ymax, xmax]
 
     Returns:
         float: IoU value between 0 and 1.
     """
-    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    # boxA, boxB are in [ymin, xmin, ymax, xmax] format
+    yminA, xminA, ymaxA, xmaxA = boxA
+    yminB, xminB, ymaxB, xmaxB = boxB
+    
+    xA = max(xminA, xminB)
+    yA = max(yminA, yminB)
+    xB = min(xmaxA, xmaxB)
+    yB = min(ymaxA, ymaxB)
+    
     inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = max(1e-5, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
-    areaB = max(1e-5, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+    areaA = max(1e-5, (xmaxA - xminA) * (ymaxA - yminA))
+    areaB = max(1e-5, (xmaxB - xminB) * (ymaxB - yminB))
     return inter / (areaA + areaB - inter + 1e-5)

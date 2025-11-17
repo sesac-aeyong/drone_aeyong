@@ -1,10 +1,9 @@
-<!-- templates/index.html -->
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tello Drone Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Tello Control</title>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         * {
@@ -12,680 +11,718 @@
             padding: 0;
             box-sizing: border-box;
         }
-
+        
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 10px;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 14px;
+            overflow-x: hidden;
         }
-
+        
         .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 15px;
-            overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            max-width: 100%;
+            padding: 5px;
         }
-
+        
         .header {
-            background: #2c3e50;
-            color: white;
-            padding: 15px 20px;
-            display: flex;
-            justify-content: space-between;
+            background: #16213e;
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 5px;
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 10px;
             align-items: center;
         }
-
-        .header h1 {
-            font-size: 24px;
+        
+        h1 {
+            color: #00d9ff;
+            font-size: 1.1em;
         }
-
+        
         .status {
             display: flex;
-            gap: 15px;
-            font-size: 14px;
+            gap: 5px;
+            font-size: 0.75em;
+            flex-wrap: wrap;
+            justify-content: center;
         }
-
+        
         .status-item {
-            background: rgba(255,255,255,0.1);
-            padding: 5px 10px;
-            border-radius: 5px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            white-space: nowrap;
         }
-
+        
+        .connected { background: #10b981; color: white; }
+        .disconnected { background: #ef4444; color: white; }
+        
+        .header-controls {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+        }
+        
+        .header-btn {
+            padding: 6px 12px;
+            font-size: 0.75em;
+            font-weight: bold;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        
+        .header-btn:active {
+            transform: scale(0.95);
+        }
+        
+        .header-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        
+        .header-btn-primary { background: #667eea; color: white; }
+        .header-btn-warning { background: #f59e0b; color: white; }
+        
+        /* 비디오 영역 */
+        .video-section {
+            background: #16213e;
+            padding: 5px;
+            border-radius: 6px;
+            margin-bottom: 5px;
+        }
+        
         .video-container {
             position: relative;
             width: 100%;
             background: #000;
-            aspect-ratio: 4/3;
-            cursor: pointer;
+            border-radius: 4px;
+            overflow: hidden;
+            cursor: crosshair;
         }
-
-        #video-stream {
+        
+        #videoFeed {
             width: 100%;
-            height: 100%;
-            object-fit: contain;
-            cursor: pointer;
-        }
-
-        .click-hint {
-            position: absolute;
-            top: 10px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(52, 152, 219, 0.9);
-            color: white;
-            padding: 8px 15px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: bold;
-            pointer-events: none;
-            z-index: 10;
-        }
-
-        .connection-panel {
-            padding: 15px 20px;
-            background: #ecf0f1;
-            text-align: center;
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            padding: 12px 24px;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin: 5px;
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .btn-primary {
-            background: #3498db;
-            color: white;
-        }
-
-        .btn-primary:hover:not(:disabled) {
-            background: #2980b9;
-        }
-
-        .btn-success {
-            background: #2ecc71;
-            color: white;
-        }
-
-        .btn-success:hover:not(:disabled) {
-            background: #27ae60;
-        }
-
-        .btn-danger {
-            background: #e74c3c;
-            color: white;
-        }
-
-        .btn-danger:hover:not(:disabled) {
-            background: #c0392b;
-        }
-
-        .btn-warning {
-            background: #f39c12;
-            color: white;
-        }
-
-        .btn-warning:hover:not(:disabled) {
-            background: #e67e22;
-        }
-
-        .tracking-indicator {
-            background: #e74c3c;
-            color: white;
-            padding: 10px;
-            text-align: center;
-            font-weight: bold;
-            display: none;
-        }
-
-        .tracking-indicator.active {
             display: block;
+        }
+        
+        .click-target {
+            position: absolute;
+            border: 3px solid #00d9ff;
+            background: rgba(0, 217, 255, 0.1);
+            pointer-events: none;
             animation: pulse 1s infinite;
         }
-
+        
         @keyframes pulse {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
+            50% { opacity: 0.5; }
         }
-
-        .detections-panel {
-            padding: 15px 20px;
-            max-height: 150px;
+        
+        .info-text {
+            font-size: 0.7em;
+            color: #94a3b8;
+            margin: 3px 0;
+            padding: 5px;
+            background: #0f3460;
+            border-radius: 3px;
+            text-align: center;
+        }
+        
+        .detections-list {
+            max-height: 80px;
             overflow-y: auto;
-            background: #f8f9fa;
+            background: #0f3460;
+            border-radius: 4px;
+            padding: 5px;
+            margin-top: 3px;
         }
-
-        .detections-panel h3 {
-            margin-bottom: 10px;
-            color: #2c3e50;
-        }
-
+        
         .detection-item {
-            background: white;
+            padding: 6px;
+            margin: 2px 0;
+            background: #16213e;
+            border-radius: 3px;
+            border-left: 3px solid #667eea;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.8em;
+        }
+        
+        .detection-item:active {
+            transform: scale(0.95);
+        }
+        
+        .detection-item.selected {
+            border-left-color: #00d9ff;
+            background: #1a3a52;
+        }
+        
+        .detection-item.tracking {
+            border-left-color: #10b981;
+            background: #0f4229;
+        }
+        
+        /* 컨트롤 영역 */
+        .controls-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px;
+            margin-bottom: 5px;
+        }
+        
+        .panel {
+            background: #16213e;
+            padding: 8px;
+            border-radius: 6px;
+        }
+        
+        .panel h2 {
+            color: #00d9ff;
+            font-size: 0.9em;
+            margin-bottom: 6px;
+            padding-bottom: 4px;
+            border-bottom: 2px solid #0f3460;
+        }
+        
+        .btn {
+            width: 100%;
             padding: 10px;
-            margin: 5px 0;
+            font-size: 0.85em;
+            font-weight: bold;
+            border: none;
             border-radius: 5px;
             cursor: pointer;
-            transition: all 0.3s;
-            border: 2px solid transparent;
+            transition: all 0.2s;
+            margin: 2px 0;
+        }
+        
+        .btn:active {
+            transform: scale(0.95);
+        }
+        
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        
+        .btn-primary { background: #667eea; color: white; }
+        .btn-success { background: #10b981; color: white; }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-warning { background: #f59e0b; color: white; }
+        .btn-info { background: #06b6d4; color: white; }
+        .btn-small { padding: 6px; font-size: 0.75em; }
+        
+        /* 이동 컨트롤 그리드 */
+        .movement-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 3px;
+            margin: 5px 0;
+        }
+        
+        .movement-btn {
+            padding: 15px 5px;
+            font-size: 1.2em;
+        }
+        
+        .altitude-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 3px;
+        }
+        
+        .rotation-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 3px;
+            margin-top: 5px;
+        }
+        
+        /* 추적 상태 표시 */
+        #trackingStatus {
+            padding: 6px;
+            margin: 5px 0;
+            background: #0f3460;
+            border-radius: 4px;
+            font-size: 0.75em;
+            text-align: center;
+        }
+        
+        #trackingStatus.active {
+            background: #0f4229;
+            color: #6ee7b7;
+            border: 1px solid #10b981;
+        }
+        
+        /* 로그 영역 */
+        .log-section {
+            background: #16213e;
+            padding: 8px;
+            border-radius: 6px;
+            margin-bottom: 5px;
+        }
+        
+        .log-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }
-
-        .detection-item:hover {
-            border-color: #3498db;
-            transform: translateX(5px);
-        }
-
-        .detection-item.selected {
-            border-color: #e74c3c;
-            background: #ffebee;
-        }
-
-        .detection-info {
-            flex-grow: 1;
-        }
-
-        .detection-actions {
-            display: flex;
-            gap: 5px;
-        }
-
-        .mini-btn {
-            padding: 5px 10px;
-            font-size: 12px;
-            border: none;
-            border-radius: 5px;
             cursor: pointer;
-            background: #3498db;
-            color: white;
+            margin-bottom: 5px;
         }
-
-        .mini-btn:hover {
-            background: #2980b9;
+        
+        .log-header h2 {
+            color: #00d9ff;
+            font-size: 0.9em;
         }
-
-        .mini-btn.tracking {
-            background: #e74c3c;
+        
+        .log-toggle {
+            color: #00d9ff;
+            font-size: 1.2em;
         }
-
-        .control-panel {
-            padding: 20px;
+        
+        #logContainer {
+            overflow-y: auto;
+            background: #0f3460;
+            border-radius: 4px;
+            padding: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.65em;
+            max-height: 150px;
+            transition: max-height 0.3s;
         }
-
-        .control-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 10px;
-            max-width: 400px;
-            margin: 0 auto;
+        
+        #logContainer.collapsed {
+            max-height: 0;
+            padding: 0;
+            overflow: hidden;
         }
-
-        .control-btn {
-            padding: 20px;
-            font-size: 20px;
-            background: #34495e;
-            color: white;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.3s;
+        
+        .log-entry {
+            padding: 3px;
+            margin-bottom: 2px;
+            border-radius: 2px;
+            border-left: 2px solid;
         }
-
-        .control-btn:hover {
-            background: #2c3e50;
-            transform: scale(1.05);
+        
+        .log-INFO { border-color: #3b82f6; color: #93c5fd; }
+        .log-SUCCESS { border-color: #10b981; color: #6ee7b7; }
+        .log-WARNING { border-color: #f59e0b; color: #fcd34d; }
+        .log-ERROR { border-color: #ef4444; color: #fca5a5; }
+        .log-DEBUG { border-color: #6b7280; color: #d1d5db; }
+        
+        .log-timestamp {
+            font-weight: bold;
+            margin-right: 4px;
         }
-
-        .control-btn:active {
-            transform: scale(0.95);
+        
+        /* 스크롤바 */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
         }
-
-        .main-controls {
-            display: flex;
-            justify-content: center;
-            gap: 10px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
+        
+        ::-webkit-scrollbar-track {
+            background: #0f3460;
         }
-
-        @media (max-width: 768px) {
+        
+        ::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 3px;
+        }
+        
+        /* 데스크톱용 레이아웃 */
+        @media (min-width: 768px) {
             .container {
-                border-radius: 0;
+                padding: 10px;
+                max-width: 1400px;
+                margin: 0 auto;
             }
-
-            .header h1 {
-                font-size: 18px;
-            }
-
-            .status {
-                font-size: 12px;
+            
+            .main-layout {
+                display: grid;
+                grid-template-columns: 1fr 400px;
                 gap: 10px;
             }
-
-            .btn {
-                padding: 10px 20px;
-                font-size: 14px;
+            
+            .left-column {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
             }
-
-            .control-grid {
-                max-width: 100%;
+            
+            .right-column {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .controls-section {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            #logContainer {
+                max-height: 300px;
             }
         }
-
-        .disconnected {
-            color: #e74c3c;
-        }
-
-        .connected {
-            color: #2ecc71;
-        }
-
-        .error-message {
-            background: #e74c3c;
-            color: white;
-            padding: 10px;
-            text-align: center;
-            display: none;
-        }
-
-        .error-message.show {
-            display: block;
+        
+        /* 모바일에서 헤더 조정 */
+        @media (max-width: 480px) {
+            .header {
+                grid-template-columns: 1fr;
+                gap: 5px;
+            }
+            
+            h1 {
+                text-align: center;
+            }
+            
+            .status {
+                order: 2;
+            }
+            
+            .header-controls {
+                order: 3;
+                justify-content: center;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- 헤더 -->
         <div class="header">
-            <h1>🚁 Tello Drone Control</h1>
+            <h1>🚁 Tello</h1>
             <div class="status">
-                <div class="status-item">
-                    <span id="connection-status" class="disconnected">⚫ Disconnected</span>
+                <div id="connectionStatus" class="status-item disconnected">●</div>
+                <div id="batteryStatus" class="status-item">🔋 --</div>
+                <div id="heightStatus" class="status-item">📏 --</div>
+            </div>
+            <div class="header-controls">
+                <button class="header-btn header-btn-primary" onclick="connectTello()" id="connectBtn">연결</button>
+                <button class="header-btn header-btn-warning" onclick="reconnectTello()" id="reconnectBtn" disabled>재연결</button>
+            </div>
+        </div>
+        
+        <div class="main-layout">
+            <div class="left-column">
+                <!-- 비디오 영역 -->
+                <div class="video-section">
+                    <div class="video-container" id="videoContainer">
+                        <img id="videoFeed" src="/video_feed" alt="Video">
+                    </div>
+                    
+                    <div class="info-text">
+                        💡 객체 클릭 → 자동 추적 시작
+                    </div>
+                    
+                    <!-- 추적 상태 -->
+                    <div id="trackingStatus">추적 안 함</div>
+                    
+                    <div class="detections-list">
+                        <div id="detectionsContent" style="color: #94a3b8; text-align: center;">감지 대기중...</div>
+                    </div>
                 </div>
-                <div class="status-item">
-                    🔋 <span id="battery">--</span>%
-                </div>
-                <div class="status-item">
-                    📏 <span id="height">--</span>cm
-                </div>
-            </div>
-        </div>
-
-        <!-- 에러 메시지 -->
-        <div id="error-message" class="error-message"></div>
-
-        <!-- 추적 상태 표시 -->
-        <div id="tracking-indicator" class="tracking-indicator">
-            🎯 Tracking: <span id="tracking-target">None</span>
-        </div>
-
-        <!-- 연결 패널 -->
-        <div class="connection-panel">
-            <button id="connect-btn" class="btn btn-primary" onclick="connectTello()">
-                Connect to Tello
-            </button>
-            <button id="reconnect-btn" class="btn btn-warning" onclick="reconnectTello()" style="display:none;">
-                🔄 Reconnect
-            </button>
-            <button id="stop-tracking-btn" class="btn btn-danger" onclick="stopTracking()" style="display:none;">
-                ⏹️ Stop Tracking
-            </button>
-        </div>
-
-        <!-- 비디오 스트림 -->
-        <div class="video-container" id="video-container">
-            <div class="click-hint" id="click-hint" style="display:none;">
-                👆 Click on a bounding box to track
-            </div>
-            <img id="video-stream" src="/video_feed" alt="Waiting for video stream...">
-        </div>
-
-        <!-- 감지된 객체 -->
-        <div class="detections-panel">
-            <h3>Detected Objects</h3>
-            <div id="detections-list">
-                <p style="color: #7f8c8d;">No objects detected</p>
-            </div>
-        </div>
-
-        <!-- 컨트롤 패널 -->
-        <div class="control-panel">
-            <!-- 메인 컨트롤 -->
-            <div class="main-controls">
-                <button class="btn btn-success" onclick="sendCommand('takeoff')">
-                    ✈️ Takeoff
-                </button>
-                <button class="btn btn-danger" onclick="sendCommand('land')">
-                    🛬 Land
-                </button>
-                <button class="btn btn-warning" onclick="sendCommand('emergency')">
-                    🚨 Emergency
-                </button>
-            </div>
-
-            <!-- 방향 컨트롤 -->
-            <div class="control-grid">
-                <button class="control-btn" onclick="sendCommand('ccw')">↶</button>
-                <button class="control-btn" onclick="sendCommand('forward')">↑</button>
-                <button class="control-btn" onclick="sendCommand('cw')">↷</button>
                 
-                <button class="control-btn" onclick="sendCommand('left')">←</button>
-                <button class="control-btn" onclick="sendCommand('up')">⬆</button>
-                <button class="control-btn" onclick="sendCommand('right')">→</button>
+                <!-- 로그 -->
+                <div class="log-section">
+                    <div class="log-header" onclick="toggleLog()">
+                        <h2>📋 로그</h2>
+                        <span class="log-toggle" id="logToggle">▼</span>
+                    </div>
+                    <div id="logContainer"></div>
+                </div>
+            </div>
+            
+            <div class="right-column">
+                <!-- 컨트롤들 -->
+                <div class="controls-section">
+                    <!-- 고도 (원래 연결 자리) -->
+                    <div class="panel">
+                        <h2>고도</h2>
+                        <div class="altitude-grid">
+                            <button class="btn btn-info" onclick="sendCommand('up')" id="upBtn" disabled>⬆ 상승</button>
+                            <button class="btn btn-info" onclick="sendCommand('down')" id="downBtn" disabled>⬇ 하강</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 비행 -->
+                    <div class="panel">
+                        <h2>비행</h2>
+                        <button class="btn btn-success" onclick="sendCommand('takeoff')" id="takeoffBtn" disabled>이륙 ✈️</button>
+                        <button class="btn btn-danger" onclick="sendCommand('land')" id="landBtn" disabled>착륙 🛬</button>
+                        <button class="btn btn-danger btn-small" onclick="sendCommand('emergency')" id="emergencyBtn" disabled>긴급!</button>
+                    </div>
+                </div>
                 
-                <button class="control-btn" style="visibility: hidden;"></button>
-                <button class="control-btn" onclick="sendCommand('back')">↓</button>
-                <button class="control-btn" onclick="sendCommand('down')">⬇</button>
+                <!-- 조종 -->
+                <div class="panel">
+                    <h2>조종</h2>
+                    
+                    <!-- 이동 -->
+                    <div class="movement-grid">
+                        <div></div>
+                        <button class="btn btn-info movement-btn" onclick="sendCommand('forward')" id="forwardBtn" disabled>↑</button>
+                        <div></div>
+                        <button class="btn btn-info movement-btn" onclick="sendCommand('left')" id="leftBtn" disabled>←</button>
+                        <div></div>
+                        <button class="btn btn-info movement-btn" onclick="sendCommand('right')" id="rightBtn" disabled>→</button>
+                        <div></div>
+                        <button class="btn btn-info movement-btn" onclick="sendCommand('back')" id="backBtn" disabled>↓</button>
+                        <div></div>
+                    </div>
+                    
+                    <!-- 회전 -->
+                    <div class="rotation-grid">
+                        <button class="btn btn-info btn-small" onclick="sendCommand('ccw')" id="ccwBtn" disabled>↺ 좌회전</button>
+                        <button class="btn btn-info btn-small" onclick="sendCommand('cw')" id="cwBtn" disabled>↻ 우회전</button>
+                    </div>
+                </div>
+                
+                <!-- 추적 중지 버튼 -->
+                <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display: none;">🛑 추적 중지</button>
             </div>
         </div>
     </div>
-
+    
     <script>
         const socket = io();
-        let selectedTrackId = null;
         let selectedTarget = null;
-        let selectedBbox = null;
         let isTracking = false;
         let currentDetections = [];
+        let logCollapsed = false;
         
-        const videoContainer = document.getElementById('video-container');
-        const videoStream = document.getElementById('video-stream');
+        const videoFeed = document.getElementById('videoFeed');
         
-        // 비디오 이미지 클릭 이벤트
-        videoStream.addEventListener('click', function(e) {
-            if (currentDetections.length === 0) {
-                console.log('No detections available');
-                return;
-            }
+        // 비디오 컨테이너 클릭 이벤트
+        document.getElementById('videoContainer').addEventListener('click', function(e) {
+            if (currentDetections.length === 0) return;
             
-            const rect = videoStream.getBoundingClientRect();
-            const clickX = e.clientX - rect.left;
-            const clickY = e.clientY - rect.top;
+            const rect = videoFeed.getBoundingClientRect();
+            const scaleX = videoFeed.naturalWidth / rect.width;
+            const scaleY = videoFeed.naturalHeight / rect.height;
             
-            console.log('Click position:', clickX, clickY);
-            console.log('Container rect:', rect.width, 'x', rect.height);
+            const clickX = (e.clientX - rect.left) * scaleX;
+            const clickY = (e.clientY - rect.top) * scaleY;
             
-            // 실제 표시되는 이미지 크기 계산
-            // 프레임은 640x480 (4:3 비율)
-            const imgRatio = 640 / 480;
-            const containerRatio = rect.width / rect.height;
-            
-            let displayWidth, displayHeight, offsetX, offsetY;
-            
-            if (containerRatio > imgRatio) {
-                // 컨테이너가 더 넓음 - 높이 기준
-                displayHeight = rect.height;
-                displayWidth = displayHeight * imgRatio;
-                offsetX = (rect.width - displayWidth) / 2;
-                offsetY = 0;
-            } else {
-                // 컨테이너가 더 높음 - 너비 기준
-                displayWidth = rect.width;
-                displayHeight = displayWidth / imgRatio;
-                offsetX = 0;
-                offsetY = (rect.height - displayHeight) / 2;
-            }
-            
-            console.log('Display size:', displayWidth, 'x', displayHeight);
-            console.log('Offset:', offsetX, ',', offsetY);
-            
-            // 원본 프레임 크기 (서버에서 640x480으로 리사이즈됨)
-            const originalWidth = 640;
-            const originalHeight = 480;
-            
-            const scaleX = displayWidth / originalWidth;
-            const scaleY = displayHeight / originalHeight;
-            
-            console.log('Scale:', scaleX, ',', scaleY);
-            
-            // 클릭 위치를 원본 좌표로 변환
-            const originalX = (clickX - offsetX) / scaleX;
-            const originalY = (clickY - offsetY) / scaleY;
-            
-            console.log('Original coordinates:', originalX, originalY);
-            console.log('Current detections:', currentDetections);
-            
-            // 클릭한 위치에 있는 바운딩 박스 찾기
+            // 클릭한 위치에 있는 detection 찾기
             for (let det of currentDetections) {
                 const [x1, y1, x2, y2] = det.bbox;
-                
-                console.log('Checking bbox:', x1, y1, x2, y2);
-                
-                if (originalX >= x1 && originalX <= x2 &&
-                    originalY >= y1 && originalY <= y2) {
-                    console.log('✅ Found matching detection:', det);
-                    selectAndTrack(det.track_id, det.class, det.bbox);
-                    return;
+                if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
+                    selectTargetAndStartTracking(det);
+                    highlightClickedTarget(det, rect, scaleX, scaleY);
+                    break;
                 }
             }
+        });
+        
+        function highlightClickedTarget(det, rect, scaleX, scaleY) {
+            const [x1, y1, x2, y2] = det.bbox;
+            const displayX = x1 / scaleX;
+            const displayY = y1 / scaleY;
+            const displayW = (x2 - x1) / scaleX;
+            const displayH = (y2 - y1) / scaleY;
             
-            console.log('❌ No detection found at click position');
-        });
-
-        socket.on('connect', function() {
-            console.log('Connected to server');
-            hideError();
-        });
-
-        socket.on('disconnect', function() {
-            console.log('Disconnected from server');
-            showError('Disconnected from server');
-        });
-
-        function showError(message) {
-            const errorEl = document.getElementById('error-message');
-            errorEl.textContent = message;
-            errorEl.classList.add('show');
+            const overlay = document.createElement('div');
+            overlay.className = 'click-target';
+            overlay.style.position = 'absolute';
+            overlay.style.left = displayX + 'px';
+            overlay.style.top = displayY + 'px';
+            overlay.style.width = displayW + 'px';
+            overlay.style.height = displayH + 'px';
+            
+            document.getElementById('videoContainer').appendChild(overlay);
+            
+            setTimeout(() => {
+                overlay.remove();
+            }, 1000);
         }
-
-        function hideError() {
-            const errorEl = document.getElementById('error-message');
-            errorEl.classList.remove('show');
+        
+        function toggleLog() {
+            const logContainer = document.getElementById('logContainer');
+            const toggle = document.getElementById('logToggle');
+            logCollapsed = !logCollapsed;
+            
+            if (logCollapsed) {
+                logContainer.classList.add('collapsed');
+                toggle.textContent = '▶';
+            } else {
+                logContainer.classList.remove('collapsed');
+                toggle.textContent = '▼';
+            }
         }
-
+        
+        function addLog(level, message, timestamp) {
+            const logContainer = document.getElementById('logContainer');
+            const logEntry = document.createElement('div');
+            logEntry.className = `log-entry log-${level}`;
+            
+            const ts = timestamp || new Date().toTimeString().split(' ')[0];
+            logEntry.innerHTML = `<span class="log-timestamp">[${ts}]</span>${message}`;
+            
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            
+            while (logContainer.children.length > 50) {
+                logContainer.removeChild(logContainer.firstChild);
+            }
+        }
+        
+        socket.on('connect', () => {
+            addLog('SUCCESS', '서버 연결');
+        });
+        
+        socket.on('log_message', (data) => {
+            addLog(data.level, data.message, data.timestamp);
+        });
+        
+        socket.on('tello_status', (data) => {
+            const statusEl = document.getElementById('connectionStatus');
+            if (data.connected) {
+                statusEl.textContent = '● ON';
+                statusEl.className = 'status-item connected';
+                document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
+                enableControls(true);
+                addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
+            } else {
+                statusEl.textContent = '● OFF';
+                statusEl.className = 'status-item disconnected';
+                enableControls(false);
+                addLog('ERROR', '연결 실패');
+            }
+        });
+        
+        socket.on('detections_update', (data) => {
+            currentDetections = data.detections;
+            document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
+            document.getElementById('heightStatus').textContent = `📏 ${data.height}cm`;
+            
+            updateDetectionsList(data.detections);
+            updateTrackingStatus(data.is_tracking);
+        });
+        
+        socket.on('stream_error', (data) => {
+            addLog('ERROR', data.message);
+        });
+        
+        socket.on('command_response', (data) => {
+            if (data.success) {
+                addLog('SUCCESS', data.message);
+            } else {
+                addLog('ERROR', data.message);
+            }
+        });
+        
         function connectTello() {
-            const btn = document.getElementById('connect-btn');
-            btn.disabled = true;
-            btn.textContent = 'Connecting...';
-            hideError();
+            addLog('INFO', 'Tello 연결중...');
             socket.emit('connect_tello');
+            document.getElementById('connectBtn').disabled = true;
         }
-
+        
         function reconnectTello() {
-            const btn = document.getElementById('reconnect-btn');
-            const connectBtn = document.getElementById('connect-btn');
-            
-            btn.disabled = true;
-            btn.textContent = 'Reconnecting...';
-            connectBtn.disabled = true;
-            
-            hideError();
-            stopTracking();
+            addLog('INFO', 'Tello 재연결중...');
             socket.emit('reconnect_tello');
         }
-
-        socket.on('tello_status', function(data) {
-            const statusEl = document.getElementById('connection-status');
-            const connectBtn = document.getElementById('connect-btn');
-            const reconnectBtn = document.getElementById('reconnect-btn');
-            const clickHint = document.getElementById('click-hint');
-            
-            if (data.connected) {
-                statusEl.textContent = '🟢 Connected';
-                statusEl.className = 'connected';
-                connectBtn.textContent = 'Connected';
-                connectBtn.disabled = true;
-                connectBtn.classList.remove('btn-primary');
-                connectBtn.classList.add('btn-success');
-                
-                reconnectBtn.style.display = 'inline-block';
-                reconnectBtn.disabled = false;
-                reconnectBtn.textContent = '🔄 Reconnect';
-                
-                clickHint.style.display = 'block';
-                setTimeout(() => {
-                    clickHint.style.display = 'none';
-                }, 5000);
-                
-                document.getElementById('battery').textContent = data.battery;
-                hideError();
-            } else {
-                statusEl.textContent = '⚫ Connection Failed';
-                statusEl.className = 'disconnected';
-                connectBtn.textContent = 'Retry Connection';
-                connectBtn.disabled = false;
-                connectBtn.classList.remove('btn-success');
-                connectBtn.classList.add('btn-primary');
-                
-                reconnectBtn.disabled = false;
-                reconnectBtn.textContent = '🔄 Reconnect';
-                clickHint.style.display = 'none';
-                
-                showError('Failed to connect to Tello. Please check the connection and try again.');
-            }
-        });
-
-        socket.on('stream_error', function(data) {
-            showError(data.message);
-            document.getElementById('reconnect-btn').style.display = 'inline-block';
-        });
-
+        
         function sendCommand(command) {
-            console.log('Sending command:', command);
             socket.emit('send_command', {command: command});
         }
-
-        socket.on('command_response', function(data) {
-            if (!data.success) {
-                showError('Command failed: ' + data.message);
-                setTimeout(hideError, 3000);
-            }
-        });
-
-        socket.on('detections_update', function(data) {
-            document.getElementById('battery').textContent = data.battery;
-            document.getElementById('height').textContent = data.height;
+        
+        function updateDetectionsList(detections) {
+            const container = document.getElementById('detectionsContent');
             
-            currentDetections = data.detections;
-            
-            isTracking = data.is_tracking;
-            updateTrackingIndicator(data.is_tracking, data.target_class);
-            updateDetectionsList(data.detections, data.target_track_id);
-        });
-
-        function updateTrackingIndicator(tracking, target) {
-            const indicator = document.getElementById('tracking-indicator');
-            const targetSpan = document.getElementById('tracking-target');
-            const stopBtn = document.getElementById('stop-tracking-btn');
-            
-            if (tracking && target) {
-                indicator.classList.add('active');
-                targetSpan.textContent = target;
-                stopBtn.style.display = 'inline-block';
-            } else {
-                indicator.classList.remove('active');
-                stopBtn.style.display = 'none';
-            }
-        }
-
-        function updateDetectionsList(detections, targetTrackId) {
-            const listEl = document.getElementById('detections-list');
-            
-            if (detections.length === 0) {
-                listEl.innerHTML = '<p style="color: #7f8c8d;">No objects detected</p>';
+            if (!detections || detections.length === 0) {
+                container.innerHTML = '<span style="color: #94a3b8;">감지 대기중...</span>';
                 return;
             }
             
-            listEl.innerHTML = '';
-            detections.forEach((det, index) => {
+            container.innerHTML = '';
+            detections.forEach(det => {
                 const item = document.createElement('div');
                 item.className = 'detection-item';
                 
-                const isSelected = det.track_id === targetTrackId;
-                
-                if (isSelected) {
-                    item.classList.add('selected');
+                if (isTracking && selectedTarget && selectedTarget.track_id === det.track_id) {
+                    item.className += ' tracking';
+                } else if (selectedTarget && selectedTarget.track_id === det.track_id) {
+                    item.className += ' selected';
                 }
                 
                 item.innerHTML = `
-                    <div class="detection-info">
-                        <strong>${det.class} (ID: ${det.track_id})</strong>: ${(det.confidence * 100).toFixed(1)}%
-                    </div>
-                    <div class="detection-actions">
-                        <button class="mini-btn ${isTracking && isSelected ? 'tracking' : ''}" 
-                                onclick="selectAndTrack(${det.track_id}, '${det.class}', ${JSON.stringify(det.bbox).replace(/"/g, '&quot;')})">
-                            ${isTracking && isSelected ? '🎯 Tracking' : '👆 Track'}
-                        </button>
-                    </div>
+                    <strong>ID ${det.track_id}</strong>: ${det.class} 
+                    <span style="opacity: 0.7;">${(det.confidence * 100).toFixed(0)}%</span>
                 `;
                 
-                listEl.appendChild(item);
+                item.onclick = () => selectTargetAndStartTracking(det);
+                container.appendChild(item);
             });
         }
-
-        function selectAndTrack(trackId, targetClass, bbox) {
-            selectedTrackId = trackId;
-            selectedTarget = targetClass;
-            selectedBbox = bbox;
+        
+        function selectTargetAndStartTracking(detection) {
+            selectedTarget = detection;
             
-            console.log('Setting target:', trackId, targetClass, bbox);
+            addLog('INFO', `타겟: ID ${detection.track_id} (${detection.class})`);
             
+            // 서버에 타겟 설정
             socket.emit('set_target', {
-                track_id: trackId,
-                class: targetClass,
-                bbox: bbox
+                track_id: detection.track_id,
+                class: detection.class,
+                bbox: detection.bbox
             });
             
-            socket.emit('start_tracking');
-            
-            console.log('Starting tracking:', trackId, targetClass);
-        }
-
-        function stopTracking() {
-            socket.emit('stop_tracking');
-            selectedTrackId = null;
-            selectedTarget = null;
-            selectedBbox = null;
-            isTracking = false;
-            console.log('Tracking stopped');
-        }
-
-        socket.on('target_response', function(data) {
-            console.log('Target confirmed:', data);
-        });
-
-        socket.on('tracking_status', function(data) {
-            isTracking = data.is_tracking;
-            
-            if (data.is_tracking) {
-                console.log('Tracking started:', data);
-            } else {
-                console.log('Tracking stopped');
-                if (data.message) {
-                    showError(data.message);
-                    setTimeout(hideError, 3000);
-                }
+            // 즉시 추적 시작
+            if (!isTracking) {
+                addLog('SUCCESS', '🎯 추적 시작!');
+                socket.emit('start_tracking');
+                isTracking = true;
+                updateTrackingStatus(true);
             }
-        });
+            
+            // 목록 업데이트
+            updateDetectionsList(currentDetections);
+        }
+        
+        function updateTrackingStatus(tracking) {
+            isTracking = tracking;
+            const statusEl = document.getElementById('trackingStatus');
+            const stopBtn = document.getElementById('stopTrackingBtn');
+            
+            if (tracking && selectedTarget) {
+                statusEl.textContent = `🎯 추적중: ID ${selectedTarget.track_id} (${selectedTarget.class})`;
+                statusEl.className = 'active';
+                stopBtn.style.display = 'block';
+            } else {
+                statusEl.textContent = '추적 안 함';
+                statusEl.className = '';
+                stopBtn.style.display = 'none';
+            }
+        }
+        
+        function stopTracking() {
+            addLog('INFO', '추적 중지');
+            socket.emit('stop_tracking');
+            isTracking = false;
+            updateTrackingStatus(false);
+        }
+        
+        function enableControls(enabled) {
+            const buttons = [
+                'reconnectBtn', 'takeoffBtn', 'landBtn', 'emergencyBtn',
+                'forwardBtn', 'backBtn', 'leftBtn', 'rightBtn', 
+                'upBtn', 'downBtn', 'cwBtn', 'ccwBtn'
+            ];
+            
+            buttons.forEach(id => {
+                document.getElementById(id).disabled = !enabled;
+            });
+        }
+        
+        window.onload = () => {
+            addLog('INFO', '시스템 준비');
+        };
     </script>
 </body>
 </html>
