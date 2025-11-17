@@ -16,12 +16,3 @@ PERSON_CLASS_ID = 0
 
 # --- ReID (OpenVINO ONNX) ---
 REID_ONNX = "/home/intel/tello/aeyong/object_detection/models/repvgg_a0_person_reid_512.onnx" #"models/osnet_x1_0.onnx"
-
-# --- Tracker ---
-IOU_WEIGHT   = 0.5
-REID_WEIGHT  = 0.5
-EMB_MATCH_TH = 0.6
-TRACK_BUFFER = 30
-
-# --- Sources ---
-TELLO_UDP = "udp://0.0.0.0:11111?fifo_size=1000000&overrun_nonfatal=1"

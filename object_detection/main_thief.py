@@ -16,7 +16,7 @@ Thief mode:
 
 import cv2, argparse
 import numpy as np
-from utils.config import ULTRA_MODEL, DETECTOR_ONNX, DETECTOR_NMS_JSON, PERSON_CLASS_ID, TELLO_UDP
+from utils.config import ULTRA_MODEL, DETECTOR_ONNX, DETECTOR_NMS_JSON, PERSON_CLASS_ID
 from utils.draw import draw_focus       #💖
 from tracker_thief import ThiefTracker  #💖
 from utils.reid_repVGG_ov import OVReID
@@ -29,13 +29,28 @@ THIEF_PATH = "cache/thief_gallery.npy"  #💖
 # 영상 입력
 # ------------------------------
 def open_source(src):
-    if src == "tello": src = TELLO_UDP
+    if src == "tello":
+        from djitellopy import Tello
+        t = Tello()
+        print("[TELLO] Connecting...")
+        t.connect()
+        try:
+            bat = t.get_battery()
+            print(f"[TELLO] Battery: {bat}%")
+        except Exception as e:
+            print(f"[TELLO] battery read error: {e}")
+
+        t.streamon()
+        print("[TELLO] streamon()")
+        frame_reader = t.get_frame_read()
+        return "tello", t, frame_reader
+
     try:
         cam_index = int(src)
         cap = cv2.VideoCapture(cam_index)
     except ValueError:
         cap = cv2.VideoCapture(src)
-    return cap
+    return "cv", cap, None
 
 
 # ------------------------------
@@ -117,38 +132,60 @@ def main():
     print("[THIEF] ThiefTracker initialized.")
     #💖
 
-    cap = open_source(args.source)
-    if not cap.isOpened():
-        print("ERROR: cannot open", args.source)
-        return
+    mode, cap, frame_reader = open_source(args.source)
+    if mode == "cv":
+        if not cap.isOpened():
+            print("ERROR: cannot open", args.source)
+            return
 
     # ------------------------
     # Main loop
     # ------------------------
+    frame_idx = 0 #💖 프레임 카운터
+    
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        # ========== 1) YOLO → now_dets ==========
-        # dets shape: [N, 6] = [x1,y1,x2,y2,score,cls]
-        dets = detector.infer(frame)
-
-        # ========== 2) crop → OVReID → now_emb ==========
-        now_dets = []     # [x1,y1,x2,y2,score]
-        now_embs = []     # ReID emb
-        for x1, y1, x2, y2, conf, cls in dets:
-            if int(cls) != PERSON_CLASS_ID:
+        if mode == "tello":
+            frame = frame_reader.frame
+            if frame is None:
+                # 아직 첫 프레임 안 온 경우도 있어서 한 번 더 기다리기
                 continue
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame = cv2.resize(frame, (640, 480))
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+        frame_idx += 1
 
-            crop = crop_safe(frame, (x1, y1, x2, y2))
-            now_emb = reid.embed(crop)
+        # ---------- 0) 이 프레임에서 YOLO/ReID를 돌릴지 결정 ----------
+        run_det = (frame_idx % 3 == 0) # 3프레임마다 추론
 
-            now_dets.append([x1, y1, x2, y2, conf])
-            now_embs.append(now_emb)
+        if run_det:
 
-        # numpy로 맞추기
-        now_dets = np.asarray(now_dets, dtype=np.float32)
+            # ========== 1) YOLO → now_dets ==========
+            # dets shape: [N, 6] = [x1,y1,x2,y2,score,cls]
+            dets = detector.infer(frame)
+
+            # ========== 2) crop → OVReID → now_emb ==========
+            now_dets = []     # [x1,y1,x2,y2,score]
+            now_embs = []     # ReID emb
+            for x1, y1, x2, y2, conf, cls in dets:
+                if int(cls) != PERSON_CLASS_ID:
+                    continue
+
+                crop = crop_safe(frame, (x1, y1, x2, y2))
+                now_emb = reid.embed(crop)
+
+                now_dets.append([x1, y1, x2, y2, conf])
+                now_embs.append(now_emb)
+
+            # numpy로 맞추기
+            now_dets = np.asarray(now_dets, dtype=np.float32)
+
+        else:
+            # 🔥 이 프레임은 관측 없이 Kalman만 돌리기
+            now_dets = np.zeros((0, 5), dtype=np.float32)
+            now_embs = []
 
         # ========== 3) ThiefTracker.update(now_dets, now_embs) ==========
         # 내부에서 TrackState.predict/update + 도둑 갤러리 기반 매칭 처리
@@ -174,10 +211,16 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-    cap.release()
+    if mode == "tello":
+        try: cap.streamoff()
+        except: pass
+        try: cap.end()
+        except: pass
+    else:
+        cap.release()
     cv2.destroyAllWindows()
 
-    # 🔹 종료할 때: 현재 도둑 갤러리 저장  #💖
+    # 종료할 때: 현재 도둑 갤러리 저장  #💖
     thief_gallery = {thief_id: {"gal_embs": thief_tracker.thief_embs}}
     save_gallery(THIEF_PATH, thief_gallery)
 
