@@ -1,30 +1,29 @@
-# main_xpu.py
+# main_thief.py
 """
-Pipeline (time axis naming):
+Thief mode:
 
-t = now frame
-t-1 = last frame
+1. 시작할 때:
+   - longterm gallery(np.load)에서 thief_id 갤러리만 꺼냄
+   - ThiefTracker(thief_embs=...) 초기화
 
-1. YOLO → now_dets   (각각 now_bbox_tlbr, now_score, now_cls)
-2. crop → OVReID → now_emb(t)
-3. LongTermBoTSORT.update(now_dets, now_embs) 호출
-   내부 동작:
-     - BoTSORT.update()
-         Track.predict() → pred_bbox_tlbr
-         last_bbox_tlbr & last_emb 업데이트
-     - LongTerm: last_emb ↔ gal_emb 비교 → identity_id 부여
-4. 화면에 track.identity_id를 그리면 됨.
+2. 매 프레임:
+   - YOLO → now_dets (person만)
+   - crop → OVReID → now_embs
+   - ThiefTracker.update(now_dets, now_embs)
+   - 반환된 트랙(논리상 0 또는 1개)에 대해 cos_dist(thief_dist)가 충분히 작으면
+     화면에 빨간 박스로 표시 / 드론 제어에 사용
 """
 
 import cv2, argparse
 import numpy as np
 from utils.config import ULTRA_MODEL, DETECTOR_ONNX, DETECTOR_NMS_JSON, PERSON_CLASS_ID, TELLO_UDP
-from utils.draw import draw_track
-from tracker_botsort import BoTSORT, LongTermBoTSORT
+from utils.draw import draw_focus       #💖
+from tracker_thief import ThiefTracker  #💖
 from utils.reid_repVGG_ov import OVReID
 
 from utils.gallery_io import save_gallery, load_gallery
-GALLERY_PATH = "cache/longterm_gallery.npy" 
+GALLERY_PATH = "cache/longterm_gallery.npy"
+THIEF_PATH = "cache/thief_gallery.npy"  #💖
 
 # ------------------------------
 # 영상 입력
@@ -65,6 +64,7 @@ def parse():
     ap.add_argument("--device", default="GPU", help="OpenVINO device: CPU/GPU")
     ap.add_argument("--onnx", default=None, help="YOLO raw-head ONNX")
     ap.add_argument("--nms-json", default=None, help="optional NMS JSON")
+    ap.add_argument("--thief-id", type=int, required=True, help="LongTerm identity id to track as thief")  #💖
     return ap.parse_args()
 
 
@@ -93,20 +93,29 @@ def main():
     # ReID embedder
     reid = OVReID(device=args.device)
 
-    # Tracker: BoTSORT + LongTerm
-    base_tracker = BoTSORT()
-    tracker = LongTermBoTSORT(base_tracker)
-
-    # 🔹 시작할 때: 갤러리 파일이 있으면 불러오기
+    # ------------------------
+    # LongTerm 갤러리에서 도둑 갤러리만 로드 #💖
+    # ------------------------
+    # gallery: {id: {"gal_embs": [emb1, emb2, ...]}, ...}
     gallery = load_gallery(GALLERY_PATH)
-    if len(gallery) > 0:
-        tracker.gallery = gallery
-        tracker.next_identity = max(gallery.keys()) + 1
-        print("[LT-GAL] start AGAIN with saved gallery")
-    else:
-        tracker.gallery = {}
-        tracker.next_identity = 1
-        print("[LT-GAL] NEW start with empty gallery")
+    if len(gallery) == 0:
+        print("[THIEF] ERROR: longterm gallery is empty. Run main_xpu (search mode) first.")
+        return
+
+    thief_id = args.thief_id
+    if thief_id not in gallery:
+        print(f"[THIEF] ERROR: identity_id {thief_id} not found in gallery. keys={list(gallery.keys())}")
+        return
+
+    thief_info = gallery[thief_id]        # {"gal_embs": [...]}
+    thief_embs = thief_info["gal_embs"]   # 실제 임베딩 리스트만 꺼내기
+
+    print(f"[THIEF] Using gallery for identity_id={thief_id}, "
+          f"K={len(thief_embs) if hasattr(thief_embs, '__len__') else '1'}")
+    
+    thief_tracker = ThiefTracker(thief_embs=thief_embs)
+    print("[THIEF] ThiefTracker initialized.")
+    #💖
 
     cap = open_source(args.source)
     if not cap.isOpened():
@@ -126,8 +135,8 @@ def main():
         dets = detector.infer(frame)
 
         # ========== 2) crop → OVReID → now_emb ==========
-        now_dets = []     # [now_bbox_tlbr, now_score]
-        now_embs = []     # now_emb
+        now_dets = []     # [x1,y1,x2,y2,score]
+        now_embs = []     # ReID emb
         for x1, y1, x2, y2, conf, cls in dets:
             if int(cls) != PERSON_CLASS_ID:
                 continue
@@ -141,32 +150,36 @@ def main():
         # numpy로 맞추기
         now_dets = np.asarray(now_dets, dtype=np.float32)
 
-        # ========== 3) LongTermBoTSORT.update(now_dets, now_embs) ==========
-        # 내부에서 BoTSORT.update → Track.predict/predict/update → Track.last_*, pred_* 처리
-        # long-term identity까지 완성된 Track 리스트 반환
-        tracks = tracker.update(now_dets, now_embs)
+        # ========== 3) ThiefTracker.update(now_dets, now_embs) ==========
+        # 내부에서 TrackState.predict/update + 도둑 갤러리 기반 매칭 처리
+        tracks = thief_tracker.update(now_dets, now_embs)
 
         # ========== 4) 화면 표시 ==========
         if args.display:
             vis = frame.copy()
             for t in tracks:
-                # BoTSORT는 Track.last_bbox_tlbr 로 위치를 유지함
+                # cos_dist 기준으로 필터
+                if getattr(t, "thief_dist", 1.0) > thief_tracker.thief_cos_dist: 
+                    continue
+                
+                # 위치 유지
                 box = t.last_bbox_tlbr
 
-                # 화면 표시 ID: identity_id 우선, 없으면 track_id
-                tid = getattr(t, "identity_id", t.track_id)
+                # 화면 표시 ID: thief_id만 있음
+                tid = thief_id
 
-                draw_track(vis, box, tid)
+                draw_focus(vis, box, tid)
 
-            cv2.imshow("XPU ReID Tracker (LongTerm + BoTSORT)", vis)
+            cv2.imshow(f"Thief Mode (id={thief_id})", vis)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     cap.release()
     cv2.destroyAllWindows()
 
-    # 🔹 종료할 때: 현재 갤러리 저장
-    save_gallery(GALLERY_PATH, tracker.gallery)
+    # 🔹 종료할 때: 현재 도둑 갤러리 저장  #💖
+    thief_gallery = {thief_id: {"gal_embs": thief_tracker.thief_embs}}
+    save_gallery(THIEF_PATH, thief_gallery)
 
 if __name__ == "__main__":
     main()

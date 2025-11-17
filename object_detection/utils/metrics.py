@@ -35,6 +35,31 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
         return 1.0
     return 1.0 - float(np.dot(a, b) / (na * nb + 1e-6))
 
+def min_cos_dist_to_list(cand_emb, gallery_embs, default=1.0):
+    """
+    cand_emb vs gallery_embs(list/ndarray) 중 최소 코사인 거리.
+    - cand_emb is None 이거나, gallery가 비어 있으면 default 반환 (기본 1.0)
+    """
+    if cand_emb is None:
+        return default
+    if gallery_embs is None:
+        return default
+
+    # list, tuple, np.ndarray 다 허용
+    # np.ndarray 인 경우 (K, D) / (D,) 모두 처리
+    if isinstance(gallery_embs, np.ndarray):
+        if gallery_embs.ndim == 1:
+            gallery_list = [gallery_embs]
+        else:
+            gallery_list = [g for g in gallery_embs]
+    else:
+        gallery_list = list(gallery_embs)
+
+    if len(gallery_list) == 0:
+        return default
+
+    return min(cosine_distance(cand_emb, g) for g in gallery_list)
+
 
 def bbox_center(box: np.ndarray) -> Tuple[float, float]:
     """
