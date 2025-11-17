@@ -50,6 +50,12 @@ class Settings:
     frame_width: int = 960
     frame_height: int = 720
 
+    """Tello"""
+    # tello_id:str = '5FD7AB' # blue tello 
+    # tello_id:str = '5A6D18' # white tello
+    tello_id:str = None
+    """set tello_id to None for automatic connection"""
+
     def __post_init__(self): #
         try:
             with open('config.json') as f:

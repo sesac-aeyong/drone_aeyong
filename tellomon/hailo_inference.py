@@ -13,7 +13,7 @@ from tracker.bot_sort import BoTSORT
 from settings import settings as S
 from yolo_tools import extract_detections
 
-class Hailo():
+class HailoRun():
     """
     Hailo pipeline class.
 
@@ -21,28 +21,9 @@ class Hailo():
     frame -> vis_model -> emb_model -> (dets, depth, yolobox)
           \\_ dep_model              /
     """
-    def _deq(self, model, data):
-        out = model.infer_model.outputs[0]
-        qi = out.quant_infos[0]
-        return (data - qi.qp_zp) * qi.qp_scale
-
-    def _emb_deq_norm(self, emb):
-        deq = self._deq(self.emb_m, emb)
-        
-        norm = np.linalg.norm(deq)
-        return deq / norm if norm > 0 else deq
-    
-    def _dep_deq(self, data):
-        deq = self._deq(self.dep_m, data)
-
-        depth = np.exp(-deq)
-        depth = 1.0 / (1.0 + depth)
-        depth = 1.0 / (depth * 10.0 + 0.009)
-        return depth
-
-    def __init__(self):
+    def load(self):
+        self.loaded = True
         ct = time.time()
-        print('loading Hailo models')
         print('vis model:', S.vis_model)
         print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
@@ -50,15 +31,33 @@ class Hailo():
         self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
         self.emb_m = HailoInfer(S.embed_model, output_type='UINT8') # dequantize on host to save bandwidth
 
-        # print(self.dep_m.infer_model.)
-        # out = self.emb_m.infer_model.outputs[0]
-        # quant_info = out.quant_infos[0]
-        # print(quant_info.qp_scale, quant_info.qp_zp)
-
-
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
         self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
         self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
+
+        # buffers
+        self.emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
+        """embeddings buffer"""
+        self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
+        """vision model framebuffer"""
+        self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
+        """depth model framebuffer"""
+        self.crop_fbs = [np.empty((self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
+                          for _ in range(S.max_emb_threads)]
+        """crop framebuffer per thread"""
+        print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
+
+
+    def __init__(self):
+        print('hailo init')
+        self.loaded = False
+        self.vis_m = None
+        self.dep_m = None
+        self.emb_m = None
+
+        self.vm_shape = None
+        self.em_shape = None
+        self.dm_shape = None
 
         self.vis_q = queue.Queue()
         self.dep_q = queue.Queue()
@@ -82,20 +81,8 @@ class Hailo():
             ablation=False
         ))
 
-        # optimizations
         self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
-        self.emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
-        """embeddings buffer"""
-        self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
-        """vision model framebuffer"""
-        self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
-        """depth model framebuffer"""
-        self.crop_fbs = [np.empty((self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
-                          for _ in range(S.max_emb_threads)]
-        """crop framebuffer per thread"""
-
         self._thread_local = threading.local()
-        print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
 
     def letterbox_buffer(self, src, dst, new_shape=640, color=(114,114,114)):
@@ -171,7 +158,6 @@ class Hailo():
                 continue
             buf = self._get_thread_buffer()
             cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
-            cv2.imshow('buf', buf)
             futures.append(self.executor.submit(self._submit_embedding, buf, i))
             emb_ids.append(i)
         
@@ -225,16 +211,16 @@ class Hailo():
             self.emb_buf[i].fill(0)
 
         depth = self._dep_deq(self.dep_q.get())
-        print(depth[160,128])
+        # print(depth[160,128])
         depth_norm = cv2.normalize(depth.squeeze(), None, 0, 255, cv2.NORM_MINMAX)
-        depth_uint8 = depth_norm.astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
-        depth_color = cv2.resize(depth_color, (640, 480))
-        cv2.imshow("Relative Depth", depth_color)
+        # depth_uint8 = depth_norm.astype(np.uint8)
+        # depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
+        # depth_color = cv2.resize(depth_color, (640, 480))
+        # cv2.imshow("Relative Depth", depth_color)
 
         # print(depth)
 
-        return rets, depth, boxes
+        return rets, depth_norm, boxes
         
     def _get_thread_buffer(self):
         if not hasattr(self._thread_local, 'buf'):
@@ -261,6 +247,25 @@ class Hailo():
         x2 = min(S.frame_width, x2)
 
         return x1, y1, x2, y2
+
+    def _deq(self, model, data):
+        out = model.infer_model.outputs[0]
+        qi = out.quant_infos[0]
+        return (data - qi.qp_zp) * qi.qp_scale
+
+    def _emb_deq_norm(self, emb):
+        deq = self._deq(self.emb_m, emb)
+        
+        norm = np.linalg.norm(deq)
+        return deq / norm if norm > 0 else deq
+    
+    def _dep_deq(self, data):
+        deq = self._deq(self.dep_m, data)
+
+        depth = np.exp(-deq)
+        depth = 1.0 / (1.0 + depth)
+        depth = 1.0 / (depth * 10.0 + 0.009)
+        return depth
     
     def close(self):
         self.vis_m.close()

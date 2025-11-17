@@ -6,27 +6,95 @@ TODO:: Tello ASCII art? xD
 """
 
 import sys
+import threading
 import time
 import cv2
 import numpy as np
 from common.toolbox import load_json_file
-from hailo import Hailo
+from hailo_inference import HailoRun
+from tello import TelloConnection
 from yolo_tools import draw_detection
+from djitellopy import Tello
+from settings import settings as S
+
+
+def _show(frame, dets, yolobox) -> bool:
+    if 'show' in sys.argv[1:]:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        for det in dets:    
+            tid, label, score, x1, y1, x2, y2 = det
+            draw_detection(
+                frame,
+                [x1, y1, x2, y2],
+                [label, f"ID {tid}"],  # second element used as bottom_text when track=True
+                score=score * 100.0,
+                color=(255, 255, 255),
+                track=True
+            )
+    
+        if 'yolo' in sys.argv[1:]:
+            for box in yolobox:
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255,0,0), 1)
+
+        cv2.imshow('out', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            return True
+    return False
 
 
 class TelloMon():
-    def __init__(self, config:dict):
-        self.config = config
+    def __init__(self):
+        self.conn = TelloConnection()
+        self.hailo = HailoRun()
+        tconn = threading.Thread(target=self.conn.connect_to_tello, args=(S.tello_id,))  
+        thailo = threading.Thread(target=self.hailo.load)
+
+        tconn.start()
+        thailo.start()
+
+        tconn.join()
+        thailo.join()
         
+        self.tello = Tello()
+        
+        self.tello.connect()
+        print('Tello battery:', self.tello.get_battery())
+        print('Tello temp:', self.tello.get_highest_temperature())
+        # self.tello.initiate_throw_takeoff()
+        if not self.tello.stream_on:
+            self.tello.streamon()
+
+        feed = None
+        for _ in range(5):  # try up to 5 times
+            try:
+                feed = self.tello.get_frame_read()
+                break
+            except ValueError:
+                print("Stream not ready, retrying...")
+                self.tello.streamon()
+                time.sleep(3)
+        if feed is None:
+            raise Exception('Could not open tello stream')
+
+
+        ### 
+        while True:
+            frame = feed.frame
+            dets, depth, yolobox = self.hailo.run(frame)
+
+            if _show(frame, dets, yolobox):
+                break
+
+        if self.tello.stream_on:
+            self.tello.streamoff()
+
 
 
 def main():
-    raise NotImplementedError('Usage: python main.py test [fps, show, yolo, file.mp4]')
-    config = load_json_file('config.json')
-    tello = TelloMon(config)
-    hailo = Hailo()
+    # raise NotImplementedError('Usage: python main.py test [fps, show, yolo, file.mp4]')
+    tellomon = TelloMon()
     
-    pass
 
 def hailo():
     """
@@ -36,7 +104,8 @@ def hailo():
         cap = cv2.VideoCapture(sys.argv[-1])
     else:
         cap = cv2.VideoCapture(0)
-    hailo = Hailo() 
+    hailo = HailoRun() 
+    hailo.load()
     fps = []
     
     print_interval = 1 # seconds
@@ -59,26 +128,8 @@ def hailo():
                     print(f'current fps: {fps_cur:.1f}, avg: {sum(fps) / len(fps):.1f}')
                     last_print = time.time()
 
-            if 'show' in sys.argv[1:]:
-                for det in dets:    
-                    tid, label, score, x1, y1, x2, y2 = det
-                    draw_detection(
-                        frame,
-                        [x1, y1, x2, y2],
-                        [label, f"ID {tid}"],  # second element used as bottom_text when track=True
-                        score=score * 100.0,
-                        color=(255, 255, 255),
-                        track=True
-                    )
-            
-                if 'yolo' in sys.argv[1:]:
-                    for box in yolobox:
-                        x1, y1, x2, y2 = map(int, box)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255,0,0), 1)
-
-                cv2.imshow('out', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            if _show(frame, dets, yolobox):
+                break
             
     except KeyboardInterrupt:
         pass
