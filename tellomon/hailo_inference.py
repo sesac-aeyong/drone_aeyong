@@ -9,9 +9,16 @@ import numpy as np
 import cv2
 
 from common.hailo_inference import HailoInfer
-from tracker.bot_sort import BoTSORT
+# from tracker.bot_sort import BoTSORT
+from tracker.utils.gallery_io import load_gallery
+from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT
 from settings import settings as S
 from yolo_tools import extract_detections
+
+
+GALLERY_PATH = "cache/longterm_gallery.npy" 
+
+
 
 class HailoRun():
     """
@@ -66,20 +73,35 @@ class HailoRun():
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
         self.dep_cb = partial(_callback, output_queue = self.dep_q)
 
-        self.tracker = BoTSORT(args = SimpleNamespace(
-            track_high_thresh=S.track_high_emb_confidence,
-            track_low_thresh=S.track_low_emb_confidence,
-            new_track_thresh=S.track_new_threshold,
-            track_buffer=S.track_buffer,
-            proximity_thresh=0.8,
-            appearance_thresh=0.4,
-            match_thresh=0.9,
-            mot20=False,
-            with_reid=True,  # set True if you have ReID embeddings
-            cmc_method='sparseOptFlow',  # for GMC
-            name='BoTSORT',
-            ablation=False
-        ))
+        # self.tracker = BoTSORT(args = SimpleNamespace(
+        #     track_high_thresh=S.track_high_emb_confidence,
+        #     track_low_thresh=S.track_low_emb_confidence,
+        #     new_track_thresh=S.track_new_threshold,
+        #     track_buffer=S.track_buffer,
+        #     proximity_thresh=0.8,
+        #     appearance_thresh=0.4,
+        #     match_thresh=0.9,
+        #     mot20=False,
+        #     with_reid=True,  # set True if you have ReID embeddings
+        #     cmc_method='sparseOptFlow',  # for GMC
+        #     name='BoTSORT',
+        #     ablation=False
+        # ))
+
+        # reid = OVReID(device=args.device)
+        base_tracker = BoTSORT()
+        self.tracker = LongTermBoTSORT(base_tracker)
+
+        gallery = load_gallery(GALLERY_PATH)
+        if len(gallery) > 0:
+            self.tracker.gallery = gallery
+            self.tracker.next_identity = max(gallery.keys()) + 1
+            print("[LT-GAL] start AGAIN with saved gallery")
+        else:
+            self.tracker.gallery = {}
+            self.tracker.next_identity = 1
+            print("[LT-GAL] NEW start with empty gallery")
+
 
         self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
         self._thread_local = threading.local()
@@ -150,15 +172,16 @@ class HailoRun():
         futures = []
         emb_ids = []
         for i in range(num_detections):
-            if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
-                continue
+            # if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
+            #     continue
             x1, y1, x2, y2 = self._safe_box(boxes[i])
             crop = frame[y1:y2, x1:x2]
-            if crop.size < S.min_emb_cropsize:
-                continue
-            buf = self._get_thread_buffer()
-            cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
-            futures.append(self.executor.submit(self._submit_embedding, buf, i))
+            # if crop.size < S.min_emb_cropsize:
+            #     continue
+            # buf = self._get_thread_buffer()
+            # cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
+            crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
+            futures.append(self.executor.submit(self._submit_embedding, crop, i))
             emb_ids.append(i)
         
         ### Tried batch processing, it's actually slower than threaded async. 
@@ -182,33 +205,36 @@ class HailoRun():
         #                        det_ids = det_ids
         #                        ))
         # detections[i] == embeddings[i] for ease of use. 
-        # embeddings = [None] * num_detections
+        embeddings = [None] * num_detections
         # print(self.emb_m.hef.get_output_vstream_infos())
 
         # for _ in range(len(person_crops)):
         #     det_id, emb = self.emb_q.get()
         #     embeddings[det_id] = emb
 
-        for _ in range(len(futures)):
+        for _ in range(num_detections):
             det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
-            self.emb_buf[det_id] = self._emb_deq_norm(emb)
+            # self.emb_buf[det_id] = self._emb_deq_norm(emb)
+            embeddings[det_id] = self._emb_deq_norm(emb)
 
         targets = self.tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), # _extract_detections already took care of min conf. 
-            frame,
-            self.emb_buf[:num_detections]
+            # frame,
+            # self.emb_buf[:num_detections]
+            embeddings
             )
         
         rets = []
         for track in targets:
-            t_id = track.track_id
-            x1, y1, x2, y2 = track.tlbr
+            # t_id = track.track_id
+            t_id = getattr(track, 'identity_id', track.track_id)
+            x1, y1, x2, y2 = track.last_bbox_tlbr
             
             rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
 
         # clean up used embedding buffers 
-        for i in emb_ids:
-            self.emb_buf[i].fill(0)
+        # for i in emb_ids:
+        #     self.emb_buf[i].fill(0)
 
         depth = self._dep_deq(self.dep_q.get())
         # print(depth[160,128])
@@ -255,7 +281,7 @@ class HailoRun():
 
     def _emb_deq_norm(self, emb):
         deq = self._deq(self.emb_m, emb)
-        
+        # return deq
         norm = np.linalg.norm(deq)
         return deq / norm if norm > 0 else deq
     

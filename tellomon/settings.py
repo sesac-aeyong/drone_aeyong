@@ -19,7 +19,7 @@ class Settings:
 
     max_vis_detections: int = 30
     """vision model max detections"""
-    min_vis_score_threshold: float = 0.6
+    min_vis_score_threshold: float = 0.7
     """vision model confidence threshold"""
     min_emb_confidence: float = min_vis_score_threshold
     """minimum vis_model confidence to update embedding"""
