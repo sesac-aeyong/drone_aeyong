@@ -9,7 +9,6 @@ import numpy as np
 import cv2
 
 from common.hailo_inference import HailoInfer
-# from tracker.bot_sort import BoTSORT
 from tracker.utils.gallery_io import load_gallery
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT
 from settings import settings as S
@@ -72,21 +71,6 @@ class HailoRun():
 
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
         self.dep_cb = partial(_callback, output_queue = self.dep_q)
-
-        # self.tracker = BoTSORT(args = SimpleNamespace(
-        #     track_high_thresh=S.track_high_emb_confidence,
-        #     track_low_thresh=S.track_low_emb_confidence,
-        #     new_track_thresh=S.track_new_threshold,
-        #     track_buffer=S.track_buffer,
-        #     proximity_thresh=0.8,
-        #     appearance_thresh=0.4,
-        #     match_thresh=0.9,
-        #     mot20=False,
-        #     with_reid=True,  # set True if you have ReID embeddings
-        #     cmc_method='sparseOptFlow',  # for GMC
-        #     name='BoTSORT',
-        #     ablation=False
-        # ))
 
         # reid = OVReID(device=args.device)
         base_tracker = BoTSORT()
@@ -247,7 +231,59 @@ class HailoRun():
         # print(depth)
 
         return rets, depth_norm, boxes
+
+    def draw_detections_on_frame(self, frame, detections, target_track_id=None):
+        """
+        프레임에 감지 결과 그리기
         
+        Args:
+            frame: RGB 이미지
+            detections: 감지된 객체 리스트 (bbox in [x1, y1, x2, y2] format)
+            target_track_id: 추적 중인 타겟의 track_id (빨간색으로 표시)
+        
+        Returns:
+            annotated_frame: 감지 결과가 그려진 프레임
+        """
+        annotated_frame = frame.copy()
+        h, w = annotated_frame.shape[:2]
+        
+        for det in detections:
+            tid = det['track_id']
+            label = det['class']
+            score = det['confidence']
+            x1, y1, x2, y2 = det['bbox']  # [x1, y1, x2, y2] format
+            
+            # 추적 중인 타겟이면 빨간색, 아니면 흰색
+            is_target = (tid == target_track_id)
+            color = (0, 0, 255) if is_target else (255, 255, 255)  # RGB
+            
+            # 라벨 수정 (추적 중이면 표시)
+            if is_target:
+                label_text = [f"🎯 {label}", f"ID {tid}"]
+            else:
+                label_text = [label, f"ID {tid}"]
+
+            # 추적 중인 타겟이면 중심점도 그리기
+            if is_target:
+                # bbox를 프레임 범위 내로 클리핑
+                x1_clipped = max(0, min(x1, w - 1))
+                y1_clipped = max(0, min(y1, h - 1))
+                x2_clipped = max(0, min(x2, w - 1))
+                y2_clipped = max(0, min(y2, h - 1))
+                
+                # 유효한 bbox인지 확인
+                if x2_clipped > x1_clipped and y2_clipped > y1_clipped:
+                    # 클리핑된 bbox의 중심점 계산
+                    center_x = int((x1_clipped + x2_clipped) / 2)
+                    center_y = int((y1_clipped + y2_clipped) / 2)
+                    
+                    # 중심점이 프레임 내부에 있을 때만 그리기
+                    if 0 <= center_x < w and 0 <= center_y < h:
+                        cv2.circle(annotated_frame, (center_x, center_y), 10, (255, 0, 0), -1)
+                        cv2.circle(annotated_frame, (center_x, center_y), 15, (255, 0, 0), 2)
+        
+        return annotated_frame
+
     def _get_thread_buffer(self):
         if not hasattr(self._thread_local, 'buf'):
             # pick a buffer based on thread id
