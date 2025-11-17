@@ -13,7 +13,6 @@ from tracker.bot_sort import BoTSORT
 from settings import settings as S
 from yolo_tools import extract_detections
 
-
 class Hailo():
     """
     Hailo pipeline class.
@@ -22,6 +21,25 @@ class Hailo():
     frame -> vis_model -> emb_model -> (dets, depth, yolobox)
           \\_ dep_model              /
     """
+    def _deq(self, model, data):
+        out = model.infer_model.outputs[0]
+        qi = out.quant_infos[0]
+        return (data - qi.qp_zp) * qi.qp_scale
+
+    def _emb_deq_norm(self, emb):
+        deq = self._deq(self.emb_m, emb)
+        
+        norm = np.linalg.norm(deq)
+        return deq / norm if norm > 0 else deq
+    
+    def _dep_deq(self, data):
+        deq = self._deq(self.dep_m, data)
+
+        depth = np.exp(-deq)
+        depth = 1.0 / (1.0 + depth)
+        depth = 1.0 / (depth * 10.0 + 0.009)
+        return depth
+
     def __init__(self):
         ct = time.time()
         print('loading Hailo models')
@@ -29,8 +47,15 @@ class Hailo():
         print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
         self.vis_m = HailoInfer(S.vis_model)
-        self.dep_m = HailoInfer(S.depth_model)
-        self.emb_m = HailoInfer(S.embed_model, output_type='FLOAT32')
+        self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
+        self.emb_m = HailoInfer(S.embed_model, output_type='UINT8') # dequantize on host to save bandwidth
+
+        # print(self.dep_m.infer_model.)
+        # out = self.emb_m.infer_model.outputs[0]
+        # quant_info = out.quant_infos[0]
+        # print(quant_info.qp_scale, quant_info.qp_zp)
+
+
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
         self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
         self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
@@ -180,7 +205,7 @@ class Hailo():
 
         for _ in range(len(futures)):
             det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
-            self.emb_buf[det_id] = emb
+            self.emb_buf[det_id] = self._emb_deq_norm(emb)
 
         targets = self.tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), # _extract_detections already took care of min conf. 
@@ -199,7 +224,17 @@ class Hailo():
         for i in emb_ids:
             self.emb_buf[i].fill(0)
 
-        return rets, self.dep_q.get(), boxes
+        depth = self._dep_deq(self.dep_q.get())
+        print(depth[160,128])
+        depth_norm = cv2.normalize(depth.squeeze(), None, 0, 255, cv2.NORM_MINMAX)
+        depth_uint8 = depth_norm.astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
+        depth_color = cv2.resize(depth_color, (640, 480))
+        cv2.imshow("Relative Depth", depth_color)
+
+        # print(depth)
+
+        return rets, depth, boxes
         
     def _get_thread_buffer(self):
         if not hasattr(self._thread_local, 'buf'):
@@ -248,8 +283,6 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     # L2 vectorize
     result = np.asarray(result).flatten() 
     # print(result)
-    norm = np.linalg.norm(result)
-    result = result / norm if norm > 0 else result
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
 

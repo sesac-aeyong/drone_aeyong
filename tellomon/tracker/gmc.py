@@ -237,8 +237,8 @@ class GMC:
 
         return H
 
+    
     def applySparseOptFlow(self, raw_frame, detections=None):
-
         t0 = time.time()
 
         # Initialize
@@ -248,60 +248,62 @@ class GMC:
 
         # Downscale image
         if self.downscale > 1.0:
-            # frame = cv2.GaussianBlur(frame, (3, 3), 1.5)
             frame = cv2.resize(frame, (width // self.downscale, height // self.downscale))
 
         # find the keypoints
         keypoints = cv2.goodFeaturesToTrack(frame, mask=None, **self.feature_params)
+        if keypoints is None:
+            keypoints = np.empty((0, 1, 2), dtype=np.float32)
 
         # Handle first frame
         if not self.initializedFirstFrame:
-            # Initialize data
             self.prevFrame = frame.copy()
             self.prevKeyPoints = copy.copy(keypoints)
-
-            # Initialization done
             self.initializedFirstFrame = True
+            return H
 
+        # Handle rare case: no previous keypoints
+        if self.prevKeyPoints is None or len(self.prevKeyPoints) == 0:
+            self.prevFrame = frame.copy()
+            self.prevKeyPoints = copy.copy(keypoints)
             return H
 
         # find correspondences
-        matchedKeypoints, status, err = cv2.calcOpticalFlowPyrLK(self.prevFrame, frame, self.prevKeyPoints, None)
+        matchedKeypoints, status, err = cv2.calcOpticalFlowPyrLK(
+            self.prevFrame, frame, self.prevKeyPoints, None
+        )
 
         # leave good correspondences only
-        prevPoints = []
-        currPoints = []
+        if matchedKeypoints is not None and status is not None:
+            status = status.reshape(-1)
+            prevPoints = self.prevKeyPoints[status == 1]
+            currPoints = matchedKeypoints[status == 1]
+        else:
+            prevPoints = np.empty((0, 2), dtype=np.float32)
+            currPoints = np.empty((0, 2), dtype=np.float32)
 
-        for i in range(len(status)):
-            if status[i]:
-                prevPoints.append(self.prevKeyPoints[i])
-                currPoints.append(matchedKeypoints[i])
-
-        prevPoints = np.array(prevPoints)
-        currPoints = np.array(currPoints)
-
-        # Find rigid matrix
-        if (np.size(prevPoints, 0) > 4) and (np.size(prevPoints, 0) == np.size(prevPoints, 0)):
-            H, inliesrs = cv2.estimateAffinePartial2D(prevPoints, currPoints, cv2.RANSAC)
-
-            # Handle downscale
-            if self.downscale > 1.0:
-                H[0, 2] *= self.downscale
-                H[1, 2] *= self.downscale
+        # Find rigid matrix if enough points
+        if len(prevPoints) >= 4:
+            H_est, inliers = cv2.estimateAffinePartial2D(prevPoints, currPoints, cv2.RANSAC)
+            if H_est is not None:
+                H = H_est
+                if self.downscale > 1.0:
+                    H[0, 2] *= self.downscale
+                    H[1, 2] *= self.downscale
         else:
             print('Warning: not enough matching points')
 
-        # Store to next iteration
+        # Store for next iteration
         self.prevFrame = frame.copy()
         self.prevKeyPoints = copy.copy(keypoints)
 
         t1 = time.time()
-
-        # gmc_line = str(1000 * (t1 - t0)) + "\t" + str(H[0, 0]) + "\t" + str(H[0, 1]) + "\t" + str(
-        #     H[0, 2]) + "\t" + str(H[1, 0]) + "\t" + str(H[1, 1]) + "\t" + str(H[1, 2]) + "\n"
+        # Optional logging:
+        # gmc_line = f"{1000*(t1-t0)}\t{H[0,0]}\t{H[0,1]}\t{H[0,2]}\t{H[1,0]}\t{H[1,1]}\t{H[1,2]}\n"
         # self.gmc_file.write(gmc_line)
 
         return H
+
 
     def applyFile(self, raw_frame, detections=None):
         line = self.gmcFile.readline()
