@@ -1,21 +1,17 @@
-# tello_web_server_modified.py
-from flask import Flask, render_template, Response, jsonify
+# tello_web_server.py
+from flask import Flask, render_template, Response
 from flask_socketio import SocketIO, emit
 import cv2
 from djitellopy import Tello
 import threading
 import time
-import base64
-import json
 import numpy as np
 import socket
 import signal
 import sys
 import subprocess
-import os
 import queue
-import datetime
-from tellomon.hailorun import HailoRun
+from hailorun import HailoRun
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tello_secret_key'
@@ -122,6 +118,7 @@ class TelloWebServer:
         self.log("INFO", "Loading inference engine...")
         try:
             self.inference_engine = HailoRun()
+            self.inference_engine.load()
             self.log("SUCCESS", "✅ Inference engine loaded successfully")
         except Exception as e:
             self.log("ERROR", f"❌ Failed to load inference engine: {e}")
@@ -264,7 +261,7 @@ class TelloWebServer:
         
         try:
             detections, depth_map, _ = self.inference_engine.run(frame)
-            return detections, depth_map, _
+            return detections, depth_map
         except Exception as e:
             print(f"❌ Inference error: {e}")
             import traceback
@@ -302,9 +299,7 @@ class TelloWebServer:
                         target_center_x = (x1 + x2) // 2
                         target_center_y = (y1 + y2) // 2
                         
-                        self.log("DEBUG", f"Frame: {w}x{h}, Center: ({center_x}, {center_y})")
-                        self.log("DEBUG", f"Target bbox: [{x1}, {y1}, {x2}, {y2}], Center: ({target_center_x}, {target_center_y})")
-                        
+                                              
                         # 오차 계산
                         error_x = target_center_x - center_x
                         error_y = target_center_y - center_y
@@ -317,10 +312,10 @@ class TelloWebServer:
                         target_ratio = target_area / frame_area
                         
                         # 임계값
-                        threshold_x = w * 0.15
-                        threshold_y = h * 0.15
-                        threshold_size_min = 0.03
-                        threshold_size_max = 0.30
+                        threshold_x = w * 0.1
+                        threshold_y = h * 0.1
+                        threshold_size_min = 0.06
+                        threshold_size_max = 0.20
                         
                         action = None
                         
@@ -446,7 +441,7 @@ class TelloWebServer:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
                     # 추론 실행
-                    detections, depth_map, _ = self.process_frame_with_inference(frame)
+                    detections, depth_map = self.process_frame_with_inference(frame)
                     
                     with self.lock:
                         self.current_detections = detections
@@ -645,7 +640,7 @@ def video_feed():
             if frame is not None:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            time.sleep(0.033)
+            time.sleep(0.01)
     
     return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -753,7 +748,7 @@ def cleanup_and_exit():
     try:
         if tello_server.is_streaming:
             tello_server.stop_streaming()
-            time.sleep(1)
+            time.sleep(0.5)
     except:
         pass
     
@@ -832,8 +827,6 @@ if __name__ == '__main__':
     local_ip = get_local_ip()
     print("\n" + "="*50)
     print(f"🚁 Tello Web Server Started!")
-    print(f"📱 Access from phone: http://{local_ip}:5000")
-    print(f"🌐 Or use: http://raspberrypi.local:5000")
     print("="*50 + "\n")
 
     try:

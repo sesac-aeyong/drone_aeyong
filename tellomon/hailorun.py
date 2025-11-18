@@ -3,7 +3,6 @@ from functools import partial
 import queue
 import threading
 import time
-from types import SimpleNamespace
 from typing import List, Tuple
 import numpy as np
 import cv2
@@ -12,7 +11,7 @@ from common.hailo_inference import HailoInfer
 from tracker.utils.gallery_io import load_gallery
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT
 from settings import settings as S
-from yolo_tools import extract_detections
+from yolo_tools import extract_detections, draw_detection
 
 
 GALLERY_PATH = "cache/longterm_gallery.npy" 
@@ -210,15 +209,15 @@ class HailoRun():
         
         rets = []
         for track in targets:
-            # t_id = track.track_id
-            t_id = getattr(track, 'identity_id', track.track_id)
-            x1, y1, x2, y2 = track.last_bbox_tlbr
-            
-            rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
+            t_id = int(getattr(track, 'identity_id', track.track_id))
+            x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
+            rets.append({
+                    'track_id': t_id,
+                    'class': 'person',
+                    'confidence': float(track.score),
+                    'bbox': [x1, y1, x2, y2]
+                })
 
-        # clean up used embedding buffers 
-        # for i in emb_ids:
-        #     self.emb_buf[i].fill(0)
 
         depth = self._dep_deq(self.dep_q.get())
         # print(depth[160,128])
@@ -230,7 +229,7 @@ class HailoRun():
 
         # print(depth)
 
-        return rets, depth_norm, boxes
+        return rets, depth, boxes
 
     def draw_detections_on_frame(self, frame, detections, target_track_id=None):
         """
@@ -250,7 +249,7 @@ class HailoRun():
         for det in detections:
             tid = det['track_id']
             label = det['class']
-            score = det['confidence']
+            score = float(det['confidence'])
             x1, y1, x2, y2 = det['bbox']  # [x1, y1, x2, y2] format
             
             # 추적 중인 타겟이면 빨간색, 아니면 흰색
@@ -259,9 +258,18 @@ class HailoRun():
             
             # 라벨 수정 (추적 중이면 표시)
             if is_target:
-                label_text = [f"🎯 {label}", f"ID {tid}"]
+                label_text = [f"{label}", f"ID {tid}"]
             else:
                 label_text = [label, f"ID {tid}"]
+
+            draw_detection(
+                annotated_frame,
+                [y1, x1, y2, x2],
+                label_text,
+                score * 100.0,
+                color,
+                True
+            )
 
             # 추적 중인 타겟이면 중심점도 그리기
             if is_target:
@@ -352,12 +360,6 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     # print(result)
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
-
-# def _batch_callback(bindings_list, output_queue, det_ids, **kwargs) -> None:
-#     for det_id, bindings in zip(det_ids, bindings_list):
-#         result = bindings.output().get_buffer()
-#         result = np.asarray(result).flatten()
-#         output_queue.put_nowait((det_id, result))
 
 
 

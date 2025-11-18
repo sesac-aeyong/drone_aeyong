@@ -8,6 +8,7 @@ rpi_examples/
 speech_recognition/
 super_resolution/
 .hailo/
+.venv*
 
 *.pyc
 *.swp
