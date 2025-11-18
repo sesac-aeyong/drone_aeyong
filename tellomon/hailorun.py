@@ -8,13 +8,10 @@ import numpy as np
 import cv2
 
 from common.hailo_inference import HailoInfer
-from tracker.utils.gallery_io import load_gallery
-from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT
+from tracker.utils.gallery_io import load_gallery, save_gallery
+from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections, draw_detection
-
-
-GALLERY_PATH = "cache/longterm_gallery.npy" 
 
 
 
@@ -71,24 +68,43 @@ class HailoRun():
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
         self.dep_cb = partial(_callback, output_queue = self.dep_q)
 
-        # reid = OVReID(device=args.device)
         base_tracker = BoTSORT()
-        self.tracker = LongTermBoTSORT(base_tracker)
+        self.longterm_tracker = LongTermBoTSORT(base_tracker)
 
-        gallery = load_gallery(GALLERY_PATH)
-        if len(gallery) > 0:
-            self.tracker.gallery = gallery
-            self.tracker.next_identity = max(gallery.keys()) + 1
-            print("[LT-GAL] start AGAIN with saved gallery")
-        else:
-            self.tracker.gallery = {}
-            self.tracker.next_identity = 1
-            print("[LT-GAL] NEW start with empty gallery")
-
+        # Active tracker pointer -> initially longterm
+        self.active_tracker = self.longterm_tracker
+        self._thief_tracker = None  # created when entering thief mode
+        self.thief_id = 0
 
         self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
         self._thread_local = threading.local()
 
+    def enter_thief_mode(self, thief_id: int):
+        """
+        특정 ID에 대해 ThiefTracker 활성화.
+        gallery에서 임베딩을 가져와 active_tracker를 ThiefTracker로 전환.
+        """
+        if thief_id not in self.longterm_tracker.gallery:
+            print(f"[THIEF] ERROR: identity_id {thief_id} not found in gallery")
+            return False
+
+        self.thief_id = thief_id
+        thief_embs = self.longterm_tracker.gallery[thief_id]["gal_embs"]
+
+        # ThiefTracker 초기화
+        self._thief_tracker = ThiefTracker(thief_embs=thief_embs)
+        self.active_tracker = self._thief_tracker
+        
+        print("[HailoRun] Entered thief mode (ThiefTracker active)")
+        
+        return True
+
+    def exit_thief_mode(self):
+        """Switch back to LongTermBoTSORT"""
+        self.active_tracker = self.longterm_tracker
+        self._thief_tracker = None
+        self.thief_id = 0
+        print("[HailoRun] Exited thief mode (LongTermBoTSORT active)")
 
     def letterbox_buffer(self, src, dst, new_shape=640, color=(114,114,114)):
         """
@@ -123,9 +139,7 @@ class HailoRun():
         output is detections, depth, list of yolo boxes
         """
         # prepare frames
-        # print(self.dm_shape)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # cv2.resize(frame, self.vm_shape, self.vis_fb, interpolation=cv2.INTER_LINEAR)
         self.letterbox_buffer(frame, self.vis_fb)
         cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
 
@@ -142,74 +156,34 @@ class HailoRun():
         boxes = detections['detection_boxes']
         scores = detections['detection_scores']
         num_detections = detections['num_detections']
-        classes = detections['detection_classes']
-
-        # collect only person class in detections. Perhaps finetune only for person class?
-        # persons = [i for i in range(num_detections) if classes[i] == 0] # class 0 is person on coco.txt 
-        # perhaps detect knife or weapons? 
-
-        ### thread embedding part to do cv2 ops while waiting
-        ### perhaps try multiprocess if not performant enough.
-        ### is this fruitless?
 
         futures = []
         emb_ids = []
         for i in range(num_detections):
-            # if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
-            #     continue
             x1, y1, x2, y2 = self._safe_box(boxes[i])
             crop = frame[y1:y2, x1:x2]
-            # if crop.size < S.min_emb_cropsize:
-            #     continue
-            # buf = self._get_thread_buffer()
-            # cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
             futures.append(self.executor.submit(self._submit_embedding, crop, i))
             emb_ids.append(i)
-        
-        ### Tried batch processing, it's actually slower than threaded async. 
-        # person_crops = []
-        # det_ids = []
-        # for i in persons:
-        #     if scores[i] < S.min_emb_confidence:
-        #         continue
-        #     x1, y1, x2, y2 = self._safe_box(boxes[i])
-        #     crop = frame[y1:y2, x1:x2]
-        #     if crop.size < S.min_emb_cropsize:
-        #         continue
-        #     # crop = np.ascontiguousarray(cv2.resize(crop, self.em_shape))
-        #     crop = cv2.resize(crop, self.em_shape)
-        #     person_crops.append(crop)
-        #     det_ids.append(i)
-        
-        # self.emb_m.run(person_crops, 
-        #                partial(_batch_callback, 
-        #                        output_queue = self.emb_q,
-        #                        det_ids = det_ids
-        #                        ))
-        # detections[i] == embeddings[i] for ease of use. 
-        embeddings = [None] * num_detections
-        # print(self.emb_m.hef.get_output_vstream_infos())
 
-        # for _ in range(len(person_crops)):
-        #     det_id, emb = self.emb_q.get()
-        #     embeddings[det_id] = emb
+        embeddings = [None] * num_detections
 
         for _ in range(num_detections):
             det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
-            # self.emb_buf[det_id] = self._emb_deq_norm(emb)
             embeddings[det_id] = self._emb_deq_norm(emb)
 
-        targets = self.tracker.update(
-            np.array([[*box, score] for box, score in zip(boxes, scores)]), # _extract_detections already took care of min conf. 
-            # frame,
-            # self.emb_buf[:num_detections]
-            embeddings
-            )
-        
+        # Convert now_dets to np.array shape (N,5)
+        now_dets = np.array([[*box, score] for box, score in zip(boxes, scores)], dtype=np.float32)
+
+        # Call active tracker (either LongTermBoTSORT or ThiefTracker)
+        targets = self.active_tracker.update(now_dets, embeddings)
+
         rets = []
         for track in targets:
-            t_id = int(getattr(track, 'identity_id', track.track_id))
+            if self.thief_id != 0:
+                t_id = self.thief_id
+            else:
+                t_id = int(getattr(track, 'identity_id', track.track_id))
             x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
             rets.append({
                     'track_id': t_id,
@@ -245,7 +219,7 @@ class HailoRun():
         """
         annotated_frame = frame.copy()
         h, w = annotated_frame.shape[:2]
-        
+
         for det in detections:
             tid = det['track_id']
             label = det['class']
@@ -264,7 +238,7 @@ class HailoRun():
 
             draw_detection(
                 annotated_frame,
-                [y1, x1, y2, x2],
+                [x1, y1, x2, y2],
                 label_text,
                 score * 100.0,
                 color,
@@ -357,7 +331,6 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     # embedding callback
     # L2 vectorize
     result = np.asarray(result).flatten() 
-    # print(result)
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
 

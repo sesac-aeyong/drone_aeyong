@@ -90,7 +90,7 @@ class TelloWebServer:
         self.is_streaming = False
         self.is_connected = False
         self.current_frame = None
-        self.current_depth = None
+        self.current_depth_map = None
         self.current_detections = []
         self.target_class = None
         self.target_track_id = None
@@ -100,6 +100,7 @@ class TelloWebServer:
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
+        self.target_depth = None
 
         # RC 명령 설정
         self.use_rc_for_manual = False
@@ -274,6 +275,8 @@ class TelloWebServer:
         command_interval = 1.0
         target_lost_time = None
         target_lost_warning_sent = False
+        depth_threshold = 0.20
+        prev_depth = None
 
         self.log("INFO", "🎯 Tracking thread started (safe mode: 1s interval)")
         
@@ -298,11 +301,17 @@ class TelloWebServer:
                         x1, y1, x2, y2 = self.target_bbox
                         target_center_x = (x1 + x2) // 2
                         target_center_y = (y1 + y2) // 2
-                        
                                               
                         # 오차 계산
                         error_x = target_center_x - center_x
                         error_y = target_center_y - center_y
+                        if prev_depth is not None:
+                            error_d = self.target_depth - prev_depth
+                        else:
+                            error_d = None
+
+                        # depth 계산
+                        prev_depth = self.target_depth
                         
                         # 타겟 크기
                         target_width = x2 - x1
@@ -337,26 +346,26 @@ class TelloWebServer:
                                     self.tello.rotate_counter_clockwise(angle)
                                     action = f"CCW {angle}°"
                         
-                        # 2. 거리 조정
-                        elif target_ratio < threshold_size_min:
-                            if self.use_rc_for_tracking:
-                                self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
-                                time.sleep(self.rc_command_duration)
-                                self.tello.send_rc_control(0, 0, 0, 0)
-                                action = f"RC forward={self.tracking_rc_speed}"
-                            else:
-                                self.tello.move_forward(20)
-                                action = "Forward 20cm"
+                        # # 2. 거리 조정
+                        # elif target_ratio < threshold_size_min:
+                        #     if self.use_rc_for_tracking:
+                        #         self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
+                        #         time.sleep(self.rc_command_duration)
+                        #         self.tello.send_rc_control(0, 0, 0, 0)
+                        #         action = f"RC forward={self.tracking_rc_speed}"
+                        #     else:
+                        #         self.tello.move_forward(20)
+                        #         action = "Forward 20cm"
                         
-                        elif target_ratio > threshold_size_max:
-                            if self.use_rc_for_tracking:
-                                self.tello.send_rc_control(0, -self.tracking_rc_speed, 0, 0)
-                                time.sleep(self.rc_command_duration)
-                                self.tello.send_rc_control(0, 0, 0, 0)
-                                action = f"RC back={self.tracking_rc_speed}"
-                            else:
-                                self.tello.move_back(20)
-                                action = "Back 20cm"
+                        # elif target_ratio > threshold_size_max:
+                        #     if self.use_rc_for_tracking:
+                        #         self.tello.send_rc_control(0, -self.tracking_rc_speed, 0, 0)
+                        #         time.sleep(self.rc_command_duration)
+                        #         self.tello.send_rc_control(0, 0, 0, 0)
+                        #         action = f"RC back={self.tracking_rc_speed}"
+                        #     else:
+                        #         self.tello.move_back(20)
+                        #         action = "Back 20cm"
                         
                         # 3. 상하 정렬
                         elif abs(error_y) > threshold_y:
@@ -378,6 +387,37 @@ class TelloWebServer:
                         
                         if action:
                             self.log("DEBUG", f"🎯 {action} | Error: x={error_x:.0f}, y={error_y:.0f} | Size: {target_ratio:.3f}")
+                            action = None
+
+                        elif error_d and abs(error_d) > depth_threshold:
+                            # 사람이 너무 멀다 → 앞으로 이동해야 함
+                            if error_d > 0:
+                                if self.use_rc_for_tracking:
+                                    self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
+                                    time.sleep(self.rc_command_duration)
+                                    self.tello.send_rc_control(0, 0, 0, 0)
+                                    action = f"RC forward (error_d={error_d:.2f})"
+                                else:
+                                    self.tello.move_forward(20)
+                                    action = "Forward 20cm"
+
+                            # # 사람이 너무 가깝다 → 뒤로 이동
+                            # else: 
+                            #     if self.use_rc_for_tracking:
+                            #         self.tello.send_rc_control(0, -self.tracking_rc_speed, 0, 0)
+                            #         time.sleep(self.rc_command_duration)
+                            #         self.tello.send_rc_control(0, 0, 0, 0)
+                            #         action = f"RC back (error_d={error_d:.2f})"
+                            #     else:
+                            #         self.tello.move_back(20)
+                            #         action = "Back 20cm"
+
+                        else:
+                            action = "Distance OK (within threshold)"
+                        
+                        if action:
+                            self.log("DEBUG", f"🎯 {action} | Error: depth={error_d:.0f} | Size: {target_ratio:.3f}")
+                            action = None
                         
                         last_command_time = current_time
                         time.sleep(0.5)
@@ -445,7 +485,7 @@ class TelloWebServer:
                     
                     with self.lock:
                         self.current_detections = detections
-                        self.current_depth = depth_map
+                        self.current_depth_map = cv2.resize(depth_map, frame.shape[:2])
                         
                         # 타겟 추적중이면 해당 객체 찾기
                         if self.is_tracking and self.target_track_id is not None:
@@ -460,6 +500,26 @@ class TelloWebServer:
                             
                             if not target_found:
                                 self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
+                            else:
+                                x1, y1, x2, y2 = map(int, self.target_bbox)
+
+                                # depth_map에서 bbox 부분만 crop
+                                bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
+
+                                if bbox_depth_map.size > 0:
+                                    # 중앙값이 가장 안정적
+                                    target_depth = float(np.median(bbox_depth_map))
+
+                                    # 신뢰도(옵션)
+                                    depth_conf = float(np.var(bbox_depth_map))
+
+                                    # 저장 (다른 쓰레드나 controller가 쓰게)
+                                    self.target_depth = target_depth
+                                    self.target_depth_conf = depth_conf
+
+                                    self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
+                                else:
+                                    self.log("WARNING", "Target depth crop invalid")
                     
                     # 감지 결과 그리기
                     frame_with_detections = self.inference_engine.draw_detections_on_frame(
@@ -543,6 +603,12 @@ class TelloWebServer:
     def start_tracking(self):
         """자동 추적 시작"""
         if not self.is_tracking and self.target_track_id is not None:
+            # ThiefTracker 활성화
+            success = self.inference_engine.enter_thief_mode(self.target_track_id)
+            if not success:
+                self.log("ERROR", f"Failed to enter thief mode for ID {self.target_track_id}")
+                return False
+
             self.is_tracking = True
             thread = threading.Thread(target=self.tracking_thread)
             thread.daemon = True
@@ -553,9 +619,15 @@ class TelloWebServer:
     
     def stop_tracking(self):
         """자동 추적 중지"""
+        if not self.is_tracking:
+            return
+
         self.is_tracking = False
         self.target_bbox = None
         self.log("INFO", "⏹️ Stopped tracking")
+
+        # ThiefTracker 모드 종료
+        self.inference_engine.exit_thief_mode()
     
     def get_current_frame_jpeg(self):
         """현재 프레임을 JPEG로 반환"""
