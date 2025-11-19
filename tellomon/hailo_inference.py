@@ -42,16 +42,10 @@ class HailoRun():
         self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
         self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
 
-        # buffers
-        self.emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
-        """embeddings buffer"""
         self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
         """vision model framebuffer"""
         self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
         """depth model framebuffer"""
-        self.crop_fbs = [np.empty((self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
-                          for _ in range(S.max_emb_threads)]
-        """crop framebuffer per thread"""
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
 
@@ -73,22 +67,6 @@ class HailoRun():
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
         self.dep_cb = partial(_callback, output_queue = self.dep_q)
 
-        # self.tracker = BoTSORT(args = SimpleNamespace(
-        #     track_high_thresh=S.track_high_emb_confidence,
-        #     track_low_thresh=S.track_low_emb_confidence,
-        #     new_track_thresh=S.track_new_threshold,
-        #     track_buffer=S.track_buffer,
-        #     proximity_thresh=0.8,
-        #     appearance_thresh=0.4,
-        #     match_thresh=0.9,
-        #     mot20=False,
-        #     with_reid=True,  # set True if you have ReID embeddings
-        #     cmc_method='sparseOptFlow',  # for GMC
-        #     name='BoTSORT',
-        #     ablation=False
-        # ))
-
-        # reid = OVReID(device=args.device)
         base_tracker = BoTSORT()
         self.tracker = LongTermBoTSORT(base_tracker)
 
@@ -101,10 +79,6 @@ class HailoRun():
             self.tracker.gallery = {}
             self.tracker.next_identity = 1
             print("[LT-GAL] NEW start with empty gallery")
-
-
-        self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
-        self._thread_local = threading.local()
 
 
     def letterbox_buffer(self, src, dst, new_shape=640, color=(114,114,114)):
@@ -121,15 +95,13 @@ class HailoRun():
         # Fill destination with padding color
         dst[:] = color
 
-        # Resize into a temporary buffer on the fly
-        resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
         # Compute padding
         top = (new_shape - nh) // 2
         left = (new_shape - nw) // 2
 
-        # Copy resized into letterboxed area of dst
-        dst[top:top+nh, left:left+nw] = resized
+        # Directly resize into the subregion of dst
+        roi = dst[top:top+nh, left:left+nw]
+        cv2.resize(src, (nw, nh), dst=roi, interpolation=cv2.INTER_LINEAR)
 
         return scale, (left, top)
     
@@ -140,9 +112,7 @@ class HailoRun():
         output is detections, depth, list of yolo boxes
         """
         # prepare frames
-        # print(self.dm_shape)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # cv2.resize(frame, self.vm_shape, self.vis_fb, interpolation=cv2.INTER_LINEAR)
         self.letterbox_buffer(frame, self.vis_fb)
         cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
 
@@ -152,7 +122,9 @@ class HailoRun():
 
         # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
+        depth = self.dep_q.get()
         del vision[1:] # 0 is person, remove all other classes.
+        # Perhaps add knife or some weapon types?
 
         detections = extract_detections(frame, vision)
 
@@ -161,105 +133,50 @@ class HailoRun():
         num_detections = detections['num_detections']
         classes = detections['detection_classes']
 
-        # collect only person class in detections. Perhaps finetune only for person class?
-        # persons = [i for i in range(num_detections) if classes[i] == 0] # class 0 is person on coco.txt 
-        # perhaps detect knife or weapons? 
-
-        ### thread embedding part to do cv2 ops while waiting
-        ### perhaps try multiprocess if not performant enough.
-        ### is this fruitless?
-
-        futures = []
-        emb_ids = []
+        emb_ids = [] 
+        emb_crops = np.empty((num_detections, self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
+        crop_count = 0
         for i in range(num_detections):
-            # if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
-            #     continue
+            if scores[i] < S.min_emb_confidence:
+                continue 
             x1, y1, x2, y2 = self._safe_box(boxes[i])
             crop = frame[y1:y2, x1:x2]
-            # if crop.size < S.min_emb_cropsize:
-            #     continue
-            # buf = self._get_thread_buffer()
-            # cv2.resize(crop, self.em_shape, buf, interpolation=cv2.INTER_LINEAR)
+            if crop.size < S.min_emb_cropsize:
+                continue
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
-            futures.append(self.executor.submit(self._submit_embedding, crop, i))
             emb_ids.append(i)
-        
-        ### Tried batch processing, it's actually slower than threaded async. 
-        # person_crops = []
-        # det_ids = []
-        # for i in persons:
-        #     if scores[i] < S.min_emb_confidence:
-        #         continue
-        #     x1, y1, x2, y2 = self._safe_box(boxes[i])
-        #     crop = frame[y1:y2, x1:x2]
-        #     if crop.size < S.min_emb_cropsize:
-        #         continue
-        #     # crop = np.ascontiguousarray(cv2.resize(crop, self.em_shape))
-        #     crop = cv2.resize(crop, self.em_shape)
-        #     person_crops.append(crop)
-        #     det_ids.append(i)
-        
-        # self.emb_m.run(person_crops, 
-        #                partial(_batch_callback, 
-        #                        output_queue = self.emb_q,
-        #                        det_ids = det_ids
-        #                        ))
-        # detections[i] == embeddings[i] for ease of use. 
+            emb_crops[crop_count] = crop
+            crop_count += 1
+
         embeddings = [None] * num_detections
-        # print(self.emb_m.hef.get_output_vstream_infos())
 
-        # for _ in range(len(person_crops)):
-        #     det_id, emb = self.emb_q.get()
-        #     embeddings[det_id] = emb
-
-        for _ in range(num_detections):
-            det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
-            # self.emb_buf[det_id] = self._emb_deq_norm(emb)
-            embeddings[det_id] = self._emb_deq_norm(emb)
+        if emb_ids:
+            self.emb_m.run(emb_crops[:crop_count], partial(_batch_callback, output_queue = self.emb_q))
+            _embs = self.emb_q.get()
+            for i, det_id in enumerate(emb_ids):
+                embeddings[det_id] = self._emb_deq_norm(_embs[i])
 
         targets = self.tracker.update(
-            np.array([[*box, score] for box, score in zip(boxes, scores)]), # _extract_detections already took care of min conf. 
-            # frame,
-            # self.emb_buf[:num_detections]
+            np.array([[*box, score] for box, score in zip(boxes, scores)]), 
             embeddings
             )
         
         rets = []
         for track in targets:
-            # t_id = track.track_id
             t_id = getattr(track, 'identity_id', track.track_id)
             x1, y1, x2, y2 = track.last_bbox_tlbr
             
             rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
+        
 
-        # clean up used embedding buffers 
-        # for i in emb_ids:
-        #     self.emb_buf[i].fill(0)
-
-        depth = self._dep_deq(self.dep_q.get())
-        # print(depth[160,128])
+        depth = self._dep_deq(depth)
         depth_norm = cv2.normalize(depth.squeeze(), None, 0, 255, cv2.NORM_MINMAX)
-        # depth_uint8 = depth_norm.astype(np.uint8)
-        # depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
-        # depth_color = cv2.resize(depth_color, (640, 480))
-        # cv2.imshow("Relative Depth", depth_color)
-
-        # print(depth)
 
         return rets, depth_norm, boxes
         
-    def _get_thread_buffer(self):
-        if not hasattr(self._thread_local, 'buf'):
-            # pick a buffer based on thread id
-            tid = threading.get_ident() % S.max_emb_threads
-            self._thread_local.buf = self.crop_fbs[tid]
-        return self._thread_local.buf
-
-
     def _submit_embedding(self, crop: np.ndarray, det_id:int):
         self.emb_m.run([crop], 
                        partial(_callback, output_queue = self.emb_q, det_id = det_id))
-
 
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
         """
@@ -280,8 +197,9 @@ class HailoRun():
         return (data - qi.qp_zp) * qi.qp_scale
 
     def _emb_deq_norm(self, emb):
+        emb = np.asarray(emb).flatten()
         deq = self._deq(self.emb_m, emb)
-        # return deq
+        # return deq 
         norm = np.linalg.norm(deq)
         return deq / norm if norm > 0 else deq
     
@@ -310,18 +228,24 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     if 'det_id' not in kwargs: # vis/dep callback
         output_queue.put_nowait(result)
         return
+    
     # embedding callback
-    # L2 vectorize
-    result = np.asarray(result).flatten() 
-    # print(result)
-
     output_queue.put_nowait((kwargs.get('det_id'), result))
+    
 
-# def _batch_callback(bindings_list, output_queue, det_ids, **kwargs) -> None:
-#     for det_id, bindings in zip(det_ids, bindings_list):
-#         result = bindings.output().get_buffer()
-#         result = np.asarray(result).flatten()
-#         output_queue.put_nowait((det_id, result))
+def _batch_callback(bindings_list, output_queue, **kwargs) -> None:
+    """
+    batch callback, single output
+    """
+    # print('batch')
+    result = []
+    for bindings in bindings_list:
+        data = bindings.output().get_buffer()
+        
+        # data = np.asarray(data).flatten()
+        result.append(data)
+
+    output_queue.put_nowait(result)
 
 
 
