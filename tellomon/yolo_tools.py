@@ -108,7 +108,6 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
 
     # Draw bottom text if exists
     if bottom_text:
-        # pos = (xmax - 50, ymax - 6)
         pos = (xmin + 4, ymin + 40)
         cv2.putText(image, bottom_text, pos, font, 0.5, border_color, 2, cv2.LINE_AA)
         cv2.putText(image, bottom_text, pos, font, 0.5, text_color, 1, cv2.LINE_AA)
