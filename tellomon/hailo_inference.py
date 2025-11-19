@@ -126,12 +126,7 @@ class HailoRun():
         del vision[1:] # 0 is person, remove all other classes.
         # Perhaps add knife or some weapon types?
 
-        detections = extract_detections(frame, vision)
-
-        boxes = detections['detection_boxes']
-        scores = detections['detection_scores']
-        num_detections = detections['num_detections']
-        classes = detections['detection_classes']
+        boxes, scores, classes, num_detections = extract_detections(frame, vision)
 
         emb_ids = [] 
         emb_crops = np.empty((num_detections, self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)

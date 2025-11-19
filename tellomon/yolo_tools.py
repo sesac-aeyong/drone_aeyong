@@ -66,12 +66,7 @@ def extract_detections(image: np.ndarray, detections: list) -> dict:
 
     scores, class_ids, boxes = zip(*top_detections) if top_detections else ([], [], [])
 
-    return {
-        'detection_boxes': list(boxes),
-        'detection_classes': list(class_ids),
-        'detection_scores': list(scores),
-        'num_detections': len(top_detections)
-    }
+    return boxes, scores, class_ids, len(top_detections)
 
 
 
