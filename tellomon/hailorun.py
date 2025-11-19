@@ -160,7 +160,12 @@ class HailoRun():
         futures = []
         emb_ids = []
         for i in range(num_detections):
+            if scores[i] < S.min_emb_confidence: # don't try to embed when confidence is low.
+                continue 
             x1, y1, x2, y2 = self._safe_box(boxes[i])
+            w = max(0, x2 - x1) ; h = max(0, y2 - y1) ; area = w * h
+            if area < S.min_emb_area:            # don't try to embed when area is small.
+                continue
             crop = frame[y1:y2, x1:x2]
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
             futures.append(self.executor.submit(self._submit_embedding, crop, i))
@@ -168,7 +173,7 @@ class HailoRun():
 
         embeddings = [None] * num_detections
 
-        for _ in range(num_detections):
+        for _ in range(len(emb_ids)):
             det_id, emb = self.emb_q.get() # will block here until all embedding results come back.
             embeddings[det_id] = self._emb_deq_norm(emb)
 
