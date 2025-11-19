@@ -163,7 +163,7 @@ class HailoRun():
                 continue 
             x1, y1, x2, y2 = self._safe_box(boxes[i])
             w = max(0, x2 - x1) ; h = max(0, y2 - y1) ; area = w * h
-            if area < S.min_emb_area:            # don't try to embed when area is small.
+            if area < S.min_emb_cropsize:            # don't try to embed when area is small.
                 continue
             crop = frame[y1:y2, x1:x2]
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
