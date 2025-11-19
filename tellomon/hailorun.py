@@ -8,7 +8,6 @@ import numpy as np
 import cv2
 
 from common.hailo_inference import HailoInfer
-from tracker.utils.gallery_io import load_gallery, save_gallery
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections, draw_detection

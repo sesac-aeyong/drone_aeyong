@@ -103,33 +103,28 @@ class TrackState:  # 이전(t-1) 프레임에서의 위치/임베딩으로 kalma
         self.kf_life += 1
 
     def _correct_kf(self, now_bbox_tlbr):
-        """
-        새 detection bbox(now_bbox_tlbr)로 Kalman 보정.
-
-        - kf / P 업데이트
-        - last_bbox_tlbr 를 '보정된 값'으로 갱신
-        - kf_bbox_tlbr 도 last_bbox_tlbr 로 동기화
-        - kf_life 를 0으로 리셋
-        """
         cx, cy, w, h = self._bbox_tlbr_to_cxcywh(now_bbox_tlbr)
         z = np.array([[cx], [cy], [w], [h]], dtype=np.float32)
 
-        # y = z - Hx
-        y = z - (self.H @ self.kf)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+        y = z - (self.H @ self.kf)  # innovation
 
-        # 상태 / 공분산 업데이트
+        # --- 근사 Kalman gain ---
+        S_diag = np.diag(self.H @ self.P @ self.H.T + self.R)
+        K_full = self.P @ self.H.T
+        K = K_full / S_diag[None, :]  # 각 열별로 나눔
+
+        # 상태 업데이트
         self.kf = self.kf + K @ y
-        I = np.eye(6, dtype=np.float32)
-        self.P = (I - K @ self.H) @ self.P
 
-        # 보정된 bbox_tlbr → last_bbox_tlbr 로 저장
+        # 공분산 단순화
+        KH = K @ self.H
+        self.P = self.P * (1 - np.mean(KH, axis=1, keepdims=True))
+
+        # bbox 갱신
         cx, cy, w, h = self.kf[:4, 0]
         self.last_bbox_tlbr = self._cxcywh_to_bbox_tlbr(cx, cy, w, h)
         self.kf_bbox_tlbr = self.last_bbox_tlbr.copy()
 
-        # 이제 막 관측으로 보정했으므로 0으로 리셋
         self.kf_life = 0
 
     # ================== 업데이트 & 수명 관리 ==================
