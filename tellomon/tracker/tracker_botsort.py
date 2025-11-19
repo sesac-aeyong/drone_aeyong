@@ -768,31 +768,39 @@ class ThiefTracker:
         matched_det  = set()
         matched_track = set()
 
-        if len(self.tracks) > 0:
-            cost = self.compute_cost_matrix(dets_valid, embs_valid)
-            row_ind, col_ind = linear_sum_assignment(cost)
+        if len(self.tracks) == 1:
+            track_idx  = 0
+            last_track = self.tracks[track_idx]
 
-            for r, c in zip(row_ind, col_ind):
-                global_idx = valid_inds[r]
-                track_idx  = c
+            best_cost = None
+            best_global_idx = None
 
-                now_bbox   = now_dets[global_idx, :4]
-                now_score  = now_dets[global_idx, 4]
-                now_emb    = None if now_embs is None else now_embs[global_idx]
-                last_track = self.tracks[track_idx]
+            # valid_inds 안에서만 후보 탐색
+            for global_idx in valid_inds:
+                now_bbox = now_dets[global_idx, :4]
+                now_emb  = None if now_embs is None else now_embs[global_idx]
 
-                # IoU gate (pred vs now)
+                # 1) IoU 게이트: 예측 위치(pred) vs 현재 bbox(now)
                 iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                 if iou_score < self.iou_gate:
                     continue
 
-                # 도둑 갤러리와의 거리 gate
+                # 2) 도둑 갤러리와의 거리 게이트
                 cos_dist = min_cos_dist_to_list(now_emb, self.thief_embs)
                 if cos_dist > self.thief_cos_dist:
                     continue
 
-                matches.append((global_idx, track_idx))
-                matched_det.add(global_idx)
+                # 3) cost = (1 - IoU) + cos_weight * cos_dist
+                cost = (1.0 - iou_score) + self.cos_weight * cos_dist
+
+                if (best_cost is None) or (cost < best_cost):
+                    best_cost = cost
+                    best_global_idx = global_idx
+
+            # 조건을 만족하는 detection이 하나라도 있으면 매칭 등록
+            if best_global_idx is not None:
+                matches.append((best_global_idx, track_idx))
+                matched_det.add(best_global_idx)
                 matched_track.add(track_idx)
 
         # 매칭되지 않은 det 중에서 “도둑일 가능성이 높은 것”만 새 Track 후보
