@@ -16,6 +16,7 @@ class Settings:
     _emb_out_size: int = 2048 if '2048' in embed_model else 512 
     """Hmm. Perhaps there is a way to get this info"""
     depth_model: str = 'models/scdepthv3.hef'
+    pose_model: str = 'models/mspn_regnetx_800mf.hef'
 
     max_vis_detections: int = 30
     """vision model max detections"""
@@ -27,6 +28,9 @@ class Settings:
     """max number of threads to run embedding on"""
     min_emb_cropsize: int = 50
     """minimum crop size to run embedding on"""
+
+    min_pos_cropsize: int = 50
+    min_pos_confidence: float = 0.8
 
 
     ###WIP

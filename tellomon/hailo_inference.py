@@ -32,40 +32,36 @@ class HailoRun():
         self.loaded = True
         ct = time.time()
         print('vis model:', S.vis_model)
-        print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
+        print('pos model:', S.pose_model)
         self.vis_m = HailoInfer(S.vis_model)
-        self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
         self.emb_m = HailoInfer(S.embed_model, output_type='UINT8') # dequantize on host to save bandwidth
+        self.pos_m = HailoInfer(S.pose_model)
 
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
         self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
-        self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
+        self.pm_shape = tuple(reversed(self.pos_m.get_input_shape()[:2]))
 
         self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
         """vision model framebuffer"""
-        self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
-        """depth model framebuffer"""
-        print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
 
     def __init__(self):
         print('hailo init')
         self.loaded = False
         self.vis_m = None
-        self.dep_m = None
         self.emb_m = None
+        self.pos_m = None
 
         self.vm_shape = None
         self.em_shape = None
-        self.dm_shape = None
+        self.pm_shape = None
 
         self.vis_q = queue.Queue()
-        self.dep_q = queue.Queue()
         self.emb_q = queue.Queue()
+        self.pos_q = queue.Queue()
 
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
-        self.dep_cb = partial(_callback, output_queue = self.dep_q)
 
         base_tracker = BoTSORT()
         self.tracker = LongTermBoTSORT(base_tracker)
@@ -81,7 +77,7 @@ class HailoRun():
             print("[LT-GAL] NEW start with empty gallery")
 
 
-    def letterbox_buffer(self, src, dst, new_shape=640, color=(114,114,114)):
+    def letterbox_buffer(self, src: np.ndarray, dst, new_shape=640, color=(114,114,114)):
         """
         src: input image (H, W, 3)
         dst: preallocated buffer (new_shape, new_shape, 3)
@@ -114,15 +110,12 @@ class HailoRun():
         # prepare frames
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
-        cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
 
-        # run vis and dep models
+        # run vis model
         self.vis_m.run([self.vis_fb], self.vis_cb)
-        self.dep_m.run([self.dep_fb], self.dep_cb)
 
-        # wait for vision model to run embeddings on.
+        # wait for vision model to finish 
         vision = self.vis_q.get()
-        depth = self.dep_q.get()
         del vision[1:] # 0 is person, remove all other classes.
         # Perhaps add knife or some weapon types?
 
@@ -130,7 +123,7 @@ class HailoRun():
 
         emb_ids = [] 
         emb_crops = np.empty((num_detections, self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
-        crop_count = 0
+        emb_crop_count = 0
         for i in range(num_detections):
             if scores[i] < S.min_emb_confidence:
                 continue 
@@ -140,16 +133,39 @@ class HailoRun():
                 continue
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
             emb_ids.append(i)
-            emb_crops[crop_count] = crop
-            crop_count += 1
+            emb_crops[emb_crop_count] = crop
+            emb_crop_count += 1
+
+        pos_ids = []
+        pos_crops = np.empty((num_detections, self.pm_shape[1], self.pm_shape[0], 3), dtype=np.uint8)
+        pos_crop_count = 0
+        for i in range(num_detections):
+            if scores[i] < S.min_pos_confidence:
+                continue
+            x1, y1, x2, y2 = self._safe_box(boxes[i])
+            crop = frame[y1:y2, x1:x2]
+            if crop.size < S.min_emb_cropsize:
+                continue
+            crop = cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)
+            pos_ids.append(i)
+            pos_crops[pos_crop_count] = crop
+            pos_crop_count += 1
+
 
         embeddings = [None] * num_detections
+        poses = [None] * num_detections
 
         if emb_ids:
-            self.emb_m.run(emb_crops[:crop_count], partial(_batch_callback, output_queue = self.emb_q))
+            self.emb_m.run(emb_crops[:emb_crop_count], partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
             for i, det_id in enumerate(emb_ids):
                 embeddings[det_id] = self._emb_deq_norm(_embs[i])
+
+        if pos_ids:
+            self.pos_m.run(pos_crops[:pos_crop_count], partial(_batch_callback, output_queue = self.pos_q))
+            _poses = self.pos_q.get()
+            for i, det_id in enumerate(pos_ids):
+                poses[det_id] = self._deq(self.pos_m, _poses[i])
 
         targets = self.tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), 
@@ -164,10 +180,8 @@ class HailoRun():
             rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
         
 
-        depth = self._dep_deq(depth)
-        depth_norm = cv2.normalize(depth.squeeze(), None, 0, 255, cv2.NORM_MINMAX)
 
-        return rets, depth_norm, boxes
+        return rets, poses, boxes
         
     def _submit_embedding(self, crop: np.ndarray, det_id:int):
         self.emb_m.run([crop], 
@@ -208,8 +222,8 @@ class HailoRun():
     
     def close(self):
         self.vis_m.close()
-        self.dep_m.close()
         self.emb_m.close()
+        self.pos_m.close()
 
     def __del__(self):
         self.close()
