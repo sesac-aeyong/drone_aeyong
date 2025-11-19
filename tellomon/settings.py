@@ -20,13 +20,13 @@ class Settings:
 
     max_vis_detections: int = 30
     """vision model max detections"""
-    min_vis_score_threshold: float = 0.7
+    min_vis_score_threshold: float = 0.8
     """vision model confidence threshold"""
     min_emb_confidence: float = min_vis_score_threshold
     """minimum vis_model confidence to update embedding"""
     max_emb_threads: int = 4
     """max number of threads to run embedding on"""
-    min_emb_cropsize: int = 50
+    min_emb_cropsize: int = 200
     """minimum crop size to run embedding on"""
 
     min_pos_cropsize: int = 50
