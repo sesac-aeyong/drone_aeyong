@@ -12,6 +12,7 @@ import sys
 import subprocess
 import queue
 from hailorun import HailoRun
+from yolo_tools import draw_detections_on_frame
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tello_secret_key'
@@ -522,7 +523,7 @@ class TelloWebServer:
                                     self.log("WARNING", "Target depth crop invalid")
                     
                     # 감지 결과 그리기
-                    frame_with_detections = self.inference_engine.draw_detections_on_frame(
+                    frame_with_detections = draw_detections_on_frame(
                         frame.copy(), 
                         detections,
                         target_track_id=self.target_track_id if self.is_tracking else None

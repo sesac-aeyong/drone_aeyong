@@ -5,6 +5,7 @@ Track이 이전 프레임 상태 저장
 → BoTSORT가 pred vs now 비교해서 track_id 유지/부여 
 → LongTermBoTSORT가 각 Track의 last_emb를 갤러리 gal_emb들과 비교해서 identity_id 부여
 """
+import sys
 import numpy as np
 from scipy.optimize import linear_sum_assignment  # pip install scipy 필요
 from tracker.utils.metrics import iou_bbox, min_cos_dist_to_list, cosine_distance
@@ -487,16 +488,17 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             track.identity_id = identity_id
             
             # 디버그용
-            info = self.gallery.get(identity_id, {"gal_embs": []})
-            gal_emb_list = info.get("gal_embs", [])
-            min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if gal_emb_list else 1.0
-            print(
-                f"[LT-FRAME] track_id={track.track_id:3d} "
-                f"identity_id={identity_id:3d} "
-                f"conf={track.score:.2f} "
-                f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
-                f"min_cos_dist={min_cos_dist:.3f}"
-            )
+            if 'lt_debug' in sys.argv: 
+                info = self.gallery.get(identity_id, {"gal_embs": []})
+                gal_emb_list = info.get("gal_embs", [])
+                min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if gal_emb_list else 1.0
+                print(
+                    f"[LT-FRAME] track_id={track.track_id:3d} "
+                    f"identity_id={identity_id:3d} "
+                    f"conf={track.score:.2f} "
+                    f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
+                    f"min_cos_dist={min_cos_dist:.3f}"
+                )
 
         # 4) 메모리 관리 – 이번 프레임에 쓰이지 않은 오래된 identity 일부 제거 (선택)
         if len(self.gallery) > self.max_memory:
