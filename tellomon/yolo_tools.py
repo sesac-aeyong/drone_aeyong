@@ -82,9 +82,8 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
         color (tuple): Color for the bounding box.
         track (bool): Whether to include tracking info.
     """
-    # ymin, xmin, ymax, xmax = map(int, box)
-    xmin, ymin, xmax, ymax = map(int, box)
-    cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
+    x1, y1, x2, y2 = map(int, box)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
     # Compose texts
@@ -103,12 +102,12 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
     border_color = (0, 0, 0)      # black
 
     # Draw top text with black border first
-    cv2.putText(image, top_text, (xmin + 4, ymin + 20), font, 0.5, border_color, 2, cv2.LINE_AA)
-    cv2.putText(image, top_text, (xmin + 4, ymin + 20), font, 0.5, text_color, 1, cv2.LINE_AA)
+    cv2.putText(image, top_text, (x1 + 4, y1 + 20), font, 0.5, border_color, 2, cv2.LINE_AA)
+    cv2.putText(image, top_text, (x1 + 4, y1 + 20), font, 0.5, text_color, 1, cv2.LINE_AA)
 
     # Draw bottom text if exists
     if bottom_text:
-        pos = (xmin + 4, ymin + 40)
+        pos = (x1 + 4, y1 + 40)
         cv2.putText(image, bottom_text, pos, font, 0.5, border_color, 2, cv2.LINE_AA)
         cv2.putText(image, bottom_text, pos, font, 0.5, text_color, 1, cv2.LINE_AA)
 
@@ -129,10 +128,10 @@ def draw_detections_on_frame(frame: np.ndarray, detections: list, target_track_i
     h, w = annotated_frame.shape[:2]
 
     for det in detections:
-        tid = det['track_id']
-        label = det['class']
-        score = float(det['confidence'])
-        x1, y1, x2, y2 = det['bbox']  # [x1, y1, x2, y2] format
+        tid = det.track_id
+        label = det.cls
+        score = float(det.confidence)
+        x1, y1, x2, y2 = det.bbox  # [x1, y1, x2, y2] format
         
         # 추적 중인 타겟이면 빨간색, 아니면 흰색
         is_target = (tid == target_track_id)

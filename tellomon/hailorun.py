@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 import queue
 import threading
@@ -12,6 +13,52 @@ from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
 
+#            rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
+
+@dataclass
+class BoundingBox:
+    """
+    tlbr Boundingbox, autocast to int on instantiation.
+    it can accept list | float | tuple | np.array, it'll automagically convert them to x1, y1, x2, y2 in order.
+    it can also be iterated so x1, y1, x2, y2 = BoundingBox(...) works.
+    warning, only input either full list of coords or one array.
+    """
+    x1: int | float | list | tuple | np.ndarray
+    y1: int | float | None = None
+    x2: int | float | None = None 
+    y2: int | float | None = None
+
+    def __post_init__(self):
+        if self.y1 is None:
+            #assume array
+            if len(arr := list(self.x1)) != 4:
+                raise ValueError('BoundingBox requires 4 elements when initializing with array-like data')
+            self.x1, self.y1, self.x2, self.y2 = map(int, arr)
+        else:
+            self.x1 = int(self.x1)
+            self.y1 = int(self.y1)
+            self.x2 = int(self.x2)
+            self.y2 = int(self.y2)
+
+
+    def __iter__(self):
+        yield self.x1
+        yield self.y1
+        yield self.x2
+        yield self.y2
+
+@dataclass
+class Target:
+    """
+    Return dataclass of HailoRun.run
+    """
+    track_id: int
+    confidence: float
+    bbox: BoundingBox
+    cls: str = 'person'
+
+    def __post_init__(self):
+        self.confidence = float(self.confidence) 
 
 
 class HailoRun():
@@ -134,8 +181,7 @@ class HailoRun():
         return scale, (left, top)
     
 
-
-    def run(self, frame: np.ndarray) -> Tuple[np.array, np.ndarray, List]:
+    def run(self, frame: np.ndarray) -> Tuple[List[Target], np.ndarray, List]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
@@ -188,9 +234,7 @@ class HailoRun():
         rets = []
         for track in targets:
             t_id = getattr(track, 'identity_id', track.track_id)
-            x1, y1, x2, y2 = track.last_bbox_tlbr
-            
-            rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
+            rets.append(Target(t_id, 'person', track.score, BoundingBox(track.last_bbox_tlbr)))
         
 
         depth = self._dep_deq(depth)
