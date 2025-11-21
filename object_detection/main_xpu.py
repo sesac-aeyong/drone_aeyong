@@ -13,7 +13,7 @@ t-1 = last frame
          Track.predict() → pred_bbox_tlbr
          last_bbox_tlbr & last_emb 업데이트
      - LongTerm: last_emb ↔ gal_emb 비교 → identity_id 부여
-4. 화면에 track.identity_id를 그리면 됨.
+4. 화면에는 track.identity_visible (갤러리 충분할 때만 숫자) 를 그리면 됨.
 """
 
 import cv2, argparse
@@ -110,7 +110,8 @@ def main():
 
     # Tracker: BoTSORT + LongTerm
     base_tracker = BoTSORT()
-    tracker = LongTermBoTSORT(base_tracker)
+    # ★ 갤러리 3장 이상부터 화면에 숫자 ID 노출
+    tracker = LongTermBoTSORT(base_tracker, gallery_min_for_display=3)
 
     # 🔹 시작할 때: 갤러리 파일이 있으면 불러오기
     gallery = load_gallery(GALLERY_PATH)
@@ -152,7 +153,6 @@ def main():
         run_det = (frame_idx % 3 == 0) # 3프레임마다 추론
 
         if run_det:
-            
             # ========== 1) YOLO → now_dets ==========
             # dets shape: [N, 6] = [x1,y1,x2,y2,score,cls]
             dets = detector.infer(frame)
@@ -179,8 +179,6 @@ def main():
             now_embs = []
             
         # ========== 3) LongTermBoTSORT.update(now_dets, now_embs) ==========
-        # 내부에서 BoTSORT.update → Track.predict/predict/update → Track.last_*, pred_* 처리
-        # long-term identity까지 완성된 Track 리스트 반환
         tracks = tracker.update(now_dets, now_embs)
 
         # ========== 4) 화면 표시 ==========
@@ -190,15 +188,22 @@ def main():
                 # BoTSORT는 Track.last_bbox_tlbr 로 위치를 유지함
                 box = t.last_bbox_tlbr
 
-                # 화면 표시 ID: identity_id 우선, 없으면 track_id
-                tid = getattr(t, "identity_id", t.track_id)
+                # ★ 표시용 ID: identity_visible (갤러리 충분할 때만 숫자), 아니면 "??"
+                #   - identity_visible 속성이 없으면 (옛 tracker) → identity_id 또는 track_id로 fallback
+                if hasattr(t, "identity_visible"):
+                    visible_id = t.identity_visible  # None이면 draw_track에서 "??" 처리
+                else:
+                    visible_id = getattr(t, "identity_id", t.track_id)
 
-                draw_track(vis, box, tid)
+                draw_track(vis, box, visible_id)
 
             cv2.imshow("XPU ReID Tracker (LongTerm + BoTSORT)", vis)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
+    # ------------------------
+    # Clean up
+    # ------------------------
     if mode == "tello":
         try: cap.streamoff()
         except: pass
