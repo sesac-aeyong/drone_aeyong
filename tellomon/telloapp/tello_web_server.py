@@ -30,13 +30,17 @@ class TelloWebServer:
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
-        self.target_depth = None
+        # self.target_depth = None
+
+        # 이륙 안정화 시간
+        self.last_takeoff_time = None
+        self.takeoff_stabilization_time = 3.0  # 이륙 후 3초간 대기
 
         # RC 명령 설정
         self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
         self.rc_speed = 40
-        self.tracking_rc_speed = 25
+        self.tracking_rc_speed = 30
         self.rc_command_duration = 0.4
         
         # 웹 로그 시스템
@@ -200,168 +204,121 @@ class TelloWebServer:
     
     def tracking_thread(self):
         """자동 추적 스레드"""
-        last_command_time = time.time()
-        command_interval = 1.0
         target_lost_time = None
         target_lost_warning_sent = False
-        depth_threshold = 0.20
-        prev_depth = None
+        
+        # 제어 게인 (단순 비례 제어)
+        gain_yaw = 0.80      # 회전 게인
+        gain_lr = 0.80       # 좌우 이동 게인
+        gain_ud = 0.40       # 상하 이동 게인
+        gain_fb = 200         # 전후 이동 게인
+        
+        # 임계값
+        yaw_threshold = 0.20    # 20% 이상 오차면 회전
+        lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
+        ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
+        size_threshold = 0.025  # 크기 오차 임계값
 
-        self.log("INFO", "🎯 Tracking thread started (safe mode: 1s interval)")
+        self.log("INFO", "🎯 Simple RC tracking started")
         
         while self.is_tracking:
             try:
+                # 이륙 후 안정화 시간 체크
+                if self.last_takeoff_time is not None:
+                    time_since_takeoff = time.time() - self.last_takeoff_time
+                    if time_since_takeoff < self.takeoff_stabilization_time:
+                        remaining = self.takeoff_stabilization_time - time_since_takeoff
+                        if int(remaining * 10) % 10 == 0:  # 0.1초마다 로그
+                            self.log("INFO", f"⏳ Stabilizing... {remaining:.1f}s remaining")
+                        time.sleep(0.1)
+                        continue
+                    else:
+                        # 안정화 완료
+                        if self.last_takeoff_time is not None:
+                            self.log("SUCCESS", "✅ Stabilization complete - starting tracking")
+                            self.last_takeoff_time = None  # 한 번만 로그 출력
+
                 if self.target_bbox and self.current_frame is not None:
-                    current_time = time.time()
-                    
                     # 타겟 재발견 시 경고 리셋
                     if target_lost_time is not None:
                         self.log("SUCCESS", "🎯 Target re-acquired!")
                         target_lost_time = None
                         target_lost_warning_sent = False
-
-                    if current_time - last_command_time >= command_interval:
-                        # 제어 명령 계산
-                        h, w = self.current_frame.shape[:2]
-                        center_x = w // 2
-                        center_y = h // 2
-                        
-                        # target_bbox is in [x1, y1, x2, y2] format
-                        x1, y1, x2, y2 = self.target_bbox
-                        target_center_x = (x1 + x2) // 2
-                        target_center_y = (y1 + y2) // 2
-                                              
-                        # 오차 계산 
-                        error_x = target_center_x - center_x
-                        error_y = target_center_y - center_y
-                        if prev_depth is not None:
-                            error_d = self.target_depth - prev_depth
-                        else:
-                            error_d = None
-
-                        # depth 계산
-                        prev_depth = self.target_depth
-                        
-                        # 타겟 크기
-                        target_width = x2 - x1
-                        target_height = y2 - y1
-                        target_area = target_width * target_height
-                        frame_area = w * h
-                        target_ratio = target_area / frame_area
-                        
-                        # 임계값
-                        threshold_x = w * 0.1
-                        threshold_y = h * 0.1
-                        threshold_size_min = 0.06
-                        threshold_size_max = 0.20
-                        
-                        action = None
-                        
-                        # 우선순위 기반 제어
-                        # 1. 좌우 정렬 (Yaw)
-                        if abs(error_x) > threshold_x:
-                            if self.use_rc_for_tracking:
-                                yaw_speed = int(np.clip(error_x * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
-                                self.tello.send_rc_control(0, 0, 0, yaw_speed)
-                                time.sleep(self.rc_command_duration)
-                                self.tello.send_rc_control(0, 0, 0, 0)
-                                action = f"RC yaw={yaw_speed}"
-                            else:
-                                angle = 15
-                                if error_x > 0:
-                                    self.tello.rotate_clockwise(angle)
-                                    action = f"CW {angle}°"
-                                else:
-                                    self.tello.rotate_counter_clockwise(angle)
-                                    action = f"CCW {angle}°"
-                        
-                        # # 2. 거리 조정
-                        # elif target_ratio < threshold_size_min:
-                        #     if self.use_rc_for_tracking:
-                        #         self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
-                        #         time.sleep(self.rc_command_duration)
-                        #         self.tello.send_rc_control(0, 0, 0, 0)
-                        #         action = f"RC forward={self.tracking_rc_speed}"
-                        #     else:
-                        #         self.tello.move_forward(20)
-                        #         action = "Forward 20cm"
-                        
-                        # elif target_ratio > threshold_size_max:
-                        #     if self.use_rc_for_tracking:
-                        #         self.tello.send_rc_control(0, -self.tracking_rc_speed, 0, 0)
-                        #         time.sleep(self.rc_command_duration)
-                        #         self.tello.send_rc_control(0, 0, 0, 0)
-                        #         action = f"RC back={self.tracking_rc_speed}"
-                        #     else:
-                        #         self.tello.move_back(20)
-                        #         action = "Back 20cm"
-                        
-                        # 3. 상하 정렬
-                        elif abs(error_y) > threshold_y:
-                            if self.use_rc_for_tracking:
-                                ud_speed = int(np.clip(-error_y * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
-                                self.tello.send_rc_control(0, 0, ud_speed, 0)
-                                time.sleep(self.rc_command_duration)
-                                self.tello.send_rc_control(0, 0, 0, 0)
-                                action = f"RC ud={ud_speed}"
-                            else:
-                                if error_y > 0:
-                                    self.tello.move_down(20)
-                                    action = "Down 20cm"
-                                else:
-                                    self.tello.move_up(20)
-                                    action = "Up 20cm"
-                        else:
-                            action = "Centered ✅"
-                        
-                        if action:
-                            self.log("DEBUG", f"🎯 {action} | Error: x={error_x:.0f}, y={error_y:.0f} | Size: {target_ratio:.3f}")
-                            action = None
-
-                        elif error_d and abs(error_d) > depth_threshold:
-                            # 사람이 너무 멀다 → 앞으로 이동해야 함
-                            if error_d > 0:
-                                if self.use_rc_for_tracking:
-                                    self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
-                                    time.sleep(self.rc_command_duration)
-                                    self.tello.send_rc_control(0, 0, 0, 0)
-                                    action = f"RC forward (error_d={error_d:.2f})"
-                                else:
-                                    self.tello.move_forward(20)
-                                    action = "Forward 20cm"
-
-                            # # 사람이 너무 가깝다 → 뒤로 이동
-                            # else: 
-                            #     if self.use_rc_for_tracking:
-                            #         self.tello.send_rc_control(0, -self.tracking_rc_speed, 0, 0)
-                            #         time.sleep(self.rc_command_duration)
-                            #         self.tello.send_rc_control(0, 0, 0, 0)
-                            #         action = f"RC back (error_d={error_d:.2f})"
-                            #     else:
-                            #         self.tello.move_back(20)
-                            #         action = "Back 20cm"
-
-                        else:
-                            action = "Distance OK (within threshold)"
-                        
-                        if action:
-                            self.log("DEBUG", f"🎯 {action} | Error: depth={error_d:.0f} | Size: {target_ratio:.3f}")
-                            action = None
-                        
-                        last_command_time = current_time
-                        time.sleep(0.5)
+                    
+                    # 제어 명령 계산
+                    h, w = self.current_frame.shape[:2]
+                    center_x = w // 2
+                    center_y = h // 2
+                    
+                    # target_bbox is in [x1, y1, x2, y2] format
+                    x1, y1, x2, y2 = self.target_bbox
+                    target_center_x = (x1 + x2) // 2
+                    target_center_y = (y1 + y2) // 2
+                    
+                    # 오차 계산 (정규화)
+                    error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
+                    error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
+                    
+                    # 타겟 크기
+                    target_width = x2 - x1
+                    target_height = y2 - y1
+                    target_area = target_width * target_height
+                    frame_area = w * h
+                    target_ratio = target_area / frame_area
+                    
+                    # 목표 크기
+                    target_size_ideal = 0.2
+                    error_size = target_size_ideal - target_ratio
+                    
+                    # === 간단한 비례 제어 ===
+                    
+                    # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
+                    if abs(error_x) > yaw_threshold:
+                        # 회전
+                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                        lr_speed = 0
+                    elif abs(error_x) > lr_threshold:
+                        # 좌우 이동
+                        yaw_speed = 0
+                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                    else:
+                        # 중앙 정렬됨
+                        yaw_speed = 0
+                        lr_speed = 0
+                    
+                    # 2. 상하 제어
+                    if abs(error_y) > ud_threshold:
+                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                    else:
+                        ud_speed = 0
+                    
+                    # 3. 전후 제어
+                    if abs(error_size) > size_threshold:
+                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
+                    else:
+                        fb_speed = 0
+                    
+                    # RC 명령 전송
+                    self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
+                    
+                    # 로그 출력
+                    # if yaw_speed != 0 or lr_speed != 0 or ud_speed != 0 or fb_speed != 0:
+                        # action = f"RC[lr={lr_speed:+3d}, fb={fb_speed:+3d}, ud={ud_speed:+3d}, yaw={yaw_speed:+3d}]"
+                        # self.log("DEBUG", 
+                            # f"🎯 {action} | Err[x={error_x:+.3f}, y={error_y:+.3f}, s={error_size:+.3f}] | Size={target_ratio:.3f}")
                 
                 else:
                     # 타겟을 잃어버림
                     if target_lost_time is None:
                         target_lost_time = time.time()
+                        self.tello.send_rc_control(0, 0, 0, 0)
                     
                     # 3초 이상 타겟을 못 찾으면 경고
                     if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
                         self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_track_id})")
                         target_lost_warning_sent = True
                 
-                time.sleep(0.2)
+                time.sleep(0.05)  # 20Hz 제어 루프
                 
             except Exception as e:
                 self.log("ERROR", f"Tracking error: {e}")
@@ -370,16 +327,17 @@ class TelloWebServer:
                         self.tello.send_rc_control(0, 0, 0, 0)
                     except:
                         pass
-                time.sleep(1)
+                time.sleep(0.5)
         
-        if self.use_rc_for_tracking:
-            try:
-                self.tello.send_rc_control(0, 0, 0, 0)
-                self.log("INFO", "🛑 Tracking stopped - drone halted")
-            except:
-                pass
+        # 추적 종료 시 정지
+        try:
+            self.tello.send_rc_control(0, 0, 0, 0)
+            self.log("INFO", "🛑 Tracking stopped - drone halted")
+        except:
+            pass
         
         self.log("INFO", "🎯 Tracking thread stopped")
+
 
     def video_stream_thread(self):
         """비디오 스트리밍 스레드"""
@@ -425,13 +383,6 @@ class TelloWebServer:
                 
                 with self.lock:
                     self.current_detections = detections
-                    self.current_depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0])) 
-                    dep_vis = cv2.normalize(self.current_depth_map, None, 0, 255).astype(np.uint8)
-                    dep_vis = cv2.applyColorMap(dep_vis, cv2.COLORMAP_JET)
-                    cv2.imshow('dep', dep_vis)
-                    cv2.waitKey(1)
-                        
-                    # don't resize the depth array, resize points instead?
                     
                     # 타겟 추적중이면 해당 객체 찾기
                     if self.is_tracking and self.target_track_id is not None:
@@ -445,26 +396,26 @@ class TelloWebServer:
                         
                         if not target_found:
                             self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
-                        else:
-                            x1, y1, x2, y2 = self.target_bbox
+                        # else:
+                        #     x1, y1, x2, y2 = self.target_bbox
 
-                            # depth_map에서 bbox 부분만 crop
-                            bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
+                        #     # depth_map에서 bbox 부분만 crop
+                        #     bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
 
-                            if bbox_depth_map.size > 0:
-                                # 중앙값이 가장 안정적
-                                target_depth = float(np.median(bbox_depth_map))
+                        #     if bbox_depth_map.size > 0:
+                        #         # 중앙값이 가장 안정적
+                        #         target_depth = float(np.median(bbox_depth_map))
 
-                                # 신뢰도(옵션)
-                                depth_conf = float(np.var(bbox_depth_map))
+                        #         # 신뢰도(옵션)
+                        #         depth_conf = float(np.var(bbox_depth_map))
 
-                                # 저장 (다른 쓰레드나 controller가 쓰게)
-                                self.target_depth = target_depth
-                                self.target_depth_conf = depth_conf
+                        #         # 저장 (다른 쓰레드나 controller가 쓰게)
+                        #         self.target_depth = target_depth
+                        #         self.target_depth_conf = depth_conf
 
-                                self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
-                            else:
-                                self.log("WARNING", "Target depth crop invalid")
+                        #         self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
+                        #     else:
+                        #         self.log("WARNING", "Target depth crop invalid")
                 
                 # 감지 결과 그리기
                 frame_with_detections = draw_detections_on_frame(
@@ -484,7 +435,7 @@ class TelloWebServer:
                 try:
                     old_battery = self.battery
                     self.battery = self.tello.get_battery()
-                    self.height = self.tello.get_height()
+                    self.height = self.tello.get_distance_tof()
                     
                     # 배터리 경고
                     if self.battery < 15 and old_battery >= 15:
@@ -592,13 +543,15 @@ class TelloWebServer:
             if command == 'takeoff':
                 self.log("INFO", "🚁 Taking off...")
                 self.tello.takeoff()
+                self.last_takeoff_time = time.time()  # 이륙 시간 기록
                 time.sleep(3)
-                self.log("SUCCESS", "Takeoff successful")
+                self.log("SUCCESS", f"Takeoff successful - stabilizing for {self.takeoff_stabilization_time}s")
                 return {'success': True, 'message': 'Takeoff successful'}
                 
             elif command == 'land':
                 self.log("INFO", "🛬 Landing...")
                 self.tello.land()
+                self.last_takeoff_time = None  # 착륙 시 초기화
                 time.sleep(2)
                 self.log("SUCCESS", "Landing successful")
                 return {'success': True, 'message': 'Landing successful'}
@@ -606,6 +559,7 @@ class TelloWebServer:
             elif command == 'emergency':
                 self.log("WARNING", "🚨 Emergency stop!")
                 self.tello.emergency()
+                self.last_takeoff_time = None  # 비상 정지 시 초기화
                 return {'success': True, 'message': 'Emergency stop'}
             
             elif command == 'up':
@@ -635,7 +589,7 @@ class TelloWebServer:
             self.log("ERROR", f"Command execution error: {e}")
             return {'success': False, 'message': str(e)}
     
-    
+
     def cleanup(self):
         """리소스 정리"""
         self.is_logging = False
