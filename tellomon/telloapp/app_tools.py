@@ -43,7 +43,7 @@ def get_current_ssid():
 
 def refresh_wifi_list() -> None:
     subprocess.run([
-        'nmcli', 'device', 'wifi', 'list'
+        'nmcli', 'device', 'wifi', 'rescan'
     ])
     
 

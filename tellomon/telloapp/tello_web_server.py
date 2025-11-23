@@ -1,6 +1,7 @@
 # tello_web_server.py
 import traceback
 import cv2
+import patches
 from djitellopy import Tello
 import threading
 import time
@@ -18,6 +19,7 @@ class TelloWebServer:
         self.is_streaming = False
         self.is_connected = False
         self.current_frame = None
+        self.current_frame_updated = False
         self.current_depth_map = None
         self.current_detections = []
         self.target_class = None
@@ -118,7 +120,7 @@ class TelloWebServer:
                 return False
             
             self.log("SUCCESS", "Tello WiFi connected")
-            time.sleep(2)
+            time.sleep(1)
             
             if self.tello:
                 try:
@@ -140,10 +142,13 @@ class TelloWebServer:
                     self.log("WARNING", f"Cleanup error (ignored): {e}")
                 finally:
                     self.tello = None
-                    time.sleep(3)
             
             self.log("INFO", "Creating new Tello connection...")
             self.tello = Tello()
+            ### Tello parameters
+            # these don't work on tello v1.3
+            # self.tello.set_video_fps(Tello.FPS_15)
+            # self.tello.set_video_resolution(Tello.RESOLUTION_480P)
             
             max_retries = 3
             for attempt in range(max_retries):
@@ -179,7 +184,7 @@ class TelloWebServer:
             self.log('INFO', 'Waiting for tello video stream to start...')
             while not self.tello.stream_on:
                 time.sleep(0.1)
-            time.sleep(0.5)
+            # time.sleep(10)
             
             self.log("SUCCESS", "🎥 Stream started successfully")
             self.is_connected = True
@@ -226,7 +231,7 @@ class TelloWebServer:
                         target_center_x = (x1 + x2) // 2
                         target_center_y = (y1 + y2) // 2
                                               
-                        # 오차 계산
+                        # 오차 계산 
                         error_x = target_center_x - center_x
                         error_y = target_center_y - center_y
                         if prev_depth is not None:
@@ -385,6 +390,7 @@ class TelloWebServer:
             print("✅ Frame reader initialized")
         except Exception as e:
             print(f"❌ Failed to initialize frame reader: {e}")
+            traceback.print_exc()
             self.is_streaming = False
             self.socketio.emit('stream_error', {
                 'message': 'Failed to start video stream. Please reconnect.'
@@ -398,96 +404,7 @@ class TelloWebServer:
             try:
                 frame = frame_reader.frame
                 
-                if frame is not None:
-                    error_count = 0
-                    
-                    # BGR → RGB 변환
-                    # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    # 추론 실행
-                    detections, depth_map, *_ = self.inference_engine.run(frame)
-                    
-                    with self.lock:
-                        self.current_detections = detections
-                        self.current_depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0])) 
-                        # don't resize the depth array, resize points instead?
-                        
-                        # 타겟 추적중이면 해당 객체 찾기
-                        if self.is_tracking and self.target_track_id is not None:
-                            target_found = False
-                            for det in detections:
-                                if det.track_id == self.target_track_id:
-                                    self.target_bbox = det.bbox
-                                    self.target_class = det.cls
-                                    target_found = True
-                                    break
-                            
-                            if not target_found:
-                                self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
-                            else:
-                                x1, y1, x2, y2 = self.target_bbox
-
-                                # depth_map에서 bbox 부분만 crop
-                                bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
-
-                                if bbox_depth_map.size > 0:
-                                    # 중앙값이 가장 안정적
-                                    target_depth = float(np.median(bbox_depth_map))
-
-                                    # 신뢰도(옵션)
-                                    depth_conf = float(np.var(bbox_depth_map))
-
-                                    # 저장 (다른 쓰레드나 controller가 쓰게)
-                                    self.target_depth = target_depth
-                                    self.target_depth_conf = depth_conf
-
-                                    self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
-                                else:
-                                    self.log("WARNING", "Target depth crop invalid")
-                    
-                    # 감지 결과 그리기
-                    frame_with_detections = draw_detections_on_frame(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
-                        detections,
-                        target_track_id=self.target_track_id if self.is_tracking else None
-                    )
-                    
-                    # 프레임 중심 십자선 표시
-                    h, w = frame_with_detections.shape[:2]
-                    center_x, center_y = w // 2, h // 2
-                    cv2.line(frame_with_detections, (center_x - 30, center_y), (center_x + 30, center_y), (255, 255, 255), 2)
-                    cv2.line(frame_with_detections, (center_x, center_y - 30), (center_x, center_y + 30), (255, 255, 255), 2)
-                    cv2.circle(frame_with_detections, (center_x, center_y), 5, (255, 255, 255), -1)
-                    
-                    # 배터리 및 높이 정보 업데이트
-                    try:
-                        old_battery = self.battery
-                        self.battery = self.tello.get_battery()
-                        self.height = self.tello.get_height()
-                        
-                        # 배터리 경고
-                        if self.battery < 15 and old_battery >= 15:
-                            self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
-                        elif self.battery < 25 and old_battery >= 25:
-                            self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
-                    except:
-                        pass
-                    
-                    # 프레임 저장
-                    with self.lock:
-                        self.current_frame = frame_with_detections
-                    
-                    # 감지 정보를 클라이언트에 전송
-                    self.socketio.emit('detections_update', {
-                        'detections': detections,
-                        'battery': self.battery,
-                        'height': self.height,
-                        'is_tracking': self.is_tracking,
-                        'target_track_id': self.target_track_id,
-                        'target_class': self.target_class
-                    })
-                
-                else:
+                if frame is None:
                     error_count += 1
                     if error_count >= max_errors:
                         print("⚠️ Too many frame errors")
@@ -495,9 +412,105 @@ class TelloWebServer:
                         self.socketio.emit('stream_error', {
                             'message': 'Video stream lost. Please reconnect.'
                         })
-                        break
+                        break                    
+                    continue
+            
+                error_count = 0
                 
-                time.sleep(0.033)
+                # BGR → RGB 변환
+                # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # 추론 실행
+                detections, depth_map, *_ = self.inference_engine.run(frame)
+                
+                with self.lock:
+                    self.current_detections = detections
+                    self.current_depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0])) 
+                    dep_vis = cv2.normalize(self.current_depth_map, None, 0, 255).astype(np.uint8)
+                    dep_vis = cv2.applyColorMap(dep_vis, cv2.COLORMAP_JET)
+                    cv2.imshow('dep', dep_vis)
+                    cv2.waitKey(1)
+                        
+                    # don't resize the depth array, resize points instead?
+                    
+                    # 타겟 추적중이면 해당 객체 찾기
+                    if self.is_tracking and self.target_track_id is not None:
+                        target_found = False
+                        for det in detections:
+                            if det.track_id == self.target_track_id:
+                                self.target_bbox = det.bbox
+                                self.target_class = det.cls
+                                target_found = True
+                                break
+                        
+                        if not target_found:
+                            self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
+                        else:
+                            x1, y1, x2, y2 = self.target_bbox
+
+                            # depth_map에서 bbox 부분만 crop
+                            bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
+
+                            if bbox_depth_map.size > 0:
+                                # 중앙값이 가장 안정적
+                                target_depth = float(np.median(bbox_depth_map))
+
+                                # 신뢰도(옵션)
+                                depth_conf = float(np.var(bbox_depth_map))
+
+                                # 저장 (다른 쓰레드나 controller가 쓰게)
+                                self.target_depth = target_depth
+                                self.target_depth_conf = depth_conf
+
+                                self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
+                            else:
+                                self.log("WARNING", "Target depth crop invalid")
+                
+                # 감지 결과 그리기
+                frame_with_detections = draw_detections_on_frame(
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
+                    detections,
+                    target_track_id=self.target_track_id if self.is_tracking else None
+                )
+                
+                # 프레임 중심 십자선 표시
+                h, w = frame_with_detections.shape[:2]
+                center_x, center_y = w // 2, h // 2
+                cv2.line(frame_with_detections, (center_x - 30, center_y), (center_x + 30, center_y), (255, 255, 255), 2)
+                cv2.line(frame_with_detections, (center_x, center_y - 30), (center_x, center_y + 30), (255, 255, 255), 2)
+                cv2.circle(frame_with_detections, (center_x, center_y), 5, (255, 255, 255), -1)
+                
+                # 배터리 및 높이 정보 업데이트
+                try:
+                    old_battery = self.battery
+                    self.battery = self.tello.get_battery()
+                    self.height = self.tello.get_height()
+                    
+                    # 배터리 경고
+                    if self.battery < 15 and old_battery >= 15:
+                        self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
+                    elif self.battery < 25 and old_battery >= 25:
+                        self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
+                except:
+                    pass
+                
+                # 프레임 저장
+                with self.lock:
+                    self.current_frame = frame_with_detections
+                    self.current_frame_updated = True
+                
+                # 감지 정보를 클라이언트에 전송
+                self.socketio.emit('detections_update', {
+                    'detections': [det.to_dict() for det in detections],
+                    'battery': self.battery,
+                    'height': self.height,
+                    'is_tracking': self.is_tracking,
+                    'target_track_id': self.target_track_id,
+                    'target_class': self.target_class
+                })
+                
+                
+                # time.sleep(0.033)
                 
             except Exception as e:
                 print(f"Stream error: {e}")
@@ -511,6 +524,7 @@ class TelloWebServer:
                 
         print("📹 Video stream thread ended")
     
+
     def start_streaming(self):
         """스트리밍 시작"""
         if not self.is_streaming and self.is_connected:
@@ -521,9 +535,11 @@ class TelloWebServer:
             return True
         return False
     
+
     def stop_streaming(self):
         """스트리밍 중지"""
         self.is_streaming = False
+
     
     def start_tracking(self):
         """자동 추적 시작"""
@@ -542,6 +558,7 @@ class TelloWebServer:
             return True
         return False
     
+
     def stop_tracking(self):
         """자동 추적 중지"""
         if not self.is_tracking:
@@ -554,14 +571,17 @@ class TelloWebServer:
         # ThiefTracker 모드 종료
         self.inference_engine.exit_thief_mode()
     
+
     def get_current_frame_jpeg(self):
         """현재 프레임을 JPEG로 반환"""
         with self.lock:
-            if self.current_frame is not None:
+            if self.current_frame is not None and self.current_frame_updated:
                 _, buffer = cv2.imencode('.jpg', self.current_frame, 
                                         [cv2.IMWRITE_JPEG_QUALITY, 80])
+                self.current_frame_updated = False
                 return buffer.tobytes()
         return None
+    
     
     def execute_command(self, command):
         """드론 명령 실행"""
@@ -614,6 +634,7 @@ class TelloWebServer:
         except Exception as e:
             self.log("ERROR", f"Command execution error: {e}")
             return {'success': False, 'message': str(e)}
+    
     
     def cleanup(self):
         """리소스 정리"""

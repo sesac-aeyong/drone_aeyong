@@ -53,7 +53,12 @@ class Settings:
     """Tello"""
     # tello_id:str = '5FD7AB' # blue tello 
     # tello_id:str = '5A6D18' # white tello
-    tello_id:str = None
+    tello_id: str = None
+    tello_retry_count: int = 1
+    tello_response_timeout:int = 3
+    tello_vs_port: int = 11111
+    tello_ip: str = '192.168.10.1'
+    #dji.Tello.__init__.__defaults__ = (S.tello_ip, S.tello_retry_count, S.tello_vs_port)
     """set tello_id to None for automatic connection"""
 
     def __post_init__(self): #

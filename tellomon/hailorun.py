@@ -13,7 +13,6 @@ from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
 
-#            rets.append((t_id, 'person', track.score, x1, y1, x2, y2))
 
 @dataclass
 class BoundingBox:
@@ -47,6 +46,11 @@ class BoundingBox:
         yield self.x2
         yield self.y2
 
+    
+    def to_list(self):
+        return [self.x1, self.y1, self.x2, self.y2]
+    
+
 @dataclass
 class Target:
     """
@@ -57,8 +61,18 @@ class Target:
     bbox: BoundingBox
     cls: str = 'person'
 
+
     def __post_init__(self):
         self.confidence = float(self.confidence) 
+
+
+    def to_dict(self):
+        return {
+            'track_id': self.track_id,
+            'confidence': self.confidence,
+            'class': self.cls,
+            'bbox': self.bbox.to_list()
+        }
 
 
 class HailoRun():
@@ -96,9 +110,6 @@ class HailoRun():
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
 
-        self.executor = ThreadPoolExecutor(max_workers=S.max_emb_threads)
-        self._thread_local = threading.local()
-
 
     def load(self):
         self.loaded = True
@@ -107,22 +118,19 @@ class HailoRun():
         print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
         self.vis_m = HailoInfer(S.vis_model)
-        self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
-        self.emb_m = HailoInfer(S.embed_model, output_type='UINT8') 
+        self.dep_m = HailoInfer(S.depth_model, output_type='FLOAT32')
+        self.emb_m = HailoInfer(S.embed_model, output_type='FLOAT32') 
 
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
         self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
         self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
 
         # buffers
-        self.emb_buf = np.zeros((S.max_vis_detections, S._emb_out_size), dtype=np.float32)
-        """embeddings buffer"""
         self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
         """vision model framebuffer"""
         self.dep_fb = np.empty((self.dm_shape[1], self.dm_shape[0], 3), dtype=np.uint8)
         """depth model framebuffer"""
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
-
 
 
     def enter_thief_mode(self, thief_id: int) -> bool:
@@ -186,47 +194,44 @@ class HailoRun():
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
-        # prepare frames
+        # prepare and run vis and dep models
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
-        cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
-
-        # run vis and dep models
         self.vis_m.run([self.vis_fb], self.vis_cb)
+        cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
-        depth = self.dep_q.get()
         del vision[1:] # 0 is person, remove all other classes.
         # Perhaps add knife or some weapon types?
 
         boxes, scores, _, num_detections = extract_detections(frame, vision)
 
         emb_ids = [] 
-        emb_crops = np.empty((num_detections, self.em_shape[1], self.em_shape[0], 3), dtype=np.uint8)
+        emb_crops = []
         crop_count = 0
         for i in range(num_detections):
             if scores[i] < S.min_emb_confidence:
                 continue 
             x1, y1, x2, y2 = self._safe_box(boxes[i])
-            crop = frame[y1:y2, x1:x2]
-            if crop.size < S.min_emb_cropsize:
+            if ((y2 - y1) * (x2 - x1)) < S.min_emb_cropsize:
                 continue
+            crop = frame[y1:y2, x1:x2]
             crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
             emb_ids.append(i)
-            emb_crops[crop_count] = crop
+            emb_crops.append(crop)
             crop_count += 1
 
         embeddings = [None] * num_detections
 
         if emb_ids:
-            self.emb_m.run(emb_crops[:crop_count], partial(_batch_callback, output_queue = self.emb_q))
+            self.emb_m.run(np.stack(emb_crops, axis=0), partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
             for i, det_id in enumerate(emb_ids):
-                embeddings[det_id] = self._emb_deq_norm(_embs[i])
+                embeddings[det_id] = self._emb_norm(_embs[i])
 
-        targets = self.tracker.update(
+        targets = self.active_tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), 
             embeddings
             )
@@ -234,17 +239,16 @@ class HailoRun():
         rets = []
         for track in targets:
             t_id = getattr(track, 'identity_id', track.track_id)
-            rets.append(Target(t_id, 'person', track.score, BoundingBox(track.last_bbox_tlbr)))
+            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
         
-
-        depth = self._dep_deq(depth)
+        depth = self.dep_q.get()
+        # depth = self._dep_deq(depth)
 
         return rets, depth, boxes
     
 
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
         """
-        expetcs str box in shape of y1, x1, y2, y2 
         returns bound safe x1, y1, x2, y2. 
         """
         x1, y1, x2, y2 = map(int, box)
@@ -262,20 +266,18 @@ class HailoRun():
         return (data - qi.qp_zp) * qi.qp_scale
 
 
-    def _emb_deq_norm(self, emb):
-        deq = self._deq(self.emb_m, emb)
-        # return deq
-        norm = np.linalg.norm(deq)
-        return deq / norm if norm > 0 else deq
+    def _emb_norm(self, emb):
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else emb
     
 
-    def _dep_deq(self, data):
-        deq = self._deq(self.dep_m, data)
+    # def _dep_deq(self, data):
+    #     deq = self._deq(self.dep_m, data)
 
-        depth = np.exp(-deq)
-        depth = 1.0 / (1.0 + depth)
-        depth = 1.0 / (depth * 10.0 + 0.009)
-        return depth
+    #     depth = np.exp(-deq)
+    #     depth = 1.0 / (1.0 + depth)
+    #     depth = 1.0 / (depth * 10.0 + 0.009)
+    #     return depth
     
     
     def close(self):
@@ -303,12 +305,12 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
 
 def _batch_callback(bindings_list, output_queue, **kwargs) -> None:
     """
-    batch callback, single output
+    batch callback, single output for embedding vectors
     """
     result = []
     for bindings in bindings_list:
         data = bindings.output().get_buffer()
-        result.append(data)
+        result.append(np.asarray(data).flatten())
 
     output_queue.put_nowait(result)
 
