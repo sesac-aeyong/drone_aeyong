@@ -26,7 +26,6 @@ def _denormalize_and_rm_pad(box: list, size: int, padding_length: int, input_hei
             box[i] -= padding_length
     y1, x1, y2, x2 = box
     return x1, y1, x2, y2
-    # return y1, x1, y2, x2
 
 
 def extract_detections(image: np.ndarray, detections: list) -> dict:
@@ -40,7 +39,6 @@ def extract_detections(image: np.ndarray, detections: list) -> dict:
     Returns:
         dict: Filtered detection results containing 'detection_boxes', 'detection_classes', 'detection_scores', and 'num_detections'.
     """
-
     score_threshold = S.min_vis_score_threshold
     max_detections = S.max_vis_detections
 
@@ -69,18 +67,24 @@ def extract_detections(image: np.ndarray, detections: list) -> dict:
     return boxes, scores, class_ids, len(top_detections)
 
 
-
-def draw_detection(image: np.ndarray, box: list, labels: list, score: float, color: tuple, track=False):
+def draw_detection(image: np.ndarray, box: list, 
+                   labels: list, score: float, color: tuple, 
+                   track: bool = False, identity_visible: int | None = None):
     """
     Draw box and label for one detection.
 
     Args:
         image (np.ndarray): Image to draw on.
         box (list): Bounding box coordinates.
-        labels (list): List of labels (1 or 2 elements).
-        score (float): Detection score.
-        color (tuple): Color for the bounding box.
-        track (bool): Whether to include tracking info.
+        labels (list): 
+            - 비추적 모드: 클래스 이름 등 1개
+            - 추적 모드: [클래스이름, 기존 트랙 라벨] 처럼 1~2개 사용 가능
+        score (float): Detection score (0~100 가정).
+        color (tuple): Bounding box 색상 (BGR).
+        track (bool): 추적 모드 여부.
+        identity_visible (int | None): 
+            - LongTermBoTSORT.track.identity_visible
+            - 숫자면 "ID:숫자", None이면 "ID:??"로 그려줌.
     """
     x1, y1, x2, y2 = map(int, box)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
@@ -91,10 +95,10 @@ def draw_detection(image: np.ndarray, box: list, labels: list, score: float, col
     bottom_text = None
 
     if track:
-        if len(labels) == 2:
-            bottom_text = labels[1]
+        if identity_visible is not None:
+            bottom_text = f"ID:{identity_visible}"
         else:
-            bottom_text = labels[0]
+            bottom_text = "ID:??"
 
 
     # Set colors
@@ -132,16 +136,15 @@ def draw_detections_on_frame(frame: np.ndarray, detections: list, target_track_i
         label = det.cls
         score = float(det.confidence)
         x1, y1, x2, y2 = det.bbox  # [x1, y1, x2, y2] format
+        visible_id = det.get('identity_visible', None)
+
         
         # 추적 중인 타겟이면 빨간색, 아니면 흰색
         is_target = (tid == target_track_id)
-        color = (0, 0, 255) if is_target else (255, 255, 255)  # RGB
-        
+        color = (0, 0, 255) if is_target else (255, 255, 255)  # BGR
+
         # 라벨 수정 (추적 중이면 표시)
-        if is_target:
-            label_text = [f"{label}", f"ID {tid}"]
-        else:
-            label_text = [label, f"ID {tid}"]
+        label_text = [label] # ID는 draw_detection에서 identity_visible로 처리
 
         draw_detection(
             annotated_frame,
@@ -149,7 +152,8 @@ def draw_detections_on_frame(frame: np.ndarray, detections: list, target_track_i
             label_text,
             score * 100.0,
             color,
-            True
+            True,
+            identity_visible=visible_id,
         )
 
         # 추적 중인 타겟이면 중심점도 그리기

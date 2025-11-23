@@ -259,7 +259,6 @@ class HailoRun():
 
         return x1, y1, x2, y2
 
-
     def _deq(self, model, data):
         out = model.infer_model.outputs[0]
         qi = out.quant_infos[0]
@@ -284,7 +283,6 @@ class HailoRun():
         self.vis_m.close()
         self.dep_m.close()
         self.emb_m.close()
-
 
     def __del__(self):
         self.close()

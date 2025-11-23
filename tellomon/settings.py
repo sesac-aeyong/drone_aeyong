@@ -58,7 +58,6 @@ class Settings:
     tello_response_timeout:int = 3
     tello_vs_port: int = 11111
     tello_ip: str = '192.168.10.1'
-    #dji.Tello.__init__.__defaults__ = (S.tello_ip, S.tello_retry_count, S.tello_vs_port)
     """set tello_id to None for automatic connection"""
 
     def __post_init__(self): #
