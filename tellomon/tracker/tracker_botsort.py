@@ -359,9 +359,6 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             # 이전에 붙어있던 ID가 있으면 그대로 유지
             if prev_identity_id is not None and prev_identity_id not in active_identity_ids:
                 return prev_identity_id
-            # 아직 트랙이 성숙하지 않았으면 새 ID 발급 보류
-            if track is not None and getattr(track, "match_frames", 0) < self.tracker.min_match_frames:
-                return None  # 이번 프레임은 identity 미할당 (vid는 자연히 None)
             # 성숙한 트랙이면 그때 새 ID 한 번만 발급
             identity_id = self.next_identity
             self.next_identity += 1
