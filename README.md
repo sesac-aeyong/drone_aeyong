@@ -113,18 +113,29 @@ BoTSORT online_tracks에
 ├── README.md
 ├── requirements.txt                              # dependencies 설치    
 └── tellomon/
-    ├── config.json                               # 추론 모델 설정
     ├── common/                                   # 전처리, 이미지 로드 등 각종 함수
+    ├── hailorun.py                               # hailo 모델 추론 파이프라인
+    ├── main.py                                   # 프로그램 진입지점
     ├── models/                                   # yolo, depth 등 .hef 모델
-    ├── templates/                                # 웹 서버용 html
+    ├── patches.py                                # djitellopy 부분 수정
+    ├── settings.py                               # 설정 파일
+    ├── telloapp/                                 # flask 앱 
+    │   ├── __init__.py
+    │   ├── app_tools.py
+    │   ├── routes.py
+    │   ├── tello_web_server.py
+    │   └── templates/                            # flask용 html
     ├── tracker/                                  # ReID 추적 모델
-    ├── hailorun.py                               # hailo 모델 추론
-    ├── tello_web_server.py                       # 텔로 웹 서버 실행
     └── yolo_tools.py                             # yolo 추론 결과 표시
 
 ```
+## Prerequisites
 
-## Prerequite
+- **HailoRT 5.0.0+**
+
+### Hardware
+- **Hailo 10H**
+- **DJI Tello**
 
 ```shell
 python -m venv .venv
@@ -140,10 +151,10 @@ cd drone_aeyong
 source .venv/bin/activate
 
 cd tellomon
-python tello_web_server.py
+python main.py
 
 # 텔로 와이파이 연결 후
-# 웹 서버에서 '연결' 클릭해서 드론 영상 연결
+# http://localhost:5000 웹 서버에서 '연결' 클릭해서 드론 영상 연결
 
 # 영상에서 추적 원하는 타겟 클릭해서 추적 시작
 ```
