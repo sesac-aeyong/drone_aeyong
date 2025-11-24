@@ -60,6 +60,7 @@ class Target:
     confidence: float
     bbox: BoundingBox
     cls: str = 'person'
+    identity_visible: int = None
 
 
     def __post_init__(self):
@@ -71,7 +72,8 @@ class Target:
             'track_id': self.track_id,
             'confidence': self.confidence,
             'class': self.cls,
-            'bbox': self.bbox.to_list()
+            'bbox': self.bbox.to_list(),
+            'identity_visible': self.identity_visible
         }
 
 
@@ -210,21 +212,18 @@ class HailoRun():
 
         emb_ids = [] 
         emb_crops = []
-        crop_count = 0
         for i in range(num_detections):
             if scores[i] < S.min_emb_confidence:
                 continue 
             x1, y1, x2, y2 = self._safe_box(boxes[i])
-            if ((y2 - y1) * (x2 - x1)) < S.min_emb_cropsize:
+            if (y2 - y1) <= 0 or (x2 - x1) <= 0 or ((y2 - y1) * (x2 - x1)) < S.min_emb_cropsize:
                 continue
-            crop = frame[y1:y2, x1:x2]
-            crop = cv2.resize(crop, self.em_shape, interpolation=cv2.INTER_LINEAR)
+            crop = cv2.resize(frame[y1:y2, x1:x2], self.em_shape, interpolation=cv2.INTER_LINEAR)
             emb_ids.append(i)
             emb_crops.append(crop)
-            crop_count += 1
 
         embeddings = [None] * num_detections
-
+        
         if emb_ids:
             self.emb_m.run(np.stack(emb_crops, axis=0), partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
@@ -239,10 +238,10 @@ class HailoRun():
         rets = []
         for track in targets:
             t_id = getattr(track, 'identity_id', track.track_id)
-            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
+            id_vis = getattr(track, 'identity_visible', None)
+            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr), identity_visible=id_vis))
         
         depth = self.dep_q.get()
-        # depth = self._dep_deq(depth)
 
         return rets, depth, boxes
     
@@ -258,6 +257,7 @@ class HailoRun():
         x2 = min(S.frame_width, x2)
 
         return x1, y1, x2, y2
+    
 
     def _deq(self, model, data):
         out = model.infer_model.outputs[0]

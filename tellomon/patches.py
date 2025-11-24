@@ -7,16 +7,16 @@ import numpy as np
 
 # override entire function
 def tello_bgfr_init_override(self, tello, address, with_queue = False, maxsize = 32):
-    print('!running monkeypatched BackgroundFrameRead init')
+    print('!running monkeypatched BackgroundFrameRead init!')
     self.address = address
     self.lock = Lock()
-    self.frame = np.zeros([300, 400, 3], dtype=np.uint8)
+    self.frame = np.zeros([S.frame_width, S.frame_height, 3], dtype=np.uint8)
     self.frames = deque([], maxsize)
     self.with_queue = with_queue
 
     try:
         djitellopy.Tello.LOGGER.debug('trying to grab video frames...')
-        self.container = av.open(self.address, timeout=(30, 30))
+        self.container = av.open('udp://192.168.10.1:11111', timeout=(30, 30))
     except av.error.ExitError:
         raise djitellopy.TelloException('Failed to grab video frames from video stream')
 
@@ -45,3 +45,5 @@ _orig_init = djitellopy.Tello.__init__
 def _patched_init_command(self, host=S.tello_ip, retry_count=S.tello_retry_count, vs_udp=S.tello_vs_port):
     return _orig_init(self, host=host, retry_count=retry_count, vs_udp=vs_udp)
 djitellopy.Tello.__init__ = _patched_init_command
+
+djitellopy.Tello.VS_UDP_IP = '192.168.10.1'

@@ -33,7 +33,7 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     nb = float(np.linalg.norm(b))
     if na < 1e-6 or nb < 1e-6:
         return 1.0
-    return 1.0 - float(np.dot(a, b) / (na * nb + 1e-6))
+    return 1.0 - float(np.dot(a, b) / (na * nb + 1e-10))
 
 def min_cos_dist_to_list(cand_emb, gallery_embs, default=1.0):
     """

@@ -39,13 +39,6 @@ class Settings:
     track_buffer: int = 600
     """# of frames lost tracks will be kept"""
 
-    ##GMC(BOTSORT)
-    gmc_sof_maxcorners:int = 200 # was 1000 by default
-    gmc_downscale:int = 3 # was 2 by default 
-    gmc_sof_quality:float = 0.03 # was 0.01 by default
-    gmc_sof_mindist:int = 3 # was 1 by default
-    gmc_sof_blocksize:int = 5 # was 3 by default
-
     """General"""
     frame_width: int = 960
     frame_height: int = 720
@@ -59,6 +52,10 @@ class Settings:
     tello_vs_port: int = 11111
     tello_ip: str = '192.168.10.1'
     """set tello_id to None for automatic connection"""
+
+    """TelloWebServer"""
+    # tello_ws_stream_on_off_timeout: int = 3
+    """time in seconds to wait for streamon/streamoff command"""
 
     def __post_init__(self): #
         try:

@@ -136,7 +136,7 @@ def draw_detections_on_frame(frame: np.ndarray, detections: list, target_track_i
         label = det.cls
         score = float(det.confidence)
         x1, y1, x2, y2 = det.bbox  # [x1, y1, x2, y2] format
-        visible_id = det.get('identity_visible', None)
+        visible_id = tid#det.identity_visible
 
         
         # 추적 중인 타겟이면 빨간색, 아니면 흰색
@@ -153,7 +153,7 @@ def draw_detections_on_frame(frame: np.ndarray, detections: list, target_track_i
             score * 100.0,
             color,
             True,
-            identity_visible=visible_id,
+            identity_visible=visible_id
         )
 
         # 추적 중인 타겟이면 중심점도 그리기

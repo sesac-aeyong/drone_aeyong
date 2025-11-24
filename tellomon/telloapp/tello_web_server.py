@@ -10,6 +10,7 @@ import queue
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import *
+from settings import settings as S
 
 
 class TelloWebServer:
@@ -30,7 +31,6 @@ class TelloWebServer:
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
-        # self.target_depth = None
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
@@ -57,7 +57,6 @@ class TelloWebServer:
             self.log("SUCCESS", "✅ Inference engine loaded successfully")
         except Exception as e:
             self.log("ERROR", f"❌ Failed to load inference engine: {e}")
-            import traceback
             traceback.print_exc()
             self.inference_engine = None
 
@@ -124,13 +123,11 @@ class TelloWebServer:
                 return False
             
             self.log("SUCCESS", "Tello WiFi connected")
-            time.sleep(1)
             
             if self.tello:
                 try:
                     self.log("INFO", "Cleaning up old connection...")
                     self.is_streaming = False
-                    time.sleep(1)
                     
                     if hasattr(self.tello, 'background_frame_read') and self.tello.background_frame_read:
                         try:
@@ -139,7 +136,6 @@ class TelloWebServer:
                             pass
                     
                     self.tello.streamoff()
-                    time.sleep(1)
                     self.tello.end()
                     
                 except Exception as e:
@@ -149,10 +145,6 @@ class TelloWebServer:
             
             self.log("INFO", "Creating new Tello connection...")
             self.tello = Tello()
-            ### Tello parameters
-            # these don't work on tello v1.3
-            # self.tello.set_video_fps(Tello.FPS_15)
-            # self.tello.set_video_resolution(Tello.RESOLUTION_480P)
             
             max_retries = 3
             for attempt in range(max_retries):
@@ -169,6 +161,7 @@ class TelloWebServer:
             
             self.battery = self.tello.get_battery()
             self.log("SUCCESS", f"Tello connected. Battery: {self.battery}%")
+            # self.log('INFO', f'Tello speed: {self.tello.query_speed()}')
             
             # 배터리 경고
             if self.battery < 20:
@@ -179,16 +172,11 @@ class TelloWebServer:
                 try:
                     self.tello.streamoff()
                     self.log('INFO', 'Waiting for video stream to end...')
-                    while self.tello.stream_on:
-                        time.sleep(0.1)
                 except:
                     pass
             
             self.tello.streamon()
             self.log('INFO', 'Waiting for tello video stream to start...')
-            while not self.tello.stream_on:
-                time.sleep(0.1)
-            # time.sleep(10)
             
             self.log("SUCCESS", "🎥 Stream started successfully")
             self.is_connected = True
@@ -267,7 +255,7 @@ class TelloWebServer:
                     target_ratio = target_area / frame_area
                     
                     # 목표 크기
-                    target_size_ideal = 0.2
+                    target_size_ideal = 0.3
                     error_size = target_size_ideal - target_ratio
                     
                     # === 간단한 비례 제어 ===
@@ -344,6 +332,7 @@ class TelloWebServer:
         print("📹 Starting video stream thread...")
         
         try:
+            time.sleep(3)
             frame_reader = self.tello.get_frame_read()
             print("✅ Frame reader initialized")
         except Exception as e:
@@ -361,6 +350,7 @@ class TelloWebServer:
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
+                print(self.tello.get_current_state())
                 
                 if frame is None:
                     error_count += 1
@@ -544,8 +534,10 @@ class TelloWebServer:
                 self.log("INFO", "🚁 Taking off...")
                 self.tello.takeoff()
                 self.last_takeoff_time = time.time()  # 이륙 시간 기록
-                time.sleep(3)
                 self.log("SUCCESS", f"Takeoff successful - stabilizing for {self.takeoff_stabilization_time}s")
+                
+                self.tello.move_up(20)
+                time.sleep(self.takeoff_stabilization_time)
                 return {'success': True, 'message': 'Takeoff successful'}
                 
             elif command == 'land':
