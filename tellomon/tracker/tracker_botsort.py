@@ -305,12 +305,12 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
     갤러리는 한 번 신중하게 저장 후 업데이트 금지
     """
     def __init__(self, botsort_tracker,
-        gal_match_cos_dist=0.4,          # 기존 ID 재사용 한계 
+        gal_match_cos_dist=0.35,         # 기존 ID 재사용 한계 
         max_memory=20,                   # 전체 identity 갯수 상한
         max_gal_emb_per_id=10,           # ID 하나당 gal_emb 최대 개수
         conf_thresh=0.7,                 # YOLO score 이 이상일 때만 prototype 후보로 인정
-        iou_no_overlap=0.1,              # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
-        gal_update_min_cos_dist=0.15,    # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
+        iou_no_overlap=0.2,              # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
+        gal_update_min_cos_dist=0.1,     # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
         gal_update_max_cos_dist=0.3,):   # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
     
         # 단기 추적기 (BoTSORT 인스턴스)
@@ -379,52 +379,30 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
 
     def _assign_identity(self, last_emb, active_identity_ids):
         """
-        Track.last_emb 를 받아서,
-          - gallery 안의 gal_emb들과 비교 → 가장 가까운 identity_id 찾기
-          - 최소 거리 <= gallery_match_threshold 이면 그 ID 재사용
-          - 아니면 새 identity_id 발급
-
-        active_identity_ids:
-          - 이번 프레임에 이미 사용된 ID 리스트 (한 프레임 내 중복 방지용)
+        기존 갤러리에서만 identity를 찾아줍니다.
+        - last_emb가 None이면 매칭 시도 불가 → None
+        - 갤러리 비었거나, threshold 안에 드는 id가 없으면 → None
+        - threshold 안에 드는 id가 있으면 → 그 id (단, 이번 프레임에서 이미 사용된 id는 스킵)
         """
-        # 1) 갤러리가 비었거나, 이 트랙에 last_emb가 없으면 → 무조건 새 ID
         if last_emb is None or len(self.gallery) == 0:
-            identity_id = self.next_identity
-            self.next_identity += 1
-            # 아직 gal_emb는 넣지 않음. 실제로 추가할지는 나중에 _should_add_gal_emb에서 판단
-            self.gallery.setdefault(identity_id, {"gal_embs": []})
-            ###print(f"[LT-ID] new identity={identity_id} (gallery empty or emb is None)")
-            return identity_id
+            return None
 
         best_id = None
-        best_cos_dist = self.gal_match_cos_dist  # 이 값보다 가까워야 매칭 인정
+        best_cos_dist = self.gal_match_cos_dist  # 이 값 '이하'면 같은 사람으로 인정
 
         for mem_id, info in self.gallery.items():
             if mem_id in active_identity_ids:
-                continue  # 한 프레임 안에서 ID 중복 사용 금지
-
+                continue
             gal_emb_list = info.get("gal_embs", [])
             if not gal_emb_list:
                 continue
 
             cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list)
-            ###print(f"[LT-ID] candidate id={mem_id} dist={cos_dist:.3f}")
-
-            if cos_dist < best_cos_dist:
+            if cos_dist <= best_cos_dist:
                 best_cos_dist = cos_dist
                 best_id = mem_id
 
-        if best_id is None:
-            # 2) threshold 안에 들어온 갤러리 ID가 없으면 → 새 ID 발급
-            identity_id = self.next_identity
-            self.next_identity += 1
-            self.gallery.setdefault(identity_id, {"gal_embs": []})
-            ###print(f"[LT-ID] new identity={identity_id} (no id under thr {self.gallery_match_threshold})")
-            return identity_id
-        else:
-            # 3) 충분히 가까운 ID가 있으면 그 ID 재사용
-            ###print(f"[LT-ID] reuse identity={best_id} (min_cos_dist={best_cos_dist:.3f})")
-            return best_id
+        return best_id  # 없으면 None
 
     def _should_add_gal_emb(self, identity_id, track, cand_emb, all_tracks):
         """
@@ -483,79 +461,82 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         """
         info = self.gallery.setdefault(identity_id, {"gal_embs": []})
         info["gal_embs"].append(cand_emb.copy())
-        ###print(f"[LT-GAL] added gal_emb for id={identity_id}: {len(info['gal_embs'])}/{self.max_gal_emb_per_id} stored")
 
     # ================== 메인 update ==================
 
     def update(self, detections: np.ndarray, embeddings: list):
         """
-        LongTermBoTSORT의 메인 엔트리.
-
-        Parameters
-        ----------
-        detections : np.ndarray
-            shape (N,5) = [x1, y1, x2, y2, score]
-        embeddings : list[np.ndarray] or None
-            길이 N, YOLO 각 bbox에 대응하는 현재 프레임 ReID 임베딩 (now_emb).
-            → 이 값은 BoTSORT.update(now_dets, now_embs) 에 그대로 넘겨짐.
-
-        반환값
-        ------
-        online_tracks : List[Track]
-            - BoTSORT가 t 프레임까지 추적을 마친 Track 리스트
-            - 각 Track 에는 .identity_id 가 추가됨
+        갤러리 저장 성공 시에만 id 확정. 실패하면 롤백 → identity_id=None
         """
-        # 1) BoTSORT 단기 추적으로 Track 리스트 갱신 (last_* 업데이트 포함)
+        # 1) BoTSORT로 트랙 최신화
         online_tracks = self.tracker.update(detections, embeddings)
 
-        # 이번 프레임에서 이미 사용된 identity_id들 (중복 방지용)
+        # 이번 프레임에 '확정'된 identity 목록 (중복 방지용)
         active_identity_ids = set()
 
         for track in online_tracks:
-            # 이 프레임 기준 “해당 사람의 대표 벡터”는 Track.last_emb (RepVGG 결과 한 장)
             last_emb = track.last_emb
 
-            # 2) 항상 갤러리 vs last_emb 로 ID 결정
-            identity_id = self._assign_identity(last_emb, active_identity_ids)
+            # (A) 기존 갤러리에서 매칭 시도
+            matched_id = self._assign_identity(last_emb, active_identity_ids)
 
-            # 3) 갤러리(Prototype) 갱신 후보라면, 매우 신중하게 gal_emb로 추가
-            if self._should_add_gal_emb(identity_id, track, last_emb, online_tracks):
-                self._add_gal_emb(identity_id, last_emb)
+            if matched_id is not None:
+                # 기존 ID 재사용은 즉시 확정 (이미 갤러리에 프로토타입이 있기 때문)
+                track.identity_id = matched_id
+                active_identity_ids.add(matched_id)
 
-            # 이번 프레임 중복 방지
-            active_identity_ids.add(identity_id)
+                # 필요 시 갤러리 업데이트(엄격) - 기존 정책 유지
+                if self._should_add_gal_emb(matched_id, track, last_emb, online_tracks):
+                    self._add_gal_emb(matched_id, last_emb)
 
-            # Track 객체에 표시용 ID 저장 → main에서 이걸 그려주면 됨
-            track.identity_id = identity_id
-            
-            # 디버그용
-            info = self.gallery.get(identity_id, {"gal_embs": []})
-            gal_emb_list = info.get("gal_embs", [])
-            min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if gal_emb_list else 1.0
+            else:
+                # (B) 갤러리 매칭 실패 → 임시 new_id '제안' (확정 아님)
+                provisional_id = self.next_identity
+
+                # 임시 id 키만 만들어두되, 확정은 갤러리 저장 성공 시점에!
+                self.gallery.setdefault(provisional_id, {"gal_embs": []})
+
+                # 갤러리 저장 조건 검사
+                if self._should_add_gal_emb(provisional_id, track, last_emb, online_tracks):
+                    # 저장 성공 → 확정
+                    self._add_gal_emb(provisional_id, last_emb)
+                    track.identity_id = provisional_id
+                    active_identity_ids.add(provisional_id)
+                    self.next_identity += 1
+                else:
+                    # 저장 실패 → 롤백(임시 id 제거 & 표시 안함)
+                    # 갤러리에 아무 것도 안 들어간 빈 키만 존재한다면 삭제
+                    info = self.gallery.get(provisional_id, {"gal_embs": []})
+                    if len(info.get("gal_embs", [])) == 0:
+                        self.gallery.pop(provisional_id, None)
+                    # 확정 안 하고 None 처리 (오버레이 금지)
+                    track.identity_id = None
+
+            # 디버그 로그 (확정된 id만 의미 있음)
+            iid = getattr(track, "identity_id", None)
+            gal_list = self.gallery.get(iid, {"gal_embs": []}).get("gal_embs", []) if iid else []
+            min_cos = min_cos_dist_to_list(last_emb, gal_list) if gal_list and last_emb is not None else 1.0
             print(
                 f"[LT-FRAME] track_id={track.track_id:3d} "
-                f"identity_id={identity_id:3d} "
+                f"identity_id={str(iid):>3} "
                 f"conf={track.score:.2f} "
-                f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
-                f"min_cos_dist={min_cos_dist:.3f}"
+                f"gal_size={len(gal_list) if iid else 0}/{self.max_gal_emb_per_id} "
+                f"min_cos_dist={min_cos:.3f}"
             )
 
-        # 4) 메모리 관리 – 이번 프레임에 쓰이지 않은 오래된 identity 일부 제거 (선택)
+        # 메모리 관리 (확정된 id만 고려)
         if len(self.gallery) > self.max_memory:
-            unused_ids = [iid for iid in self.gallery.keys()
-                          if iid not in active_identity_ids]
-            # 너무 많이 넘친 만큼만 앞에서부터 제거
+            used_ids = set(i for i in active_identity_ids if i in self.gallery)
+            unused_ids = [iid for iid in list(self.gallery.keys()) if iid not in used_ids]
             over = max(0, len(self.gallery) - self.max_memory)
             for iid in unused_ids[:over]:
-                ###print(f"[LT-MEM] remove identity_id={iid} from gallery (memory limit)")
                 self.gallery.pop(iid, None)
 
-        # 디버그: 한 프레임 안에서 identity 중복이 있으면 경고
-        ids_this_frame = [getattr(t, "identity_id", t.track_id) for t in online_tracks]
+        # 한 프레임 안에서 확정된 identity 중복 체크
+        ids_this_frame = [getattr(t, "identity_id", None) for t in online_tracks if getattr(t, "identity_id", None) is not None]
         if len(ids_this_frame) != len(set(ids_this_frame)):
             print("[WARN] duplicate identity in this frame:", ids_this_frame)
 
-        # self._merge_galleries()
         return online_tracks
     
 class ThiefTracker:
