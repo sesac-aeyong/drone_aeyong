@@ -340,7 +340,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
 
     # ================== ID 매칭 / prototype 추가 로직 ==================
 
-    def _assign_identity(self, last_emb, active_identity_ids, prev_identity_id=None, track=None):
+    def _assign_identity(self, last_emb, active_identity_ids, prev_identity_id=None):
         """
         last_emb와 gallery를 비교해 identity_id를 정하되,
 
@@ -359,10 +359,8 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             # 이전에 붙어있던 ID가 있으면 그대로 유지
             if prev_identity_id is not None and prev_identity_id not in active_identity_ids:
                 return prev_identity_id
-            # 아직 트랙이 성숙하지 않았으면 새 ID 발급 보류
-            if track is not None and getattr(track, "match_frames", 0) < self.tracker.min_match_frames:
-                return None  # 이번 프레임은 identity 미할당 (vid는 자연히 None)
-            # 성숙한 트랙이면 그때 새 ID 한 번만 발급
+
+            # 진짜 완전 새로운 트랙이면 새 ID
             identity_id = self.next_identity
             self.next_identity += 1
             self.gallery.setdefault(identity_id, {"gal_embs": []})
@@ -413,7 +411,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
                 prev_dist = min_cos_dist_to_list(last_emb, prev_gals)
 
         # prev_identity를 유지할지 결정할 threshold (튜닝 포인트)
-        KEEP_PREV_THR = 0.4
+        KEEP_PREV_THR = 0.25
 
         if prev_identity_id is not None and prev_identity_id not in active_identity_ids:
             # prev_id에 갤러리가 있고, 거리도 꽤 가깝다면 → prev 유지
@@ -530,14 +528,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
                 last_emb=last_emb,
                 active_identity_ids=active_identity_ids,
                 prev_identity_id=prev_identity_id,
-                track=track,
             )
-
-            # 🔧 보완: 아직 ID 보류(None)면, 갤러리/표시/active-set 모두 스킵
-            if identity_id is None:
-                track.identity_id = None
-                track.identity_visible = None
-                continue
 
             # 3) 갤러리(Prototype) 갱신 후보라면, 신중하게 추가
             if self._should_add_gal_emb(identity_id, track, last_emb, online_tracks):
