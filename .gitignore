@@ -9,6 +9,9 @@ speech_recognition/
 super_resolution/
 .hailo/
 .venv*
+build/
+models/
+cpp/
 
 *.pyc
 *.swp
