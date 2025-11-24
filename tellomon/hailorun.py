@@ -183,22 +183,17 @@ class HailoRun():
         targets = self.active_tracker.update(now_dets, embeddings)
 
         rets = []
-        for track in targets:
-            # 1) 항상 단기 추적 ID는 BoTSORT의 것을 유지
-            tid = int(getattr(track, 'track_id', -1))
-            
-            # 2) identity/visible 결정
+        for track in targets:            
             if self.thief_id != 0:
                 # ThiefTracker 모드
                 iid = int(self.thief_id)   # 도둑 모드: 고정
-                vid  = iid          # 도둑 모드: 항상 숫자 노출
+                vid  = iid                 # 도둑 모드: 항상 숫자 노출
             else:
                 # LongTermBoTSORT 모드
                 iid = getattr(track, 'identity_id', None)
                 vid  = getattr(track, 'identity_visible', None)  # 갤러리 조건 충족 시에만 표시
             x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
             rets.append({
-                    'track_id': tid,          # ← 단기 추적 ID로 고정
                     'identity_id': iid,       # ← 장기 ID는 별도 필드로
                     'identity_visible': vid,  # ← 화면 라벨
                     'class': 'person',
@@ -219,15 +214,13 @@ class HailoRun():
 
         return rets, depth, boxes
 
-    def draw_detections_on_frame(self, frame, detections, target_track_id=None):
+    def draw_detections_on_frame(self, frame, detections):
         """
         프레임에 감지 결과 그리기
         
         Args:
             frame: RGB 이미지
-            detections: 감지된 객체 리스트 (bbox in [x1, y1, x2, y2] format)
-            target_track_id: 추적 중인 타겟의 track_id (빨간색으로 표시)
-        
+            detections: 감지된 객체 리스트 (bbox in [x1, y1, x2, y2] format)        
         Returns:
             annotated_frame: 감지 결과가 그려진 프레임
         """
@@ -238,20 +231,9 @@ class HailoRun():
             label = [det['class']]
             score = float(det['confidence']) * 100.0
             x1, y1, x2, y2 = det['bbox']  # [x1, y1, x2, y2] format
-            
-            tid = det['track_id']                     # 단기 추적 ID
-            iid = det.get('identity_id', None)        # 장기 ID (없으면 폴백)
             vis = det.get('identity_visible', None)   # 화면 표시용
             
-            # 도둑 모드면 표시 폴백
-            if self.thief_id != 0 and vis is None:
-                vis = self.thief_id  # 화면 라벨 강제
-                
-            # 타깃 강조 조건
-            if self.thief_id != 0:
-                is_target = (vis == self.thief_id)
-            else:
-                is_target = (tid == target_track_id)
+            is_target = (self.thief_id != 0 and vis == self.thief_id)
             color = (0, 0, 255) if is_target else (255, 255, 255)  # 추적 중인 타겟이면 빨간색, 아니면 흰색
 
             draw_detection(
