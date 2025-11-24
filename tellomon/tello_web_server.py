@@ -93,8 +93,7 @@ class TelloWebServer:
         self.current_depth_map = None
         self.current_detections = []
         self.target_class = None
-        self.target_visible_id = None   # 일반 모드에서 화면에 vid를 표시할 때 사용
-        self.target_identity_id = None  # 도둑 모드: iid
+        self.target_track_id = None
         self.target_bbox = None  # Store in [x1, y1, x2, y2] format
         self.is_tracking = False
         self.battery = 0
@@ -430,7 +429,7 @@ class TelloWebServer:
                     
                     # 3초 이상 타겟을 못 찾으면 경고
                     if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (IID: {self.target_identity_id})")
+                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_track_id})")
                         target_lost_warning_sent = True
                 
                 time.sleep(0.2)
@@ -489,10 +488,10 @@ class TelloWebServer:
                         self.current_depth_map = cv2.resize(depth_map, frame.shape[:2])
                         
                         # 타겟 추적중이면 해당 객체 찾기
-                        if self.is_tracking and self.target_identity_id is not None:
+                        if self.is_tracking and self.target_track_id is not None:
                             target_found = False
                             for det in detections:
-                                if det['identity_id'] == self.target_identity_id:
+                                if det['track_id'] == self.target_track_id:
                                     # bbox 업데이트 (detections는 [x1, y1, x2, y2] format)
                                     self.target_bbox = det['bbox']
                                     self.target_class = det['class']
@@ -500,7 +499,7 @@ class TelloWebServer:
                                     break
                             
                             if not target_found:
-                                self.log("WARNING", f"⚠️ Target IID {self.target_identity_id} lost from view")
+                                self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
                             else:
                                 x1, y1, x2, y2 = map(int, self.target_bbox)
 
@@ -525,7 +524,8 @@ class TelloWebServer:
                     # 감지 결과 그리기
                     frame_with_detections = self.inference_engine.draw_detections_on_frame(
                         frame.copy(), 
-                        detections
+                        detections,
+                        target_track_id=self.target_track_id if self.is_tracking else None
                     )
                     
                     # 프레임 중심 십자선 표시
@@ -559,8 +559,7 @@ class TelloWebServer:
                         'battery': self.battery,
                         'height': self.height,
                         'is_tracking': self.is_tracking,
-                        'target_identity_id': self.target_identity_id,
-                        'target_visible_id': self.target_visible_id,
+                        'target_track_id': self.target_track_id,
                         'target_class': self.target_class
                     })
                 
@@ -603,22 +602,18 @@ class TelloWebServer:
     
     def start_tracking(self):
         """자동 추적 시작"""
-        if not self.is_tracking and self.target_identity_id is not None:
+        if not self.is_tracking and self.target_track_id is not None:
             # ThiefTracker 활성화
-            
-            # set_target 직후, 선택된 detection에서 identity_id를 저장
-            iid = self.target_identity_id
-            success = self.inference_engine.enter_thief_mode(iid)
-      
+            success = self.inference_engine.enter_thief_mode(self.target_track_id)
             if not success:
-                self.log("ERROR", f"Failed to enter thief mode for IID {self.target_identity_id}")
+                self.log("ERROR", f"Failed to enter thief mode for ID {self.target_track_id}")
                 return False
 
             self.is_tracking = True
             thread = threading.Thread(target=self.tracking_thread)
             thread.daemon = True
             thread.start()
-            self.log("SUCCESS", f"🎯 Started tracking: IID {self.target_identity_id} ({self.target_class})")
+            self.log("SUCCESS", f"🎯 Started tracking: ID {self.target_track_id} ({self.target_class})")
             return True
         return False
     
@@ -774,30 +769,28 @@ def handle_command(data):
 @socketio.on('set_target')
 def handle_set_target(data):
     """타겟 설정 (bbox는 [x1, y1, x2, y2] format)"""
+    target_track_id = data.get('track_id')
     target_class = data.get('class')
     target_bbox = data.get('bbox')  # [x1, y1, x2, y2]
-    vid = data.get('identity_visible')
-    iid = data.get('identity_id')
-    tello_server.target_visible_id = vid
-    tello_server.target_identity_id = iid
+    
+    tello_server.target_track_id = target_track_id
     tello_server.target_class = target_class
     tello_server.target_bbox = target_bbox
     
-    tello_server.log("INFO", f"🎯 Target set to: ID {vid} ({target_class}), bbox: {target_bbox}")
+    tello_server.log("INFO", f"🎯 Target set to: ID {target_track_id} ({target_class}), bbox: {target_bbox}")
     emit('target_response', {
-        'identity_visible': vid,
-        'identity_id': iid,
+        'track_id': target_track_id,
         'class': target_class,
         'bbox': target_bbox
     })
 
 @socketio.on('start_tracking')
 def handle_start_tracking():
-    if tello_server.target_identity_id is not None:
+    if tello_server.target_track_id is not None:
         success = tello_server.start_tracking()
         emit('tracking_status', {
             'is_tracking': success,
-            'target_identity_id': tello_server.target_identity_id,
+            'target_track_id': tello_server.target_track_id,
             'target_class': tello_server.target_class
         })
     else:
