@@ -1,8 +1,0 @@
-{
-    "vis_model": "models/yolov11s.hef",
-    "embed_model": "models/repvgg_a0_person_reid_2048.hef",
-    "depth_model": "models/scdepthv3.hef",
-
-
-    "tello_id": null
-}
