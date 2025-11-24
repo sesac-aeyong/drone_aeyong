@@ -350,7 +350,6 @@ class TelloWebServer:
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
-                print(self.tello.get_current_state())
                 
                 if frame is None:
                     error_count += 1

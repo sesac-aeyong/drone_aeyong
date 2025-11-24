@@ -60,7 +60,6 @@ class Target:
     confidence: float
     bbox: BoundingBox
     cls: str = 'person'
-    identity_visible: int = None
 
 
     def __post_init__(self):
@@ -72,8 +71,7 @@ class Target:
             'track_id': self.track_id,
             'confidence': self.confidence,
             'class': self.cls,
-            'bbox': self.bbox.to_list(),
-            'identity_visible': self.identity_visible
+            'bbox': self.bbox.to_list()
         }
 
 
@@ -237,15 +235,17 @@ class HailoRun():
         
         rets = []
         for track in targets:
-            t_id = getattr(track, 'identity_id', track.track_id)
-            id_vis = getattr(track, 'identity_visible', None)
-            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr), identity_visible=id_vis))
+            if self.thief_id != 0:
+                t_id = self.thief_id
+            else:
+                t_id = int(getattr(track, 'identity_id', track.track_id))
+            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
         
         depth = self.dep_q.get()
 
         return rets, depth, boxes
     
-
+            
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
         """
         returns bound safe x1, y1, x2, y2. 
@@ -268,15 +268,6 @@ class HailoRun():
     def _emb_norm(self, emb):
         norm = np.linalg.norm(emb)
         return emb / norm if norm > 0 else emb
-    
-
-    # def _dep_deq(self, data):
-    #     deq = self._deq(self.dep_m, data)
-
-    #     depth = np.exp(-deq)
-    #     depth = 1.0 / (1.0 + depth)
-    #     depth = 1.0 / (depth * 10.0 + 0.009)
-    #     return depth
     
     
     def close(self):
@@ -311,11 +302,4 @@ def _batch_callback(bindings_list, output_queue, **kwargs) -> None:
         result.append(np.asarray(data).flatten())
 
     output_queue.put_nowait(result)
-
-
-
-
-
-
-
 
