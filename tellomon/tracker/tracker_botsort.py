@@ -333,6 +333,48 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         self.gal_update_min_cos_dist = gal_update_min_cos_dist
         self.gal_update_max_cos_dist = gal_update_max_cos_dist
 
+    # ================== 유사 갤러리 합치기 ==================
+
+    def _merge_galleries(self, dist_thresh: float = 0.25):
+        def min_cos_dist_between_lists(list1, list2):
+            return min(min_cos_dist_to_list(e1, list2) for e1 in list1)
+        """
+        Merge galleries by comparing all embeddings in galleries.
+        """
+        active_ids = list(self.gallery.keys())
+        merged = {}
+
+        for i in range(len(active_ids)):
+            id_i = active_ids[i]
+            if id_i in merged:
+                continue
+            embs_i = self.gallery[id_i]['gal_embs']
+            if not embs_i:
+                continue
+
+            for j in range(i + 1, len(active_ids)):
+                id_j = active_ids[j]
+                if id_j in merged:
+                    continue
+                embs_j = self.gallery[id_j]['gal_embs']
+                if not embs_j:
+                    continue
+
+                # compute min cosine distance between any embedding pair
+                min_dist = min_cos_dist_between_lists(embs_i, embs_j)
+                if min_dist < dist_thresh:
+                    # merge: append embeddings from j to i
+                    self.gallery[id_i]['gal_embs'].extend(embs_j)
+                    # keep only last N embeddings
+                    self.gallery[id_i]['gal_embs'] = self.gallery[id_i]['gal_embs'][-self.max_gal_emb_per_id:]
+                    merged[id_j] = id_i
+
+        # remove merged galleries
+        for o_id, new_id in merged.items():
+            if o_id in self.gallery:
+                print(f'Merged {o_id} into {new_id}')
+                del self.gallery[o_id]
+
     # ================== ID 매칭 / prototype 추가 로직 ==================
 
     def _assign_identity(self, last_emb, active_identity_ids):
@@ -513,6 +555,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         if len(ids_this_frame) != len(set(ids_this_frame)):
             print("[WARN] duplicate identity in this frame:", ids_this_frame)
 
+        # self._merge_galleries()
         return online_tracks
     
 class ThiefTracker:
