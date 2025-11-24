@@ -185,18 +185,12 @@ class HailoRun():
         rets = []
         for track in targets:
             if self.thief_id != 0:
-                # ThiefTracker 모드
                 t_id = self.thief_id
-                visible_id = t_id  # 갤러리 상관없이 항상 숫자 표시
             else:
-                # LongTermBoTSORT 모드
-                identity_id = int(getattr(track, 'identity_id', track.track_id))
-                visible_id = getattr(track, 'identity_visible', None)
-                t_id = identity_id
+                t_id = int(getattr(track, 'identity_id', track.track_id))
             x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
             rets.append({
                     'track_id': t_id,
-                    'identity_visible': visible_id,    # ★ 화면에 숫자로 찍을지, ??로 찍을지 판단용
                     'class': 'person',
                     'confidence': float(track.score),
                     'bbox': [x1, y1, x2, y2]
@@ -235,14 +229,16 @@ class HailoRun():
             label = det['class']
             score = float(det['confidence'])
             x1, y1, x2, y2 = det['bbox']  # [x1, y1, x2, y2] format
-            visible_id = det.get('identity_visible', None)
             
             # 추적 중인 타겟이면 빨간색, 아니면 흰색
             is_target = (tid == target_track_id)
-            color = (0, 0, 255) if is_target else (255, 255, 255)  # BGR
+            color = (0, 0, 255) if is_target else (255, 255, 255)  # RGB
             
             # 라벨 수정 (추적 중이면 표시)
-            label_text = [label] # ID는 draw_detection에서 identity_visible로 처리
+            if is_target:
+                label_text = [f"{label}", f"ID {tid}"]
+            else:
+                label_text = [label, f"ID {tid}"]
 
             draw_detection(
                 annotated_frame,
@@ -250,8 +246,7 @@ class HailoRun():
                 label_text,
                 score * 100.0,
                 color,
-                True,
-                identity_visible=visible_id,
+                True
             )
 
             # 추적 중인 타겟이면 중심점도 그리기
@@ -342,3 +337,13 @@ def _callback(bindings_list, output_queue, **kwargs) -> None:
     result = np.asarray(result).flatten() 
 
     output_queue.put_nowait((kwargs.get('det_id'), result))
+
+
+
+
+
+
+
+
+
+
