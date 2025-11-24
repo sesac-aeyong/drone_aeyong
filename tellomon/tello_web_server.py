@@ -783,7 +783,7 @@ def handle_set_target(data):
     tello_server.target_class = target_class
     tello_server.target_bbox = target_bbox
     
-    tello_server.log("INFO", f"🎯 Target set to: ID {vid} ({target_class}), bbox: {target_bbox}")
+    tello_server.log("INFO", f"🎯 Target set → iid={iid}, vid={vid} ({target_class}), bbox={target_bbox}")
     emit('target_response', {
         'identity_visible': vid,
         'identity_id': iid,
