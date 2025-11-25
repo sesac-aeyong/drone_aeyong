@@ -57,23 +57,5 @@ class Settings:
     # tello_ws_stream_on_off_timeout: int = 3
     """time in seconds to wait for streamon/streamoff command"""
 
-    def __post_init__(self): #
-        try:
-            with open('config.json') as f:
-                sjson:dict = json.load(f)
-                for k, v in sjson.items():
-                    if k.startswith('_'):
-                        continue
-                    if hasattr(self, k):
-                        setattr(self, k, v)
-                    else:
-                        print(f'Unknown config key {k} with value {v} was ignored.')
-        except FileNotFoundError:
-            print('failed to load config.json, using defaults!')
-        except json.JSONDecodeError:
-            print('failed to convert config.json to json. Using defaults!')
-        self._emb_out_size: int = 2048 if '2048' in self.embed_model else 512 
-        self.min_emb_confidence: float = self.min_vis_score_threshold
-
 settings = Settings()
 

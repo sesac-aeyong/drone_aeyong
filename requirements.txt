@@ -1,0 +1,6 @@
+cv2
+numpy
+scipy
+djitellopy
+flask
+av

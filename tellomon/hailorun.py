@@ -1,8 +1,6 @@
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 import queue
-import threading
 import time
 from typing import List, Tuple
 import numpy as np
@@ -257,12 +255,6 @@ class HailoRun():
         x2 = min(S.frame_width, x2)
 
         return x1, y1, x2, y2
-    
-
-    def _deq(self, model, data):
-        out = model.infer_model.outputs[0]
-        qi = out.quant_infos[0]
-        return (data - qi.qp_zp) * qi.qp_scale
 
 
     def _emb_norm(self, emb):
@@ -281,9 +273,9 @@ class HailoRun():
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:
     result = None
-
     for bindings in bindings_list:
         result = bindings.output().get_buffer()
+        
     if 'det_id' not in kwargs: # vis/dep callback
         output_queue.put_nowait(result)
         return
