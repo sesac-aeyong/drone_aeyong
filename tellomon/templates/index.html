@@ -485,6 +485,9 @@
                 
                 <!-- 추적 중지 버튼 -->
                 <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display: none;">🛑 추적 중지</button>
+
+                <!-- 스크린샷 캡처 버튼 -->
+                <button class="btn btn-primary" onclick="captureScreenshot()" id="captureBtn" disabled>📸 화면 캡처</button>
             </div>
         </div>
     </div>
@@ -616,7 +619,17 @@
                 addLog('ERROR', data.message);
             }
         });
-        
+
+        socket.on('screenshot_response', (data) => {
+            if (data.success) {
+                addLog('SUCCESS', `${data.message}`);
+                // 캡처 효과 애니메이션
+                flashScreen();
+            } else {
+                addLog('ERROR', `캡처 실패: ${data.message}`);
+            }
+        });
+                
         function connectTello() {
             addLog('INFO', 'Tello 연결중...');
             socket.emit('connect_tello');
@@ -626,6 +639,34 @@
         function reconnectTello() {
             addLog('INFO', 'Tello 재연결중...');
             socket.emit('reconnect_tello');
+        }
+
+        // 스크린샷 캡처 함수
+        function captureScreenshot() {
+            addLog('INFO', '📸 화면 캡처중...');
+            socket.emit('capture_screenshot');
+        }
+
+        // 캡처 시각 효과
+        function flashScreen() {
+            const videoContainer = document.getElementById('videoContainer');
+            const flash = document.createElement('div');
+            flash.style.position = 'absolute';
+            flash.style.top = '0';
+            flash.style.left = '0';
+            flash.style.width = '100%';
+            flash.style.height = '100%';
+            flash.style.backgroundColor = 'white';
+            flash.style.opacity = '0.8';
+            flash.style.pointerEvents = 'none';
+            flash.style.transition = 'opacity 0.3s';
+            
+            videoContainer.appendChild(flash);
+            
+            setTimeout(() => {
+                flash.style.opacity = '0';
+                setTimeout(() => flash.remove(), 300);
+            }, 100);
         }
         
         function sendCommand(command) {
@@ -712,7 +753,7 @@
             const buttons = [
                 'reconnectBtn', 'takeoffBtn', 'landBtn', 'emergencyBtn',
                 'forwardBtn', 'backBtn', 'leftBtn', 'rightBtn', 
-                'upBtn', 'downBtn', 'cwBtn', 'ccwBtn'
+                'upBtn', 'downBtn', 'cwBtn', 'ccwBtn', 'captureBtn'
             ];
             
             buttons.forEach(id => {
