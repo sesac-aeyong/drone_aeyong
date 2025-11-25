@@ -1,7 +1,6 @@
 # tello_web_server.py
 import traceback
 import cv2
-import patches
 from djitellopy import Tello
 import threading
 import time
@@ -9,7 +8,7 @@ import numpy as np
 import queue
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
-from .app_tools import *
+from .app_tools import connect_to_tello_wifi
 from settings import settings as S
 
 
@@ -24,7 +23,7 @@ class TelloWebServer:
         self.current_depth_map = None
         self.current_detections = []
         self.target_class = None
-        self.target_track_id = None
+        self.target_identity_id = None
         self.target_bbox = None  # Store in [x1, y1, x2, y2] format
         self.is_tracking = False
         self.battery = 0
@@ -303,7 +302,7 @@ class TelloWebServer:
                     
                     # 3초 이상 타겟을 못 찾으면 경고
                     if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_track_id})")
+                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
                         target_lost_warning_sent = True
                 
                 time.sleep(0.05)  # 20Hz 제어 루프
@@ -364,61 +363,45 @@ class TelloWebServer:
             
                 error_count = 0
                 
-                # BGR → RGB 변환
-                # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
                 # 추론 실행
                 detections, depth_map, *_ = self.inference_engine.run(frame)
                 
                 with self.lock:
                     self.current_detections = detections
                     
-                    # 타겟 추적중이면 해당 객체 찾기
-                    if self.is_tracking and self.target_track_id is not None:
-                        target_found = False
+                    if self.is_tracking:
+                        # 1) 도둑 모드 후보 찾기: thief_dist <= gate 인 것 중 최솟값
+                        best = None
                         for det in detections:
-                            if det.track_id == self.target_track_id:
-                                self.target_bbox = det.bbox
-                                self.target_class = det.cls
-                                target_found = True
-                                break
-                        
-                        if not target_found:
-                            self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
-                        # else:
-                        #     x1, y1, x2, y2 = self.target_bbox
+                            get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
+                            td = get("thief_dist")
+                            tg = get("thief_cos_dist")
+                            if td is None or tg is None:
+                                continue
+                            if td <= tg:
+                                if (best is None) or (td < best.get("thief_dist", 1e9)):
+                                    best = det
 
-                        #     # depth_map에서 bbox 부분만 crop
-                        #     bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
-
-                        #     if bbox_depth_map.size > 0:
-                        #         # 중앙값이 가장 안정적
-                        #         target_depth = float(np.median(bbox_depth_map))
-
-                        #         # 신뢰도(옵션)
-                        #         depth_conf = float(np.var(bbox_depth_map))
-
-                        #         # 저장 (다른 쓰레드나 controller가 쓰게)
-                        #         self.target_depth = target_depth
-                        #         self.target_depth_conf = depth_conf
-
-                        #         self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
-                        #     else:
-                        #         self.log("WARNING", "Target depth crop invalid")
+                        if best is not None:
+                            # 매칭 통과: 이 bbox만 추적 대상으로
+                            self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
+                            self.target_class = (best.get("class", "person") if isinstance(best, dict)
+                                                else getattr(best, "cls", "person"))
+                        else:
+                            # 매칭 실패: 타겟 상실 처리
+                            if self.target_bbox is not None:
+                                self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
+                            self.target_bbox = None
                 
                 # 감지 결과 그리기
-                frame_with_detections = draw_detections_on_frame(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
-                    detections,
-                    target_track_id=self.target_track_id if self.is_tracking else None
-                )
+                frame_with_detections = draw_detections_on_frame(frame, detections)
                 
                 # 프레임 중심 십자선 표시
                 h, w = frame_with_detections.shape[:2]
-                center_x, center_y = w // 2, h // 2
-                cv2.line(frame_with_detections, (center_x - 30, center_y), (center_x + 30, center_y), (255, 255, 255), 2)
-                cv2.line(frame_with_detections, (center_x, center_y - 30), (center_x, center_y + 30), (255, 255, 255), 2)
-                cv2.circle(frame_with_detections, (center_x, center_y), 5, (255, 255, 255), -1)
+                cx, cy = w // 2, h // 2
+                cv2.line(frame_with_detections, (cx - 30, cy), (cx + 30, cy), (255, 255, 255), 2)
+                cv2.line(frame_with_detections, (cx, cy - 30), (cx, cy + 30), (255, 255, 255), 2)
+                cv2.circle(frame_with_detections, (cx, cy), 5, (255, 255, 255), -1)
                 
                 # 배터리 및 높이 정보 업데이트
                 try:
@@ -441,11 +424,11 @@ class TelloWebServer:
                 
                 # 감지 정보를 클라이언트에 전송
                 self.socketio.emit('detections_update', {
-                    'detections': [det.to_dict() for det in detections],
+                    'detections': detections,
                     'battery': self.battery,
                     'height': self.height,
                     'is_tracking': self.is_tracking,
-                    'target_track_id': self.target_track_id,
+                    'target_identity_id': self.target_identity_id,
                     'target_class': self.target_class
                 })
                 
@@ -483,44 +466,120 @@ class TelloWebServer:
     
     def start_tracking(self):
         """자동 추적 시작"""
-        if not self.is_tracking and self.target_track_id is not None:
+        if not self.is_tracking and self.target_identity_id is not None:
             # ThiefTracker 활성화
-            success = self.inference_engine.enter_thief_mode(self.target_track_id)
+            success = self.inference_engine.enter_thief_mode(self.target_identity_id)
             if not success:
-                self.log("ERROR", f"Failed to enter thief mode for ID {self.target_track_id}")
+                self.log("ERROR", f"Failed to enter thief mode for ID {self.target_identity_id}")
                 return False
 
             self.is_tracking = True
             thread = threading.Thread(target=self.tracking_thread)
             thread.daemon = True
             thread.start()
-            self.log("SUCCESS", f"🎯 Started tracking: ID {self.target_track_id} ({self.target_class})")
+            self.log("SUCCESS", f"🎯 Started tracking: ID {self.target_identity_id} ({self.target_class})")
             return True
         return False
     
 
-    def stop_tracking(self):
-        """자동 추적 중지"""
-        if not self.is_tracking:
+    def start_tracking(self):
+        """자동 추적 시작 (identity 우선, 실패 시 bbox 폴백)"""
+        # 이미 추적 중이면 재시작 금지
+        if getattr(self, "is_tracking", False):
+            self.log("WARNING", "Already tracking. Ignoring start request.")
+            return True
+
+        iid = self.target_identity_id
+        bbox = getattr(self, "target_bbox", None)
+
+        # 1) 타입/유효성 정리
+        if iid is not None:
+            try:
+                iid = int(iid)
+                if iid < 0:
+                    iid = None
+            except Exception:
+                iid = None
+
+        # 2) identity 시도
+        if iid is not None:
+            ok = self.inference_engine.enter_thief_mode(iid)
+            if ok:
+                self._spawn_tracking_thread()
+                self.is_tracking = True
+                self.log("SUCCESS", f"🎯 Started tracking: ID {iid} ({self.target_class})")
+                # (선택) 프론트로 상태 방송
+                self._emit_tracking_status(True, target_identity_id=iid)
+                return True
+            else:
+                self.log("WARNING", f"enter_thief_mode failed for ID {iid}; trying bbox fallback...")
+
+        # 3) bbox 폴백 (초기 ?? 케이스 지원)
+        if bbox is not None:
+            ok = self.inference_engine.lock_by_bbox(bbox)  # 근접 트랙/검출로 락
+            if ok:
+                self._spawn_tracking_thread()
+                self.is_tracking = True
+                self.log("SUCCESS", "🎯 Started tracking by bbox-lock (ID pending)")
+                self._emit_tracking_status(True, target_identity_id=None)
+                return True
+
+        # 4) 실패
+        self._emit_tracking_status(False, message="lock_by_identity and bbox fallback both failed")
+        self.log("ERROR", "Failed to start tracking: no valid identity/bbox lock")
+        return False
+
+    def _spawn_tracking_thread(self):
+        """트래킹 스레드 안전 생성 (중복 방지)"""
+        if getattr(self, "_tracking_thread", None) and self._tracking_thread.is_alive():
             return
+        t = threading.Thread(target=self.tracking_thread, daemon=True)
+        t.start()
+        self._tracking_thread = t
 
-        self.is_tracking = False
-        self.target_bbox = None
-        self.log("INFO", "⏹️ Stopped tracking")
-
-        # ThiefTracker 모드 종료
-        self.inference_engine.exit_thief_mode()
+    def _emit_tracking_status(self, is_on, target_identity_id=None, message=None):
+        """프론트로 추적 상태 송신 (routes.py에서 socketio.emit 쓰는 콜백을 주입해도 됨)"""
+        try:
+            if hasattr(self, "socketio"):
+                self.socketio.emit('tracking_status', {
+                    'is_tracking': bool(is_on),
+                    'target_identity_id': target_identity_id,
+                    'class': getattr(self, 'target_class', None),
+                    'message': message,
+                })
+        except Exception:
+            pass
     
 
     def get_current_frame_jpeg(self):
-        """현재 프레임을 JPEG로 반환"""
+        """현재 프레임을 JPEG로 반환 (BGR 그대로 인코딩, 락 최소화)"""
+        frame = None
         with self.lock:
             if self.current_frame is not None and self.current_frame_updated:
-                _, buffer = cv2.imencode('.jpg', self.current_frame, 
-                                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+                # 잠깐만 복사 떠서 락 빨리 풀기
+                frame = self.current_frame.copy()
+                # 인코딩 성공 시에만 False로 내리는 게 안전하지만
+                # 프레임을 한 번만 내보내고 새 프레임을 기다리려면 여기서 내립니다.
                 self.current_frame_updated = False
-                return buffer.tobytes()
-        return None
+
+        if frame is None:
+            return None
+
+        try:
+            # ⚠ OpenCV는 BGR → 바로 JPEG 인코딩 (RGB 변환 금지)
+            ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                # 인코딩 실패했으면 다음 호출에서 다시 시도할 수 있게 플래그 복원
+                with self.lock:
+                    self.current_frame_updated = True
+                return None
+            return buffer.tobytes()
+        except Exception as e:
+            # 실패 시 플래그 복원
+            with self.lock:
+                self.current_frame_updated = True
+            self.log("ERROR", f"JPEG encode failed: {e}")
+            return None
     
     
     def execute_command(self, command):

@@ -26,10 +26,10 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                  max_kf_life=30,          # 관측 없이 예측만 허용할 최대 프레임 수
                  min_match_frames=3,      # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
                  iou_gate=0.1,            # IoU 기준 최소값
-                 l2_gate=1.0,             # ReID 거리 기준 최대값 (None 이면 사용 안 함)
-                 l2_weight=2.0,           # cost에 들어가는 ReID 거리 가중치
-                 high_yolo_thresh=0.5,    # 새 Track 생성에 쓸 최소 YOLO score
-                 low_yolo_thresh=0.3):    # 기존 Track 연결에만 쓸 YOLO score 하한
+                 cos_gate=0.3,            # ReID 거리 기준 최대값 (None 이면 사용 안 함)
+                 cos_weight=2.0,          # cost에 들어가는 ReID 거리 가중치
+                 high_yolo_thresh=0.7,    # 새 Track 생성에 쓸 최소 YOLO score
+                 low_yolo_thresh=0.5):    # 기존 Track 연결에만 쓸 YOLO score 하한
 
         # Track 생성 시 넘겨줄 공통 하이퍼파라미터
         self.max_kf_life      = max_kf_life
@@ -37,8 +37,8 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
 
         # 매칭 cost / gate 파라미터
         self.iou_gate    = float(iou_gate)
-        self.l2_gate   = l2_gate   # None 이면 ReID gate는 생략
-        self.l2_weight = float(l2_weight)
+        self.cos_gate   = cos_gate   # None 이면 ReID gate는 생략
+        self.cos_weight = float(cos_weight)
 
         # ByteTrack 스타일: YOLO confidence 분리
         self.high_yolo_thresh = float(high_yolo_thresh)
@@ -62,8 +62,8 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
             길이 N, 각 detection의 현재 프레임 ReID 임베딩.
 
         cost(d, t) = (1 - IoU(Track.kf_bbox_tlbr, now_bbox_d))
-                     + l2_weight * ||Track.last_emb - now_emb_d||
-                     (단, last_emb와 now_emb 둘 다 있을 때만 ReID 항 추가)
+                     + cos_weight * cosine_distance(Track.last_emb, now_emb_d)
+                     (단, 임베딩이 둘 다 있을 때만 ReID 항 추가)
         """
         N = len(now_dets)
         M = len(self.tracks)
@@ -80,10 +80,10 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                 iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
                 cost = 1.0 - iou_score
 
-                # 2) ReID 기반 거리 cost (항상 ReID는 쓰되, 임베딩이 둘 다 있을 때만)
+                # 2) ReID 기반 거리 cost (임베딩이 둘 다 있을 때만)
                 if last_track.last_emb is not None and now_emb is not None:
-                    l2_dist = np.linalg.norm(last_track.last_emb - now_emb)
-                    cost += l2_dist * self.l2_weight
+                    cos_dist = cosine_distance(last_track.last_emb, now_emb)
+                    cost += cos_dist * self.cos_weight
 
                 cost_matrix[det_idx, track_idx] = cost
 
@@ -185,12 +185,12 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                     if iou_score < self.iou_gate:
                         continue
 
-                    # ReID gate (옵션: reid_gate가 None이면 스킵)
-                    if self.l2_gate is not None and now_embs is not None:
+                    # ReID gate (옵션: cos_gate가 None이면 스킵)
+                    if self.cos_gate is not None and now_embs is not None:
                         now_emb = now_embs[global_now_idx]
                         if last_track.last_emb is not None and now_emb is not None:
-                            l2_dist = np.linalg.norm(last_track.last_emb - now_emb)
-                            if l2_dist > self.l2_gate:
+                            cos_dist = cosine_distance(last_track.last_emb, now_emb)
+                            if cos_dist > self.cos_gate:
                                 continue
 
                     matches.append((global_now_idx, track_idx))
@@ -229,11 +229,11 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                     continue
 
                 # ReID gate
-                if self.l2_gate is not None and now_embs is not None:
+                if self.cos_gate is not None and now_embs is not None:
                     now_emb = now_embs[global_now_idx]
                     if last_track.last_emb is not None and now_emb is not None:
-                        l2_dist = np.linalg.norm(last_track.last_emb - now_emb)
-                        if l2_dist > self.l2_gate:
+                        cos_dist = cosine_distance(last_track.last_emb, now_emb)
+                        if cos_dist > self.cos_gate:
                             continue
 
                 matches.append((global_now_idx, track_idx))
@@ -305,13 +305,13 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
     갤러리는 한 번 신중하게 저장 후 업데이트 금지
     """
     def __init__(self, botsort_tracker,
-        gal_match_cos_dist=0.4,          # 기존 ID 재사용 한계 
+        gal_match_cos_dist=0.3,          # 기존 ID 재사용 한계 
         max_memory=20,                   # 전체 identity 갯수 상한
         max_gal_emb_per_id=10,           # ID 하나당 gal_emb 최대 개수
         conf_thresh=0.7,                 # YOLO score 이 이상일 때만 prototype 후보로 인정
         iou_no_overlap=0.1,              # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
         gal_update_min_cos_dist=0.15,    # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
-        gal_update_max_cos_dist=0.3,):   # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
+        gal_update_max_cos_dist=0.25,):  # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
     
         # 단기 추적기 (BoTSORT 인스턴스)
         self.tracker = botsort_tracker
@@ -387,15 +387,10 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         active_identity_ids:
           - 이번 프레임에 이미 사용된 ID 리스트 (한 프레임 내 중복 방지용)
         """
-        # 1) 갤러리가 비었거나, 이 트랙에 last_emb가 없으면 → 무조건 새 ID
+        # 1) 갤러리가 비었거나, 이 트랙에 last_emb가 없으면 → ID 판단 보류(None)
         if last_emb is None or len(self.gallery) == 0:
-            identity_id = self.next_identity
-            self.next_identity += 1
-            # 아직 gal_emb는 넣지 않음. 실제로 추가할지는 나중에 _should_add_gal_emb에서 판단
-            self.gallery.setdefault(identity_id, {"gal_embs": []})
-            ###print(f"[LT-ID] new identity={identity_id} (gallery empty or emb is None)")
-            return identity_id
-
+            return None
+        
         best_id = None
         best_cos_dist = self.gal_match_cos_dist  # 이 값보다 가까워야 매칭 인정
 
@@ -408,23 +403,13 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
                 continue
 
             cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list)
-            ###print(f"[LT-ID] candidate id={mem_id} dist={cos_dist:.3f}")
 
             if cos_dist < best_cos_dist:
                 best_cos_dist = cos_dist
                 best_id = mem_id
 
-        if best_id is None:
-            # 2) threshold 안에 들어온 갤러리 ID가 없으면 → 새 ID 발급
-            identity_id = self.next_identity
-            self.next_identity += 1
-            self.gallery.setdefault(identity_id, {"gal_embs": []})
-            ###print(f"[LT-ID] new identity={identity_id} (no id under thr {self.gallery_match_threshold})")
-            return identity_id
-        else:
-            # 3) 충분히 가까운 ID가 있으면 그 ID 재사용
-            ###print(f"[LT-ID] reuse identity={best_id} (min_cos_dist={best_cos_dist:.3f})")
-            return best_id
+        # threshold 안에 들어온 갤러리 ID가 없으면 → 아직 새 ID 발급하지 않음(None 반환)
+        return best_id
 
     def _should_add_gal_emb(self, identity_id, track, cand_emb, all_tracks):
         """
@@ -454,9 +439,11 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             if iou_val > self.iou_no_overlap:
                 return False
 
-        # 갤러리에 이미 있는 gal_emb 개수 확인
-        info = self.gallery.setdefault(identity_id, {"gal_embs": []})
-        gal_emb_list = info["gal_embs"]
+        # 갤러리에 이미 있는 gal_emb 개수 확인 (identity_id=None이면 '비어있다'로 취급)
+        if identity_id is None:
+            gal_emb_list = []
+        else:
+            gal_emb_list = self.gallery.get(identity_id, {}).get("gal_embs", [])
 
         if len(gal_emb_list) >= self.max_gal_emb_per_id:
             # 이미 identity_id 당 허용한 최대 개수만큼 저장됨 → 더 안 넣음 (업데이트 금지!)
@@ -483,7 +470,6 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
         """
         info = self.gallery.setdefault(identity_id, {"gal_embs": []})
         info["gal_embs"].append(cand_emb.copy())
-        ###print(f"[LT-GAL] added gal_emb for id={identity_id}: {len(info['gal_embs'])}/{self.max_gal_emb_per_id} stored")
 
     # ================== 메인 update ==================
 
@@ -515,26 +501,35 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             # 이 프레임 기준 “해당 사람의 대표 벡터”는 Track.last_emb (RepVGG 결과 한 장)
             last_emb = track.last_emb
 
-            # 2) 항상 갤러리 vs last_emb 로 ID 결정
+            # 2) 기존 갤러리와 매칭 시도 (성공 시 그 ID 사용)
             identity_id = self._assign_identity(last_emb, active_identity_ids)
 
-            # 3) 갤러리(Prototype) 갱신 후보라면, 매우 신중하게 gal_emb로 추가
-            if self._should_add_gal_emb(identity_id, track, last_emb, online_tracks):
-                self._add_gal_emb(identity_id, last_emb)
-
-            # 이번 프레임 중복 방지
-            active_identity_ids.add(identity_id)
-
-            # Track 객체에 표시용 ID 저장 → main에서 이걸 그려주면 됨
-            track.identity_id = identity_id
+            if identity_id is not None:
+                # 3-a) 기존 ID에 대해 갤러리 업데이트 시도
+                if self._should_add_gal_emb(identity_id, track, last_emb, online_tracks):
+                    self._add_gal_emb(identity_id, last_emb)
+                active_identity_ids.add(identity_id)
+                track.identity_id = identity_id
+            else:
+                # 3-b) 기존 매칭 실패: "저장 조건"을 만족하면 그 순간에만 새 ID 생성+저장
+                if self._should_add_gal_emb(None, track, last_emb, online_tracks):
+                    new_id = self.next_identity
+                    self.next_identity += 1
+                    self.gallery.setdefault(new_id, {"gal_embs": []})
+                    self._add_gal_emb(new_id, last_emb)
+                    track.identity_id = new_id
+                    active_identity_ids.add(new_id)
+                else:
+                    track.identity_id = None
             
             # 디버그용
-            info = self.gallery.get(identity_id, {"gal_embs": []})
+            gid = track.identity_id
+            info = self.gallery.get(gid, {"gal_embs": []})
             gal_emb_list = info.get("gal_embs", [])
-            min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if gal_emb_list else 1.0
+            min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if (gal_emb_list and last_emb is not None) else 1.0
             print(
                 f"[LT-FRAME] track_id={track.track_id:3d} "
-                f"identity_id={identity_id:3d} "
+                f"identity_id={(gid if gid is not None else -1):3d} "
                 f"conf={track.score:.2f} "
                 f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
                 f"min_cos_dist={min_cos_dist:.3f}"
@@ -547,7 +542,6 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
             # 너무 많이 넘친 만큼만 앞에서부터 제거
             over = max(0, len(self.gallery) - self.max_memory)
             for iid in unused_ids[:over]:
-                ###print(f"[LT-MEM] remove identity_id={iid} from gallery (memory limit)")
                 self.gallery.pop(iid, None)
 
         # 디버그: 한 프레임 안에서 identity 중복이 있으면 경고
@@ -697,43 +691,6 @@ class ThiefTracker:
         if best_dist <= self.thief_cos_dist:
             self.thief_match_counts[best_idx] += 1
             
-    # ----------------- cost matrix -----------------
-
-    def compute_cost_matrix(self, now_dets, now_embs):
-        """
-        현재 프레임 YOLO detection vs 이전 프레임 TrackState(pred 상태) 사이의 cost matrix 계산.
-
-        도둑 전용 cost 정의:
-          cost(d, t) = (1 - IoU(Track.kf_bbox_tlbr, now_bbox_d))
-                       + cos_weight * min_cos_dist(now_emb_d, thief_embs)
-
-        - 여기서는 Track의 last_emb 대신 "도둑 갤러리(thief_embs)"와의 거리를 사용한다.
-        """
-        N = len(now_dets)
-        M = len(self.tracks)
-        cost_matrix = np.zeros((N, M), dtype=np.float32)
-
-        for det_idx in range(N):
-            now_bbox = now_dets[det_idx, :4]
-            now_emb  = None if now_embs is None else now_embs[det_idx]
-
-            # 도둑 갤러리와의 최소 거리
-            cos_dist = min_cos_dist_to_list(now_emb, self.thief_embs)
-
-            for track_idx in range(M):
-                last_track = self.tracks[track_idx]
-
-                # 1) 위치 기반 IoU cost (예측 위치(pred) vs 현재 bbox(now))
-                iou_score = iou_bbox(now_bbox, last_track.kf_bbox_tlbr)
-                cost = 1.0 - iou_score
-
-                # 2) 도둑 갤러리와의 거리 cost
-                cost += cos_dist * self.cos_weight
-
-                cost_matrix[det_idx, track_idx] = cost
-
-        return cost_matrix
-
     # ----------------- 메인 update -----------------
 
     def update(self, now_dets, now_embs=None):
@@ -798,12 +755,6 @@ class ThiefTracker:
 
             return [t for t in self.tracks if t.frame_conf and t.kf_life <= 3]
 
-        # 도둑 후보 detection만 서브셋으로 사용
-        dets_valid = now_dets[valid_inds]
-        embs_valid = None
-        if now_embs is not None:
-            embs_valid = [now_embs[i] for i in valid_inds]
-
         # =========================================
         # 1단계: 도둑 후보 dets vs 기존 TrackState
         # =========================================
@@ -829,6 +780,8 @@ class ThiefTracker:
                     continue
 
                 # 2) 도둑 갤러리와의 거리 게이트
+                if now_emb is None:
+                    continue
                 cos_dist = min_cos_dist_to_list(now_emb, self.thief_embs)
                 if cos_dist > self.thief_cos_dist:
                     continue
@@ -853,12 +806,14 @@ class ThiefTracker:
         if now_embs is not None:
             for idx in unmatched_det_indices:
                 emb = now_embs[idx]
+                if emb is None:
+                    continue
                 cos_dist = min_cos_dist_to_list(emb, self.thief_embs)
                 if cos_dist <= self.thief_cos_dist:
                     thief_like_det_indices.append(idx)
         else:
-            # emb 없으면 thief_cos_dist를 쓸 수 없으니, 우선 YOLO conf만으로 후보 판단
-            thief_like_det_indices = unmatched_det_indices
+            # 도둑 모드는 임베딩 기반이 핵심 → 임베딩 없으면 생성 건너뜀
+            thief_like_det_indices = []
 
         # ==============================
         # 매칭된 TrackState 업데이트 (last ← now)
