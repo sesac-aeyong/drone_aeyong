@@ -46,6 +46,8 @@ class HailoRun():
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
 
+        self.optical_flow = OpticalFlowEgoMotion()
+
 
     def load(self):
         self.loaded = True
@@ -186,11 +188,90 @@ class HailoRun():
                 det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
             rets.append(det)
         
-        depth = self.dep_q.get()
+        depth_raw = self.dep_q.get()
+        depth = self._process_depth(depth_raw)
 
-        return rets, depth, boxes
+        # 배경 마스크 생성 (YOLO detection 영역 제외)
+        h, w = frame.shape[:2]
+        background_mask = np.ones((h, w), dtype=np.uint8) * 255
+        
+        for i in range(num_detections):
+            if scores[i] < 0.3:
+                continue
+            x1, y1, x2, y2 = map(int, boxes[i])
+            # Dilate detection box
+            padding = 20
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(w, x2 + padding)
+            y2 = min(h, y2 + padding)
+            background_mask[y1:y2, x1:x2] = 0
+        
+        # Optical flow 계산
+        flow_result = self.optical_flow.compute_sparse_optical_flow(
+            frame, background_mask
+        )
+        
+        ego_velocity = None
+        has_flow = False
+
+        if flow_result is not None:
+            good_new, good_old = flow_result
+            ego_velocity = self.optical_flow.estimate_ego_velocity(
+                good_new, good_old, depth
+            )
+            has_flow = True
+        
+        optical_flow_data = {
+            'ego_velocity': ego_velocity,  # [vx, vy] in m/s
+            'background_mask': background_mask,
+            'has_flow': has_flow 
+        }
+        
+        return rets, depth, boxes, optical_flow_data
     
-            
+    def _process_depth(self, depth_raw: np.ndarray) -> np.ndarray:
+        """
+        SC-DepthV3 raw output을 실제 거리(미터)로 변환
+        
+        SC-DepthV3는 log-space disparity를 출력:
+        - 음수 값이 정상
+        - exp(-depth_raw)로 변환 필요
+        """
+        # 디버깅 (필요시 주석 처리)
+        #print(f"[DEPTH DEBUG] Raw depth: min={np.min(depth_raw):.4f}, "
+        #    f"max={np.max(depth_raw):.4f}, mean={np.mean(depth_raw):.4f}")
+        
+        # Log-space disparity → Disparity 변환
+        # SC-DepthV3: disparity = exp(-depth_raw)
+        disparity = np.exp(-depth_raw)
+        
+        # Disparity → Depth 변환
+        # depth = 1 / disparity (역수 관계)
+        # 하지만 직접 역수는 불안정하므로 정규화 후 처리
+        
+        # 정규화 [0, 1]
+        disp_min = np.min(disparity)
+        disp_max = np.max(disparity)
+        disp_normalized = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+        
+        # Normalized disparity → Depth
+        # 높은 disparity (1에 가까움) = 가까운 거리
+        # 낮은 disparity (0에 가까움) = 먼 거리
+        depth = 1.0 / (disp_normalized + 0.01)  # 0.01로 0 나누기 방지
+        
+        DEPTH_SCALE = 1.4
+        depth = depth * DEPTH_SCALE
+        
+        # 유효 범위로 클리핑
+        depth = np.clip(depth, 0.1, 10.0)
+        
+        # 디버깅 (필요시 주석 처리)
+        print(f"[DEPTH DEBUG] Processed depth: min={np.min(depth):.4f}, "
+            f"max={np.max(depth):.4f}, mean={np.mean(depth):.4f}")
+        
+        return depth
+                
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
         """
         returns bound safe x1, y1, x2, y2. 
@@ -222,6 +303,59 @@ class HailoRun():
 
     def __del__(self):
         self.close()
+
+    def extract_target_depth(self, depth_map: np.ndarray, target_bbox: Tuple[int, int, int, int]):
+        """
+        특정 타겟의 depth 값을 추출 (배경 영향 최소화)
+        """
+        if target_bbox is None:
+            return None
+        
+        x1, y1, x2, y2 = map(int, target_bbox)
+        
+        # BBox 유효성 검사
+        h, w = depth_map.shape[:2]
+        if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            return None
+        
+        # ✨ 중앙 60% 영역만 사용 (배경 제거)
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+        center_ratio = 0.6
+        
+        x1_c = int(x1 + bbox_w * (1 - center_ratio) / 2)
+        y1_c = int(y1 + bbox_h * (1 - center_ratio) / 2)
+        x2_c = int(x2 - bbox_w * (1 - center_ratio) / 2)
+        y2_c = int(y2 - bbox_h * (1 - center_ratio) / 2)
+        
+        # 영역이 너무 작으면 원본 사용
+        if (x2_c - x1_c) < 10 or (y2_c - y1_c) < 10:
+            x1_c, y1_c, x2_c, y2_c = x1, y1, x2, y2
+        
+        # 타겟 영역 추출
+        target_depth_region = depth_map[y1_c:y2_c, x1_c:x2_c]
+        
+        if target_depth_region.size == 0:
+            return None
+        
+        # ✨ 이상치 제거
+        depths_flat = target_depth_region.flatten()
+        
+        # 1. 유효 범위 필터링
+        valid_depths = depths_flat[(depths_flat > 0.5) & (depths_flat < 8.0)]
+        
+        if len(valid_depths) == 0:
+            return None
+        
+        # 2. 중앙값 기준 ±2m 이내만 사용
+        median_depth = np.median(valid_depths)
+        filtered_depths = valid_depths[np.abs(valid_depths - median_depth) < 2.0]
+        
+        if len(filtered_depths) == 0:
+            return median_depth
+        
+        # 3. 최종 중앙값 반환
+        return float(np.median(filtered_depths))
 
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:

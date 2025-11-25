@@ -39,7 +39,7 @@ class TelloWebServer:
         self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
         self.rc_speed = 40
-        self.tracking_rc_speed = 30
+        self.tracking_rc_speed = 50
         self.rc_command_duration = 0.4
         
         # 웹 로그 시스템
@@ -47,7 +47,20 @@ class TelloWebServer:
         self.log_thread = None
         self.is_logging = True
         self.start_log_broadcaster()
+
+        # Optical flow 데이터 저장
+        self.current_ego_velocity = None
+        self.ego_velocity_history = []
+        self.max_ego_history = 5
         
+        # 거리 유지 목표
+        self.forward_only = True
+        self.target_distance = 3.0  # 3m 유지
+        self.min_safe_distance = 1.0 # 최소 안전 거리
+        self.max_track_distance = 5.0   # 최대 추적 거리
+        self.depth_history = []
+        self.max_depth_history = 5
+  
         # 추론 엔진 초기화
         self.log("INFO", "Loading inference engine...")
         try:
@@ -195,16 +208,17 @@ class TelloWebServer:
         target_lost_warning_sent = False
         
         # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.80      # 회전 게인
-        gain_lr = 0.80       # 좌우 이동 게인
-        gain_ud = 0.40       # 상하 이동 게인
-        gain_fb = 200         # 전후 이동 게인
+        gain_yaw = 0.30      # 회전 게인
+        gain_lr = 0.20       # 좌우 이동 게인
+        gain_ud = 0.30       # 상하 이동 게인
+        gain_fb_depth = 30.0 # 전후 이동 게인
         
         # 임계값
         yaw_threshold = 0.20    # 20% 이상 오차면 회전
         lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
         ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
         size_threshold = 0.025  # 크기 오차 임계값
+        depth_threshold = 0.25
 
         self.log("INFO", "🎯 Simple RC tracking started")
         
@@ -246,6 +260,25 @@ class TelloWebServer:
                     error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
                     error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
                     
+                    if hasattr(self, 'current_depth_map') and self.current_depth_map is not None:
+                        target_depth = self.inference_engine.extract_target_depth(
+                            self.current_depth_map,
+                            self.target_bbox
+                        )
+                        
+                        if target_depth is not None:
+                            self.depth_history.append(target_depth)
+                            if len(self.depth_history) > self.max_depth_history:
+                                self.depth_history.pop(0)
+
+                    # Depth 평활화
+                    if len(self.depth_history) > 0:
+                        smoothed_depth = np.median(self.depth_history)
+                        distance_error = smoothed_depth - self.target_distance
+                    else:
+                        smoothed_depth = None
+                        distance_error = 0
+
                     # 타겟 크기
                     target_width = x2 - x1
                     target_height = y2 - y1
@@ -278,13 +311,63 @@ class TelloWebServer:
                         ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
                     else:
                         ud_speed = 0
-                    
-                    # 3. 전후 제어
-                    if abs(error_size) > size_threshold:
-                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
+
+
+                    # 3. 전후 제어 (FB - Depth 기반, 앞으로만)
+                    if smoothed_depth:
+                        distance_error = smoothed_depth - self.target_distance
+                        
+                        # 안전 거리 체크
+                        if smoothed_depth < self.min_safe_distance:
+                            # 너무 가까움 - 정지 + 경고
+                            fb_speed = 0
+                            self.log("WARNING", 
+                                    f"Too close! (depth={smoothed_depth:.2f}m < min={self.min_safe_distance}m)")
+                        
+                        elif smoothed_depth > self.max_track_distance:
+                            # 너무 멀음 - 정지 + 경고
+                            fb_speed = 0
+                            self.log("WARNING", 
+                                    f"Too far! (depth={smoothed_depth:.2f}m > max={self.max_track_distance}m)")
+                        
+                        elif distance_error > depth_threshold:
+                            # 사람이 멀어짐 - 앞으로 추적
+                            if self.forward_only:
+                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
+                                                    0,  # ← 최소값 0 (뒤로 안 감!)
+                                                    self.tracking_rc_speed))
+                                
+                                if fb_speed > 0:
+                                    self.log("DEBUG", 
+                                            f"Forward (depth={smoothed_depth:.2f}m, target={self.target_distance}m)")
+                            else:
+                                # 양방향 (원래 로직)
+                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
+                                                    -self.tracking_rc_speed, 
+                                                    self.tracking_rc_speed))
+                        
+                        elif distance_error < -depth_threshold:
+                            # 사람이 가까워짐
+                            if self.forward_only:
+                                # 뒤로 안 가고 정지!
+                                fb_speed = 0
+                                self.log("DEBUG", 
+                                        f"top (too close: depth={smoothed_depth:.2f}m < target={self.target_distance}m)")
+                            else:
+                                # 뒤로 이동 (원래)
+                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
+                                                    -self.tracking_rc_speed, 
+                                                    self.tracking_rc_speed))
+                        
+                        else:
+                            # 안전 범위 내 - 정지
+                            fb_speed = 0
+                            self.log("DEBUG", 
+                                    f"✓ In range (depth={smoothed_depth:.2f}m)")
+
                     else:
                         fb_speed = 0
-                    
+
                     # RC 명령 전송
                     self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
                     
@@ -364,10 +447,22 @@ class TelloWebServer:
                 error_count = 0
                 
                 # 추론 실행
-                detections, depth_map, *_ = self.inference_engine.run(frame)
+                detections, depth_map, _, optical_flow_data = self.inference_engine.run(frame)
+                self.current_depth_map = depth_map
+
+                # Ego-velocity 저장
+                self.current_ego_velocity = optical_flow_data.get('ego_velocity')
                 
                 with self.lock:
                     self.current_detections = detections
+                    self.current_depth_map = cv2.resize(depth_map, frame.shape[1::-1])
+                        
+                    # Ego-velocity 저장
+                    if optical_flow_data['has_flow'] and optical_flow_data['ego_velocity'] is not None:
+                        self.current_ego_velocity = optical_flow_data['ego_velocity']
+                        self.ego_velocity_history.append(self.current_ego_velocity)
+                        if len(self.ego_velocity_history) > self.max_ego_history:
+                            self.ego_velocity_history.pop(0)
                     
                     if self.is_tracking:
                         # 1) 도둑 모드 후보 찾기: thief_dist <= gate 인 것 중 최솟값
@@ -387,11 +482,27 @@ class TelloWebServer:
                             self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
                             self.target_class = (best.get("class", "person") if isinstance(best, dict)
                                                 else getattr(best, "cls", "person"))
+                            # Depth 계산
+                            x1, y1, x2, y2 = map(int, self.target_bbox)
+                            bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
+                            
+                            if bbox_depth_map.size > 0:
+                                target_depth = float(np.median(bbox_depth_map))
+                                depth_conf = float(np.var(bbox_depth_map))
+                                
+                                self.target_depth = target_depth
+                                self.target_depth_conf = depth_conf
+                                
+                                # Depth history 저장
+                                self.depth_history.append(target_depth)
+                                if len(self.depth_history) > self.max_depth_history:
+                                    self.depth_history.pop(0)
                         else:
                             # 매칭 실패: 타겟 상실 처리
                             if self.target_bbox is not None:
                                 self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
                             self.target_bbox = None
+
                 
                 # 감지 결과 그리기
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
