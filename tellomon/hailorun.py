@@ -238,8 +238,7 @@ class HailoRun():
             if self.thief_id != 0:
                 t_id = self.thief_id
             else:
-                iid = getattr(track, 'identity_id', None)
-                t_id = None if iid is None else int(iid)
+                t_id = int(getattr(track, 'identity_id', track.track_id))
             rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
         
         depth = self.dep_q.get()
