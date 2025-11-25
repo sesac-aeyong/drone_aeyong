@@ -1,6 +1,6 @@
 # routes.py
 import time, os
-from flask import Blueprint, render_template, Response, request
+from flask import Blueprint, render_template, Response
 
 def create_routes(socketio, get_tello_server, disconnect_wifi):
     """

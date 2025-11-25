@@ -463,71 +463,39 @@ class TelloWebServer:
         """스트리밍 중지"""
         self.is_streaming = False
 
-    
-    def start_tracking(self):
-        """자동 추적 시작"""
-        if not self.is_tracking and self.target_identity_id is not None:
-            # ThiefTracker 활성화
-            success = self.inference_engine.enter_thief_mode(self.target_identity_id)
-            if not success:
-                self.log("ERROR", f"Failed to enter thief mode for ID {self.target_identity_id}")
-                return False
-
-            self.is_tracking = True
-            thread = threading.Thread(target=self.tracking_thread)
-            thread.daemon = True
-            thread.start()
-            self.log("SUCCESS", f"🎯 Started tracking: ID {self.target_identity_id} ({self.target_class})")
-            return True
-        return False
-    
-
     def start_tracking(self):
         """자동 추적 시작 (identity 우선, 실패 시 bbox 폴백)"""
-        # 이미 추적 중이면 재시작 금지
-        if getattr(self, "is_tracking", False):
+        if self.is_tracking:
             self.log("WARNING", "Already tracking. Ignoring start request.")
+            self._emit_tracking_status(True, target_identity_id=self.target_identity_id)
             return True
 
-        iid = self.target_identity_id
-        bbox = getattr(self, "target_bbox", None)
+        iid = None if self.target_identity_id is None else int(self.target_identity_id)
+        bbox = self.target_bbox
 
-        # 1) 타입/유효성 정리
+        # 1) identity 우선
         if iid is not None:
-            try:
-                iid = int(iid)
-                if iid < 0:
-                    iid = None
-            except Exception:
-                iid = None
-
-        # 2) identity 시도
-        if iid is not None:
-            ok = self.inference_engine.enter_thief_mode(iid)
-            if ok:
-                self._spawn_tracking_thread()
+            if self.inference_engine.enter_thief_mode(iid):
                 self.is_tracking = True
-                self.log("SUCCESS", f"🎯 Started tracking: ID {iid} ({self.target_class})")
-                # (선택) 프론트로 상태 방송
+                self._spawn_tracking_thread()
                 self._emit_tracking_status(True, target_identity_id=iid)
+                self.log("SUCCESS", f"🎯 Started tracking: ID {iid} ({self.target_class})")
                 return True
-            else:
-                self.log("WARNING", f"enter_thief_mode failed for ID {iid}; trying bbox fallback...")
+            self.log("WARNING", f"enter_thief_mode failed for ID {iid}; trying bbox fallback...")
 
-        # 3) bbox 폴백 (초기 ?? 케이스 지원)
-        if bbox is not None:
-            ok = self.inference_engine.lock_by_bbox(bbox)  # 근접 트랙/검출로 락
-            if ok:
-                self._spawn_tracking_thread()
-                self.is_tracking = True
-                self.log("SUCCESS", "🎯 Started tracking by bbox-lock (ID pending)")
-                self._emit_tracking_status(True, target_identity_id=None)
-                return True
+        # 2) bbox 폴백
+        if bbox is not None and self.inference_engine.lock_by_bbox(bbox):
+            self.is_tracking = True
+            self._spawn_tracking_thread()
+            self._emit_tracking_status(True, target_identity_id=None)
+            self.log("SUCCESS", "🎯 Started tracking by bbox-lock (ID pending)")
+            return True
 
-        # 4) 실패
+        # 3) 실패
         self._emit_tracking_status(False, message="lock_by_identity and bbox fallback both failed")
-        self.log("ERROR", "Failed to start tracking: no valid identity/bbox lock")
+        self.log("ERROR", "Failed to start tracking")
         return False
+
 
     def _spawn_tracking_thread(self):
         """트래킹 스레드 안전 생성 (중복 방지)"""
@@ -552,30 +520,24 @@ class TelloWebServer:
     
 
     def get_current_frame_jpeg(self):
-        """현재 프레임을 JPEG로 반환 (BGR 그대로 인코딩, 락 최소화)"""
+        """현재 프레임을 JPEG로 반환 (BGR 그대로 인코딩)"""
         frame = None
         with self.lock:
             if self.current_frame is not None and self.current_frame_updated:
-                # 잠깐만 복사 떠서 락 빨리 풀기
-                frame = self.current_frame.copy()
-                # 인코딩 성공 시에만 False로 내리는 게 안전하지만
-                # 프레임을 한 번만 내보내고 새 프레임을 기다리려면 여기서 내립니다.
+                frame = self.current_frame  # copy() 불필요: 바로 imencode 하고 끝
                 self.current_frame_updated = False
-
         if frame is None:
             return None
 
         try:
-            # ⚠ OpenCV는 BGR → 바로 JPEG 인코딩 (RGB 변환 금지)
-            ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # >>> 색 변환 금지! (OpenCV는 BGR 그대로 JPEG 인코딩)
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not ok:
-                # 인코딩 실패했으면 다음 호출에서 다시 시도할 수 있게 플래그 복원
                 with self.lock:
                     self.current_frame_updated = True
                 return None
-            return buffer.tobytes()
+            return buf.tobytes()
         except Exception as e:
-            # 실패 시 플래그 복원
             with self.lock:
                 self.current_frame_updated = True
             self.log("ERROR", f"JPEG encode failed: {e}")
@@ -645,3 +607,34 @@ class TelloWebServer:
         self.is_logging = False
         if self.inference_engine:
             self.inference_engine.close()
+
+
+    def stop_tracking(self):
+        """자동 추적 중지 → 일반 모드로 복귀"""
+        if not self.is_tracking:
+            self._emit_tracking_status(False, message="Already stopped")
+            return
+
+        # 도둑 모드 해제(있으면)
+        try:
+            if hasattr(self.inference_engine, "exit_thief_mode"):
+                self.inference_engine.exit_thief_mode()
+        except Exception as e:
+            self.log("WARNING", f"exit_thief_mode error: {e}")
+
+        # 상태 초기화
+        self.is_tracking = False
+        self.target_identity_id = None
+        self.target_bbox = None
+        self.target_class = None
+
+        # 드론 정지 (안전)
+        try:
+            if self.tello:
+                self.tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+
+        # 프론트 알림
+        self._emit_tracking_status(False, message="Back to normal mode")
+        self.log("INFO", "Stopped tracking and returned to normal mode.")

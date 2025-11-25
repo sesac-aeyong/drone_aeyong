@@ -131,10 +131,10 @@ class HailoRun():
         output is detections, depth, list of yolo boxes
         """
         # prepare and run vis and dep models
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        self.letterbox_buffer(frame, self.vis_fb)
+        frame_rgb = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
+        self.letterbox_buffer(frame_rgb, self.vis_fb)
         self.vis_m.run([self.vis_fb], self.vis_cb)
-        self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
+        self.dep_fb[...] = cv2.resize(frame_rgb, self.dm_shape, interpolation=cv2.INTER_LINEAR)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
@@ -152,7 +152,7 @@ class HailoRun():
             x1, y1, x2, y2 = self._safe_box(boxes[i])
             if (y2 - y1) <= 0 or (x2 - x1) <= 0 or ((y2 - y1) * (x2 - x1)) < S.min_emb_cropsize:
                 continue
-            crop = cv2.resize(frame[y1:y2, x1:x2], self.em_shape, interpolation=cv2.INTER_LINEAR)
+            crop = cv2.resize(frame_rgb[y1:y2, x1:x2], self.em_shape, interpolation=cv2.INTER_LINEAR)
             emb_ids.append(i)
             emb_crops.append(crop)
 
