@@ -484,245 +484,294 @@
                 </div>
                 
                 <!-- 추적 중지 버튼 -->
-                <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display: none;">🛑 추적 중지</button>
+                <div class="panel">
+                    <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display: none;">🛑 추적 중지</button>
+                </div>
+
+                <!-- 도둑 ID 수동 지정 + 서버 종료 -->
+                <div class="panel">
+                    <h2>도둑 ID 수동 지정 & 종료</h2>
+                    <div style="display:grid; grid-template-columns: 1fr auto; gap:6px; margin-bottom:6px;">
+                        <input id="manualId" type="number" min="1" placeholder="identity_id 입력" style="width:100%; padding:6px;">
+                        <button class="btn btn-primary btn-small" onclick="manualSetThief()">지정&추적</button>
+                    </div>
+                    <button class="btn btn-danger" onclick="shutdownServer()">✔️ 서버 종료 (CTRL+C)</button>
+                </div>
             </div>
         </div>
     </div>
     
     <script>
-        const socket = io();
-        let selectedTarget = null;
-        let isTracking = false;
-        let currentDetections = [];
-        let logCollapsed = false;
-        
-        const videoFeed = document.getElementById('videoFeed');
-        
-        // 비디오 컨테이너 클릭 이벤트
-        document.getElementById('videoContainer').addEventListener('click', function(e) {
-            if (currentDetections.length === 0) return;
-            
-            const rect = videoFeed.getBoundingClientRect();
-            const scaleX = videoFeed.naturalWidth / rect.width;
-            const scaleY = videoFeed.naturalHeight / rect.height;
-            
-            const clickX = (e.clientX - rect.left) * scaleX;
-            const clickY = (e.clientY - rect.top) * scaleY;
-            
-            // 클릭한 위치에 있는 detection 찾기
-            for (let det of currentDetections) {
-                const [x1, y1, x2, y2] = det.bbox;
-                if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
-                    selectTargetAndStartTracking(det);
-                    highlightClickedTarget(det, rect, scaleX, scaleY);
-                    break;
-                }
-            }
+    // --- Socket.IO ---
+    const socket = io({ transports: ['websocket', 'polling'] });
+
+    // --- UI state ---
+    let selectedTarget = null;
+    let isTracking = false;
+    let currentDetections = [];
+    let logCollapsed = false;
+
+    const videoFeed = document.getElementById('videoFeed');
+
+    // ---------- 유틸 ----------
+    function toIntOrNull(v) {
+        // null/undefined/'null'/'undefined'/NaN → null, 그 외 정수
+        if (v === null || v === undefined) return null;
+        if (v === 'null' || v === 'undefined') return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.trunc(n) : null;
+    }
+
+    function addLog(level, message, timestamp) {
+        const logContainer = document.getElementById('logContainer');
+        const logEntry = document.createElement('div');
+        logEntry.className = `log-entry log-${level}`;
+        const ts = timestamp || new Date().toTimeString().split(' ')[0];
+        logEntry.innerHTML = `<span class="log-timestamp">[${ts}]</span>${message}`;
+        logContainer.appendChild(logEntry);
+        logContainer.scrollTop = logContainer.scrollHeight;
+        while (logContainer.children.length > 50) {
+        logContainer.removeChild(logContainer.firstChild);
+        }
+    }
+
+    function toggleLog() {
+        const logContainer = document.getElementById('logContainer');
+        const toggle = document.getElementById('logToggle');
+        logCollapsed = !logCollapsed;
+        if (logCollapsed) {
+        logContainer.classList.add('collapsed');
+        toggle.textContent = '▶';
+        } else {
+        logContainer.classList.remove('collapsed');
+        toggle.textContent = '▼';
+        }
+    }
+
+    // ---------- 비디오 클릭(객체 선택) ----------
+    document.getElementById('videoContainer').addEventListener('click', function (e) {
+        if (!currentDetections || currentDetections.length === 0) return;
+
+        const rect = videoFeed.getBoundingClientRect();
+        // naturalWidth/Height가 0인 초기 프레임 방어
+        const nw = videoFeed.naturalWidth || rect.width;
+        const nh = videoFeed.naturalHeight || rect.height;
+
+        const scaleX = nw / rect.width;
+        const scaleY = nh / rect.height;
+
+        const clickX = (e.clientX - rect.left) * scaleX;
+        const clickY = (e.clientY - rect.top) * scaleY;
+
+        for (let det of currentDetections) {
+        const [x1, y1, x2, y2] = det.bbox;
+        if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
+            selectTargetAndStartTracking(det);
+            highlightClickedTarget(det, rect, scaleX, scaleY);
+            break;
+        }
+        }
+    });
+
+    function highlightClickedTarget(det, rect, scaleX, scaleY) {
+        const [x1, y1, x2, y2] = det.bbox;
+        const displayX = x1 / scaleX;
+        const displayY = y1 / scaleY;
+        const displayW = (x2 - x1) / scaleX;
+        const displayH = (y2 - y1) / scaleY;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'click-target';
+        overlay.style.position = 'absolute';
+        overlay.style.left = displayX + 'px';
+        overlay.style.top = displayY + 'px';
+        overlay.style.width = displayW + 'px';
+        overlay.style.height = displayH + 'px';
+        document.getElementById('videoContainer').appendChild(overlay);
+        setTimeout(() => overlay.remove(), 1000);
+    }
+
+    // ---------- 소켓 수신 ----------
+    socket.on('connect', () => addLog('SUCCESS', '서버 연결'));
+
+    socket.on('log_message', (data) => addLog(data.level, data.message, data.timestamp));
+
+    socket.on('tello_status', (data) => {
+        const statusEl = document.getElementById('connectionStatus');
+        if (data.connected) {
+        statusEl.textContent = '● ON';
+        statusEl.className = 'status-item connected';
+        document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
+        enableControls(true);
+        // 재연결 버튼 활성화
+        const r = document.getElementById('reconnectBtn');
+        if (r) r.disabled = false;
+        addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
+        } else {
+        statusEl.textContent = '● OFF';
+        statusEl.className = 'status-item disconnected';
+        enableControls(false);
+        addLog('ERROR', '연결 실패');
+        }
+    });
+
+    socket.on('detections_update', (data) => {
+        currentDetections = data?.detections || [];
+        document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
+        document.getElementById('heightStatus').textContent = `📏 ${data.height}cm`;
+        updateDetectionsList(currentDetections);
+        // 서버가 보낸 is_tracking은 참고만, 최종 표시는 tracking_status에서 통일
+        if (typeof data.is_tracking === 'boolean') {
+        updateTrackingStatus(data.is_tracking);
+        }
+    });
+
+    socket.on('stream_error', (data) => addLog('ERROR', data.message));
+
+    socket.on('command_response', (data) => {
+        addLog(data.success ? 'SUCCESS' : 'ERROR', data.message);
+    });
+
+    // ✅ 서버의 추적 상태 방송 수신 (버튼 표시의 기준)
+    socket.on('tracking_status', (data) => {
+        if (data.is_tracking) {
+        addLog('SUCCESS', `서버 추적 ON: ID ${data.target_identity_id ?? 'bbox-lock'}`);
+        isTracking = true;
+        } else {
+        addLog('WARNING', data.message || '서버 추적 OFF/실패');
+        isTracking = false;
+        }
+        updateTrackingStatus(isTracking);
+    });
+
+    // ---------- 소켓 송신 ----------
+    function connectTello() {
+        addLog('INFO', 'Tello 연결중...');
+        socket.emit('connect_tello');
+        document.getElementById('connectBtn').disabled = true;
+    }
+
+    function reconnectTello() {
+        addLog('INFO', 'Tello 재연결중...');
+        socket.emit('reconnect_tello');
+    }
+
+    function sendCommand(command) {
+        socket.emit('send_command', { command });
+    }
+
+    function shutdownServer() {
+        addLog('WARNING', '서버 종료 요청…');
+        socket.emit('shutdown_server');
+    }
+
+    // ---------- 리스트 렌더 ----------
+    function updateDetectionsList(detections) {
+        const container = document.getElementById('detectionsContent');
+        if (!detections || detections.length === 0) {
+        container.innerHTML = '<span style="color: #94a3b8;">감지 대기중...</span>';
+        return;
+        }
+
+        container.innerHTML = '';
+        detections.forEach((det) => {
+        const item = document.createElement('div');
+        item.className = 'detection-item';
+
+        const iid = toIntOrNull(det.identity_id);
+        const same = !!selectedTarget && selectedTarget.identity_id === iid;
+
+        if (isTracking && same) item.className += ' tracking';
+        else if (same) item.className += ' selected';
+
+        const label = (iid === null) ? '??' : iid;
+        item.innerHTML = `
+            <strong>ID ${label}</strong>: ${det.class}
+            <span style="opacity:0.7;">${(det.confidence * 100).toFixed(0)}%</span>
+        `;
+
+        // ✅ ??도 클릭 허용: bbox-lock로 시작 → 갤러리 확정 시 ID로 승격
+        item.onclick = () => selectTargetAndStartTracking(det);
+        if (iid === null) {
+            item.style.opacity = 0.85;
+            item.title = '임시 bbox로 추적 시작. 갤러리 확정 후 ID로 승격됩니다.';
+        }
+
+        container.appendChild(item);
         });
-        
-        function highlightClickedTarget(det, rect, scaleX, scaleY) {
-            const [x1, y1, x2, y2] = det.bbox;
-            const displayX = x1 / scaleX;
-            const displayY = y1 / scaleY;
-            const displayW = (x2 - x1) / scaleX;
-            const displayH = (y2 - y1) / scaleY;
-            
-            const overlay = document.createElement('div');
-            overlay.className = 'click-target';
-            overlay.style.position = 'absolute';
-            overlay.style.left = displayX + 'px';
-            overlay.style.top = displayY + 'px';
-            overlay.style.width = displayW + 'px';
-            overlay.style.height = displayH + 'px';
-            
-            document.getElementById('videoContainer').appendChild(overlay);
-            
-            setTimeout(() => {
-                overlay.remove();
-            }, 1000);
-        }
-        
-        function toggleLog() {
-            const logContainer = document.getElementById('logContainer');
-            const toggle = document.getElementById('logToggle');
-            logCollapsed = !logCollapsed;
-            
-            if (logCollapsed) {
-                logContainer.classList.add('collapsed');
-                toggle.textContent = '▶';
-            } else {
-                logContainer.classList.remove('collapsed');
-                toggle.textContent = '▼';
-            }
-        }
-        
-        function addLog(level, message, timestamp) {
-            const logContainer = document.getElementById('logContainer');
-            const logEntry = document.createElement('div');
-            logEntry.className = `log-entry log-${level}`;
-            
-            const ts = timestamp || new Date().toTimeString().split(' ')[0];
-            logEntry.innerHTML = `<span class="log-timestamp">[${ts}]</span>${message}`;
-            
-            logContainer.appendChild(logEntry);
-            logContainer.scrollTop = logContainer.scrollHeight;
-            
-            while (logContainer.children.length > 50) {
-                logContainer.removeChild(logContainer.firstChild);
-            }
-        }
-        
-        socket.on('connect', () => {
-            addLog('SUCCESS', '서버 연결');
+    }
+
+    // ---------- 선택 + 추적 시작 ----------
+    function selectTargetAndStartTracking(detection) {
+        const iid = toIntOrNull(detection.identity_id);
+
+        selectedTarget = { ...detection, identity_id: iid }; // 타입 정규화
+        addLog('INFO', `타겟: ID ${iid ?? '??'} (${detection.class})`);
+
+        // 서버에 타겟 설정 (bbox 포함)
+        socket.emit('set_target', {
+        target_identity_id: iid, // null이면 서버에서 bbox 폴백
+        class: detection.class,
+        bbox: detection.bbox,
         });
-        
-        socket.on('log_message', (data) => {
-            addLog(data.level, data.message, data.timestamp);
+
+        // ⚠️ 로컬에서 isTracking=true를 올리지 않고, 서버의 tracking_status를 기다림
+        socket.emit('start_tracking');
+
+        // 하이라이트 즉시 갱신
+        updateDetectionsList(currentDetections);
+    }
+
+    // ---------- 상태/버튼 ----------
+    function updateTrackingStatus(tracking) {
+        isTracking = !!tracking;
+        const statusEl = document.getElementById('trackingStatus');
+        const stopBtn = document.getElementById('stopTrackingBtn');
+
+        if (isTracking && selectedTarget) {
+        statusEl.textContent = `🎯 추적중: ID ${selectedTarget.identity_id ?? '??'} (${selectedTarget.class})`;
+        statusEl.className = 'active';
+        stopBtn.style.display = 'block';
+        } else {
+        statusEl.textContent = '추적 안 함';
+        statusEl.className = '';
+        stopBtn.style.display = 'none';
+        }
+    }
+
+    function stopTracking() {
+        addLog('INFO', '추적 중지');
+        socket.emit('stop_tracking');
+        // 최종 OFF 반영은 tracking_status 수신으로 통일
+    }
+
+    function manualSetThief() {
+        const v = toIntOrNull(document.getElementById('manualId').value);
+        if (v === null || v <= 0) {
+        addLog('WARNING', '유효한 identity_id를 입력하세요.');
+        return;
+        }
+        selectedTarget = { identity_id: v, class: 'person', bbox: null };
+        socket.emit('set_target', { target_identity_id: v, class: 'person', bbox: null });
+        socket.emit('start_tracking');
+    }
+
+    function enableControls(enabled) {
+        const buttons = [
+        'reconnectBtn', 'takeoffBtn', 'landBtn', 'emergencyBtn',
+        'forwardBtn', 'backBtn', 'leftBtn', 'rightBtn',
+        'upBtn', 'downBtn', 'cwBtn', 'ccwBtn'
+        ];
+        buttons.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !enabled;
         });
-        
-        socket.on('tello_status', (data) => {
-            const statusEl = document.getElementById('connectionStatus');
-            if (data.connected) {
-                statusEl.textContent = '● ON';
-                statusEl.className = 'status-item connected';
-                document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
-                enableControls(true);
-                addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
-            } else {
-                statusEl.textContent = '● OFF';
-                statusEl.className = 'status-item disconnected';
-                enableControls(false);
-                addLog('ERROR', '연결 실패');
-            }
-        });
-        
-        socket.on('detections_update', (data) => {
-            currentDetections = data.detections;
-            document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
-            document.getElementById('heightStatus').textContent = `📏 ${data.height}cm`;
-            
-            updateDetectionsList(data.detections);
-            updateTrackingStatus(data.is_tracking);
-        });
-        
-        socket.on('stream_error', (data) => {
-            addLog('ERROR', data.message);
-        });
-        
-        socket.on('command_response', (data) => {
-            if (data.success) {
-                addLog('SUCCESS', data.message);
-            } else {
-                addLog('ERROR', data.message);
-            }
-        });
-        
-        function connectTello() {
-            addLog('INFO', 'Tello 연결중...');
-            socket.emit('connect_tello');
-            document.getElementById('connectBtn').disabled = true;
-        }
-        
-        function reconnectTello() {
-            addLog('INFO', 'Tello 재연결중...');
-            socket.emit('reconnect_tello');
-        }
-        
-        function sendCommand(command) {
-            socket.emit('send_command', {command: command});
-        }
-        
-        function updateDetectionsList(detections) {
-            const container = document.getElementById('detectionsContent');
-            
-            if (!detections || detections.length === 0) {
-                container.innerHTML = '<span style="color: #94a3b8;">감지 대기중...</span>';
-                return;
-            }
-            
-            container.innerHTML = '';
-            detections.forEach(det => {
-                const item = document.createElement('div');
-                item.className = 'detection-item';
-                
-                if (isTracking && selectedTarget && selectedTarget.track_id === det.track_id) {
-                    item.className += ' tracking';
-                } else if (selectedTarget && selectedTarget.track_id === det.track_id) {
-                    item.className += ' selected';
-                }
-                
-                item.innerHTML = `
-                    <strong>ID ${det.track_id}</strong>: ${det.class} 
-                    <span style="opacity: 0.7;">${(det.confidence * 100).toFixed(0)}%</span>
-                `;
-                
-                item.onclick = () => selectTargetAndStartTracking(det);
-                container.appendChild(item);
-            });
-        }
-        
-        function selectTargetAndStartTracking(detection) {
-            selectedTarget = detection;
-            
-            addLog('INFO', `타겟: ID ${detection.track_id} (${detection.class})`);
-            
-            // 서버에 타겟 설정
-            socket.emit('set_target', {
-                track_id: detection.track_id,
-                class: detection.class,
-                bbox: detection.bbox
-            });
-            
-            // 즉시 추적 시작
-            if (!isTracking) {
-                addLog('SUCCESS', '🎯 추적 시작!');
-                socket.emit('start_tracking');
-                isTracking = true;
-                updateTrackingStatus(true);
-            }
-            
-            // 목록 업데이트
-            updateDetectionsList(currentDetections);
-        }
-        
-        function updateTrackingStatus(tracking) {
-            isTracking = tracking;
-            const statusEl = document.getElementById('trackingStatus');
-            const stopBtn = document.getElementById('stopTrackingBtn');
-            
-            if (tracking && selectedTarget) {
-                statusEl.textContent = `🎯 추적중: ID ${selectedTarget.track_id} (${selectedTarget.class})`;
-                statusEl.className = 'active';
-                stopBtn.style.display = 'block';
-            } else {
-                statusEl.textContent = '추적 안 함';
-                statusEl.className = '';
-                stopBtn.style.display = 'none';
-            }
-        }
-        
-        function stopTracking() {
-            addLog('INFO', '추적 중지');
-            socket.emit('stop_tracking');
-            isTracking = false;
-            updateTrackingStatus(false);
-        }
-        
-        function enableControls(enabled) {
-            const buttons = [
-                'reconnectBtn', 'takeoffBtn', 'landBtn', 'emergencyBtn',
-                'forwardBtn', 'backBtn', 'leftBtn', 'rightBtn', 
-                'upBtn', 'downBtn', 'cwBtn', 'ccwBtn'
-            ];
-            
-            buttons.forEach(id => {
-                document.getElementById(id).disabled = !enabled;
-            });
-        }
-        
-        window.onload = () => {
-            addLog('INFO', '시스템 준비');
-        };
+    }
+
+    // ---------- 부팅 로그 ----------
+    window.onload = () => {
+        addLog('INFO', '시스템 준비');
+    };
     </script>
 </body>
 </html>
