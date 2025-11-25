@@ -26,39 +26,48 @@ def iou_bbox(a: np.ndarray, b: np.ndarray) -> float:
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     """
     코사인 거리 = 1 - cos(a,b)
+    임베딩이 L2 정규화되어 있으므로 cos(a,b) = dot(a,b)
     """
     if a is None or b is None:
         return 1.0
-    na = float(np.linalg.norm(a))
-    nb = float(np.linalg.norm(b))
-    if na < 1e-6 or nb < 1e-6:
-        return 1.0
-    return 1.0 - float(np.dot(a, b) / (na * nb + 1e-6))
+    dot = float(np.dot(a, b))
+    # 수치오차 방지
+    if dot > 1.0: dot = 1.0
+    elif dot < -1.0: dot = -1.0
+    return 1.0 - dot
+
 
 def min_cos_dist_to_list(cand_emb, gallery_embs, default=1.0):
     """
     cand_emb vs gallery_embs(list/ndarray) 중 최소 코사인 거리.
-    - cand_emb is None 이거나, gallery가 비어 있으면 default 반환 (기본 1.0)
+    - 모든 임베딩이 L2 정규화되어 있다고 가정 → 1 - (G @ c)
     """
-    if cand_emb is None:
-        return default
-    if gallery_embs is None:
+    if cand_emb is None or gallery_embs is None:
         return default
 
-    # list, tuple, np.ndarray 다 허용
-    # np.ndarray 인 경우 (K, D) / (D,) 모두 처리
+    c = np.asarray(cand_emb, dtype=np.float32)
+    if c.ndim != 1 or c.size == 0:
+        return default
+
     if isinstance(gallery_embs, np.ndarray):
-        if gallery_embs.ndim == 1:
-            gallery_list = [gallery_embs]
-        else:
-            gallery_list = [g for g in gallery_embs]
+        G = gallery_embs.astype(np.float32, copy=False)
+        if G.ndim == 1:
+            G = G[None, :]
     else:
-        gallery_list = list(gallery_embs)
+        try:
+            G = np.asarray(list(gallery_embs), dtype=np.float32)
+        except Exception:
+            return default
 
-    if len(gallery_list) == 0:
+    if G.size == 0:
         return default
+    if G.ndim != 2:
+        G = G.reshape(-1, G.shape[-1])
 
-    return min(cosine_distance(cand_emb, g) for g in gallery_list)
+    dots = G @ c              # (K,)
+    np.clip(dots, -1.0, 1.0, out=dots)
+    dists = 1.0 - dots
+    return float(np.min(dists))
 
 
 def bbox_center(box: np.ndarray) -> Tuple[float, float]:
