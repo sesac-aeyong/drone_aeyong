@@ -10,6 +10,7 @@ from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
 from settings import settings as S
+from .profiler import FPSMeter, log_trace_to_csv, new_trace, mark #☠️☠️☠️
 
 
 class TelloWebServer:
@@ -30,6 +31,7 @@ class TelloWebServer:
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
+        self.last_trace = None   #☠️☠️☠️ 최근 프레임의 트레이스(E2E 계산용)
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
@@ -328,6 +330,8 @@ class TelloWebServer:
 
     def video_stream_thread(self):
         """비디오 스트리밍 스레드"""
+        self.recv_fps = FPSMeter()   #☠️☠️☠️
+        self.infer_fps = FPSMeter()  #☠️☠️☠️
         print("📹 Starting video stream thread...")
         
         try:
@@ -349,6 +353,9 @@ class TelloWebServer:
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
+                trace = new_trace()              #☠️☠️☠️ 카메라 수신 시각
+                self.recv_fps.tick()             #☠️☠️☠️ recv FPS 측정
+                mark(trace, "ts_frame_recv_ns")  #☠️☠️☠️
                 
                 if frame is None:
                     error_count += 1
@@ -364,7 +371,12 @@ class TelloWebServer:
                 error_count = 0
                 
                 # 추론 실행
-                detections, depth_map, *_ = self.inference_engine.run(frame)
+                mark(trace, "ts_infer_start_ns")     #☠️☠️☠️ trace를 HailoRun으로 전달하고, 보강된 trace를 돌려받음
+                detections, depth_map, *rest = self.inference_engine.run(frame, trace) #☠️☠️☠️
+                #detections, depth_map, *_ = self.inference_engine.run(frame)
+                trace = rest[-1] if rest else trace #☠️☠️☠️
+                mark(trace, "ts_infer_done_ns")     #☠️☠️☠️
+                self.infer_fps.tick()               #☠️☠️☠️
                 
                 with self.lock:
                     self.current_detections = detections
@@ -422,6 +434,7 @@ class TelloWebServer:
                 with self.lock:
                     self.current_frame = frame_with_detections
                     self.current_frame_updated = True
+                    self.last_trace = trace     #☠️☠️☠️ 현재 프레임의 trace를 보관해 JPEG/스트리밍 지연까지 연결
                 
                 # 감지 정보를 클라이언트에 전송
                 self.socketio.emit('detections_update', {
@@ -433,6 +446,12 @@ class TelloWebServer:
                     'target_class': self.target_class
                 })
                 
+                #☠️☠️☠️ 1초마다 요약 출력 (옵션)
+                if int(time.time()) % 1 == 0:
+                    try:
+                        self.log("DEBUG",f"FPS recv={self.recv_fps.fps():.1f} | infer={self.infer_fps.fps():.1f}")
+                    except Exception:
+                        pass #☠️☠️☠️
                 
                 # time.sleep(0.033)
                 
@@ -527,12 +546,19 @@ class TelloWebServer:
             if self.current_frame is not None and self.current_frame_updated:
                 frame = self.current_frame  # copy() 불필요: 바로 imencode 하고 끝
                 self.current_frame_updated = False
+                trace = self.last_trace  #☠️☠️☠️
         if frame is None:
             return None
 
         try:
             # >>> 색 변환 금지! (OpenCV는 BGR 그대로 JPEG 인코딩)
+            if trace is None:                  #☠️☠️☠️ 추론 없이 들어온 초기 프레임 등을 대비
+                trace = new_trace()            #☠️☠️☠️
+                self.last_trace = trace        #☠️☠️☠️
+            mark(trace, "ts_jpeg_start_ns")    #☠️☠️☠️
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            mark(trace, "ts_jpeg_done_ns")     #☠️☠️☠️
+            log_trace_to_csv(trace)            #☠️☠️☠️
             if not ok:
                 with self.lock:
                     self.current_frame_updated = True
