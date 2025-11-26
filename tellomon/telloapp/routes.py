@@ -1,6 +1,7 @@
 # routes.py
 import time, os
 from flask import Blueprint, render_template, Response
+from telloapp.profiler import mark, log_trace_to_csv
 
 def create_routes(socketio, get_tello_server, disconnect_wifi):
     """
@@ -20,6 +21,17 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
             while True:
                 frame = get_tello_server().get_current_frame_jpeg()
                 if frame is not None:
+                    
+                    # ===========================================
+                    # 📌 HTTP 전송 지연 기록 (profiler)
+                    # ===========================================
+                    ts = get_tello_server()
+                    trace = ts.last_trace
+                    if trace is not None:
+                        # 마지막 단계: 클라이언트로 나가는 순간
+                        mark(trace, "ts_http_send_ns")
+                        log_trace_to_csv(trace) 
+                    
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
                 time.sleep(0.01)

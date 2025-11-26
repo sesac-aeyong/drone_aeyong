@@ -132,23 +132,25 @@ class HailoRun():
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
-        if trace is None: trace = new_trace() #☠️☠️☠️
+        if trace is None: trace = new_trace()  #☠️☠️☠️
+        trace["mode"] = "thief" if self.thief_id else "normal"          #☠️☠️☠️
+        trace["thief_id"] = str(self.thief_id) if self.thief_id else "" #☠️☠️☠️
         
         # prepare and run vis and dep models
+        self.lat.start("yolo")     #☠️☠️☠️ YOLO (vision) latency 포함: submit → result 수신까지
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
-        
-        self.lat.start("yolo") #☠️☠️☠️ YOLO (vision) latency 포함: submit → result 수신까지
         self.vis_m.run([self.vis_fb], self.vis_cb)
         
-        self.lat.start("depth") #☠️☠️☠️ DEPTH는 GPU/원격과 분리되어 있더라도 여기선 Hailo depth라고 가정
+        self.lat.start("depth")    #☠️☠️☠️ DEPTH는 GPU/원격과 분리되어 있더라도 여기선 Hailo depth라고 가정
         self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
-        self.lat.stop("yolo") #☠️☠️☠️
-        mark(trace, "ts_yolo_done_ns") #☠️☠️☠️
+        t_yolo = self.lat.stop("yolo")           #☠️☠️☠️
+        mark(trace, "ts_yolo_done_ns")           #☠️☠️☠️
+        trace["marks"]["yolo_lat_ns"] = t_yolo   #☠️☠️☠️
         
         del vision[1:] # 0 is person, remove all other classes.
         # Perhaps add knife or some weapon types?
@@ -157,6 +159,7 @@ class HailoRun():
 
         emb_ids = [] 
         emb_crops = []
+        self.lat.start("reid_pre")      #☠️☠️☠️crops 만들기 시간
         for i in range(num_detections):
             if scores[i] < S.min_emb_confidence:
                 continue 
@@ -167,18 +170,25 @@ class HailoRun():
             emb_ids.append(i)
             emb_crops.append(crop)
 
+        t_reid_pre = self.lat.stop("reid_pre")          #☠️☠️☠️  reid_pre는 항상 stop해서 기록
+        trace["marks"]["reid_pre_lat_ns"] = t_reid_pre  #☠️☠️☠️
+
         embeddings = [None] * num_detections
         
         if emb_ids:
-            self.lat.start("reid") #☠️☠️☠️
+            self.lat.start("reid")           #☠️☠️☠️
             self.emb_m.run(np.stack(emb_crops, axis=0), partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
-            self.lat.stop("reid") #☠️☠️☠️
-            mark(trace, "ts_reid_done_ns") #☠️☠️☠️
+            t_reid = self.lat.stop("reid")    # ☠️☠️☠️
+            trace["marks"]["reid_lat_ns"] = t_reid  #☠️☠️☠️
+            mark(trace, "ts_reid_done_ns")    # ☠️☠️☠️
+            
             
             for i, det_id in enumerate(emb_ids):
                 embeddings[det_id] = self._emb_norm(_embs[i])
 
+        else: trace["marks"]["reid_lat_ns"] = 0   #☠️☠️☠️ 사람 없음 → reid 수행 안 함. 0으로 고정 기록.
+        
         targets = self.active_tracker.update(
             np.array([[*box, score] for box, score in zip(boxes, scores)]), 
             embeddings
@@ -202,8 +212,9 @@ class HailoRun():
             rets.append(det)
         
         depth = self.dep_q.get()
-        self.lat.stop("depth") #☠️☠️☠️
-        mark(trace, "ts_depth_done_ns") #☠️☠️☠️
+        t_depth = self.lat.stop("depth")           #☠️☠️☠️
+        mark(trace, "ts_depth_done_ns")            #☠️☠️☠️
+        trace["marks"]["depth_lat_ns"] = t_depth   #☠️☠️☠️
 
         #return rets, depth, boxes
         return rets, depth, boxes, trace
