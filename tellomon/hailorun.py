@@ -10,7 +10,6 @@ from common.hailo_inference import HailoInfer
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
-from telloapp.profiler import LatencyMeter, new_trace, mark #☠️☠️☠️
 
 class HailoRun():
     """
@@ -46,7 +45,6 @@ class HailoRun():
         self.active_tracker = self.longterm_tracker
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
-        self.lat = LatencyMeter()  #☠️☠️☠️ 모델별 지연 측정
 
 
     def load(self):
@@ -126,30 +124,21 @@ class HailoRun():
 
         return scale, (left, top)
     
-    #def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray, List]:
-    def run(self, frame: np.ndarray, trace=None) -> Tuple[List[dict], np.ndarray, List, dict]: #☠️☠️☠️
+
+    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray, List]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
-        if trace is None: trace = new_trace() #☠️☠️☠️
-        
         # prepare and run vis and dep models
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
-        
-        self.lat.start("yolo") #☠️☠️☠️ YOLO (vision) latency 포함: submit → result 수신까지
         self.vis_m.run([self.vis_fb], self.vis_cb)
-        
-        self.lat.start("depth") #☠️☠️☠️ DEPTH는 GPU/원격과 분리되어 있더라도 여기선 Hailo depth라고 가정
         self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
-        self.lat.stop("yolo") #☠️☠️☠️
-        mark(trace, "ts_yolo_done_ns") #☠️☠️☠️
-        
         del vision[1:] # 0 is person, remove all other classes.
         # Perhaps add knife or some weapon types?
 
@@ -170,12 +159,8 @@ class HailoRun():
         embeddings = [None] * num_detections
         
         if emb_ids:
-            self.lat.start("reid") #☠️☠️☠️
             self.emb_m.run(np.stack(emb_crops, axis=0), partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
-            self.lat.stop("reid") #☠️☠️☠️
-            mark(trace, "ts_reid_done_ns") #☠️☠️☠️
-            
             for i, det_id in enumerate(emb_ids):
                 embeddings[det_id] = self._emb_norm(_embs[i])
 
@@ -202,11 +187,8 @@ class HailoRun():
             rets.append(det)
         
         depth = self.dep_q.get()
-        self.lat.stop("depth") #☠️☠️☠️
-        mark(trace, "ts_depth_done_ns") #☠️☠️☠️
 
-        #return rets, depth, boxes
-        return rets, depth, boxes, trace
+        return rets, depth, boxes
     
             
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
