@@ -332,7 +332,6 @@ class TelloWebServer:
         """비디오 스트리밍 스레드"""
         self.recv_fps = FPSMeter()   #☠️☠️☠️
         self.infer_fps = FPSMeter()  #☠️☠️☠️
-        last_fps_log = 0.0           #☠️☠️☠️
         print("📹 Starting video stream thread...")
         
         try:
@@ -378,7 +377,6 @@ class TelloWebServer:
                 trace = rest[-1] if rest else trace #☠️☠️☠️
                 mark(trace, "ts_infer_done_ns")     #☠️☠️☠️
                 self.infer_fps.tick()               #☠️☠️☠️
-                trace["is_tracking"] = bool(self.is_tracking)  #☠️☠️☠️
                 
                 with self.lock:
                     self.current_detections = detections
@@ -448,12 +446,10 @@ class TelloWebServer:
                     'target_class': self.target_class
                 })
                 
-                #☠️☠️☠️ 정확히 1초 간격으로 요약 출력
-                now = time.time()
-                if now - last_fps_log >= 1.0:
-                    last_fps_log = now
+                #☠️☠️☠️ 1초마다 요약 출력 (옵션)
+                if int(time.time()) % 1 == 0:
                     try:
-                        self.log("DEBUG", f"FPS recv={self.recv_fps.fps():.1f} | infer={self.infer_fps.fps():.1f}")
+                        self.log("DEBUG",f"FPS recv={self.recv_fps.fps():.1f} | infer={self.infer_fps.fps():.1f}")
                     except Exception:
                         pass #☠️☠️☠️
                 
@@ -562,12 +558,7 @@ class TelloWebServer:
             mark(trace, "ts_jpeg_start_ns")    #☠️☠️☠️
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             mark(trace, "ts_jpeg_done_ns")     #☠️☠️☠️
-            try:
-                trace["jpeg_size_bytes"] = int(len(buf)) if ok else 0
-            except Exception:
-                pass
             log_trace_to_csv(trace)            #☠️☠️☠️
-            
             if not ok:
                 with self.lock:
                     self.current_frame_updated = True
