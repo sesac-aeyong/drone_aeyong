@@ -43,14 +43,57 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         return Response(generate(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
+    @bp.route('/depth_feed')
+    def depth_feed():
+        def generate():
+            try:
+                # 첫 프레임 placeholder
+                yield (b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n' + PLACEHOLDER_JPEG + b'\r\n')
+
+                while True:
+                    s = get_tello_server()
+                    # 버튼 OFF면 연산/전송 모두 중단(낮은 주기 대기)
+                    if not getattr(s, 'use_depth', False):
+                        time.sleep(0.2)
+                        continue
+
+                    # 서버가 depth JPEG을 주는 메서드(직접 구현 필요)
+                    frame = None
+                    if hasattr(s, 'get_depth_colormap_jpeg'):
+                        frame = s.get_depth_colormap_jpeg()
+
+                    if frame is not None:
+                        yield (b'--frame\r\n'
+                            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                    else:
+                        # 프레임 없으면 잠시 대기 (연산 절약)
+                        time.sleep(0.03)
+                    time.sleep(0.01)
+            except GeneratorExit:
+                pass
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    
     @bp.route('/api/undistort', methods=['POST'])
-    def api_undistort(): #🚨depth map 껐다키기
+    def api_undistort(): #🚨왜곡 껐다키기
         """JSON {"enable": true/false} 를 받아 왜곡보정 토글"""
         data = request.get_json(force=True, silent=True) or {}
         enable = bool(data.get("enable", False))
         s = get_tello_server()
         s.set_undistort(enable)
         socketio.emit('undistort_status', {"enable": enable})
+        return jsonify({"ok": True, "enable": enable})
+
+    @bp.route('/api/depth', methods=['POST'])
+    def api_depth():
+        data = request.get_json(force=True, silent=True) or {}
+        enable = bool(data.get("enable", False))
+        s = get_tello_server()
+        if hasattr(s, 'set_depth'):
+            s.set_depth(enable)
+        else:
+            setattr(s, 'use_depth', enable)
+        socketio.emit('depth_status', {"enable": enable})
         return jsonify({"ok": True, "enable": enable})
 
     # SocketIO events
@@ -71,6 +114,7 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
             ts.start_streaming()
             socketio.emit('tello_status', {'connected': True, 'battery': ts.battery})
             socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
+            socketio.emit('depth_status', {"enable": ts.use_depth}) #🚨
         else:
             socketio.emit('tello_status', {'connected': False})
 
@@ -79,6 +123,7 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         ts = get_tello_server()
         socketio.emit('tello_status', {'connected': ts.is_connected, 'battery': ts.battery})
         socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
+        socketio.emit('depth_status', {"enable": ts.use_depth}) #🚨
 
     @socketio.on('reconnect_tello')
     def handle_reconnect_tello():
@@ -97,6 +142,7 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
             ts.start_streaming()
             socketio.emit('tello_status', {'connected': True, 'battery': ts.battery})
             socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
+            socketio.emit('depth_status', {"enable": getattr(ts, 'use_depth', False)}) #🚨
         else:
             socketio.emit('tello_status', {'connected': False})
 
@@ -108,13 +154,25 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         socketio.emit('command_response', result)
 
     @socketio.on('set_undistort')
-    def set_undistort_event(data): #🚨depth map 껐다키기
+    def set_undistort_event(data): #🚨왜곡 껐다키기
         # data: {"enable": true/false}
         enable = bool(data.get("enable", False))
         s = get_tello_server()
         s.set_undistort(enable)
         socketio.emit('undistort_status', {"enable": enable})
 
+    @socketio.on('set_depth')
+    def set_depth_event(data):
+        # data: {"enable": true/false}
+        enable = bool(data.get("enable", False))
+        s = get_tello_server()
+        if hasattr(s, 'set_depth'):
+            s.set_depth(enable)
+        else:
+            # 없는 경우라도 플래그는 유지
+            setattr(s, 'use_depth', enable)
+        socketio.emit('depth_status', {"enable": enable})
+    
     # ---------------------------
     # 🎯 Target Selection (identity_id only)
     # ---------------------------

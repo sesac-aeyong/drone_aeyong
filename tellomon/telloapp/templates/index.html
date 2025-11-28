@@ -406,6 +406,7 @@
                 <button class="header-btn header-btn-primary" onclick="connectTello()" id="connectBtn">연결</button>
                 <button class="header-btn header-btn-warning" onclick="reconnectTello()" id="reconnectBtn" disabled>재연결</button>
                 <button class="header-btn header-btn-primary" onclick="toggleUndistort()" id="undistortBtn" disabled>왜곡보정: OFF</button>
+                <button class="header-btn header-btn-primary" onclick="toggleDepth()" id="depthBtn" disabled>Depth: OFF</button>
             </div>
         </div>
         
@@ -415,6 +416,13 @@
                 <div class="video-section">
                     <div class="video-container" id="videoContainer">
                         <img id="videoFeed" src="/video_feed" alt="Video">
+                    </div>
+
+                    <div class="video-section" id="depthSection" style="display:none;">
+                        <div class="video-container">
+                            <img id="depthFeed" alt="Depth Map" style="width:100%; display:block;">
+                        </div>
+                        <div class="info-text">💡 Depth는 버튼을 켜야만 스트리밍합니다.</div>
                     </div>
                     
                     <div class="info-text">
@@ -511,7 +519,8 @@
     let isTracking = false;
     let currentDetections = [];
     let logCollapsed = false;
-    let undistortOn = false;
+    let undistortOn = false; //🚨
+    let depthOn = false; //🚨
 
     const videoFeed = document.getElementById('videoFeed');
 
@@ -609,30 +618,40 @@
         statusEl.className = 'status-item connected';
         document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
         enableControls(true);
-        // 재연결 버튼 활성화
-        const r = document.getElementById('reconnectBtn');
-        if (r) r.disabled = false;
-        // 🔽 연결되면 왜곡보정 버튼 활성화
-        const u = document.getElementById('undistortBtn');
-        if (u) {
-            u.disabled = false;
-            // 서버가 tello_status에 초기 undistort를 싣는다면 즉시 라벨 동기화
-            if (typeof data.undistort_enabled === 'boolean') {
-                undistortOn = data.undistort_enabled;
-                u.textContent = `왜곡보정: ${undistortOn ? 'ON' : 'OFF'}`;
-            }
-        }
-        addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
+        //🚨 상단 버튼 활성화
+        const r = document.getElementById('reconnectBtn'); if (r) r.disabled = false;
+        const u = document.getElementById('undistortBtn'); if (u) u.disabled = false;
+        const d = document.getElementById('depthBtn'); if (d) d.disabled = false;
+        addLog('SUCCESS', `연결 성공! 배터리 ${data.battery}%`);
     } else {
         statusEl.textContent = '● OFF';
         statusEl.className = 'status-item disconnected';
         enableControls(false);
-        // 🔽 끊기면 비활성화
-        const u = document.getElementById('undistortBtn');
-        if (u) u.disabled = true;
+        //🚨 끊기면 비활성화
+        const u = document.getElementById('undistortBtn'); if (u) u.disabled = true;
+        const d = document.getElementById('depthBtn'); if (d) d.disabled = true;
         addLog('ERROR', '연결 실패');
-    }
-});
+        }
+    });
+
+    //🚨 서버가 depth 상태를 방송해줌
+    socket.on('depth_status', ({ enable }) => {
+        depthOn = !!enable;
+        const b = document.getElementById('depthBtn');
+        const sec = document.getElementById('depthSection');
+        const img = document.getElementById('depthFeed');
+        if (b) b.textContent = `Depth: ${depthOn ? 'ON' : 'OFF'}`;
+
+        if (depthOn) {
+        // 켤 때만 스트리밍을 시작(연산 절약)
+        if (sec) sec.style.display = '';
+        if (img) img.src = `/depth_feed?ts=${Date.now()}`; // 캐시 방지
+        } else {
+        // 끌 때는 스트리밍 중단(연산 절약)
+        if (img) img.src = '';
+        if (sec) sec.style.display = 'none';
+        }
+    });
 
     socket.on('detections_update', (data) => {
         currentDetections = data?.detections || [];
@@ -693,9 +712,14 @@
     function toggleUndistort() {
         const next = !undistortOn;
         socket.emit('set_undistort', { enable: next });
-        // 실제 적용/라벨 반영은 서버가 'undistort_status'로 방송하는 값으로 동기화
+        //🚨 실제 적용/라벨 반영은 서버가 'undistort_status'로 방송하는 값으로 동기화
     }
-
+    function toggleDepth() {
+        const next = !depthOn;
+        socket.emit('set_depth', { enable: next });
+        //🚨 실제 적용/라벨은 depth_status로 동기화
+    }
+    
     // ---------- 리스트 렌더 ----------
     function updateDetectionsList(detections) {
         const container = document.getElementById('detectionsContent');

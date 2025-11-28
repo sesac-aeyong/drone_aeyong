@@ -112,6 +112,10 @@ class TelloWebServer:
             [  0.         , 920.62929167, 355.42781255],
             [  0.         ,   0.         ,   1.        ]
         ], dtype=np.float32)
+        
+        self.use_depth = False
+        self.current_depth_jpeg = None
+        # depth 추론은 self.use_depth가 True일 때만 수행하게 가드
 
     # ----------------------
     # 로깅
@@ -167,7 +171,7 @@ class TelloWebServer:
         """프레임 크기에 맞춰 undistort remap을 1회 준비"""
         if self._ud_maps_ready and self._ud_size == (w, h):
             return
-        # ROI 손실 최소화를 위해 alpha=0.0(가장 타이트)~0.5 정도가 무난. 먼저 0.0로 시작.
+        # ROI 손실 최소화를 위해 alpha=0.0 -> 가능한 한 많이 크롭해서 원본과 비슷한 FOV 유지 (padding 없음)
         newK, _ = cv2.getOptimalNewCameraMatrix(
             self.camera_mtx, self.dist_coeffs, (w, h), alpha=0.0, newImgSize=(w, h)
         )
@@ -179,9 +183,13 @@ class TelloWebServer:
         self._ud_size = (w, h)
         self.log("INFO", f"📐 Undistort maps ready for {w}x{h}")
 
-    def set_undistort(self, enable: bool):
+    def set_undistort(self, enable: bool): #🚨
         self.use_undistort = bool(enable)
         self.log("INFO", f"🎛️ Undistortion toggled {'ON' if enable else 'OFF'}")
+
+    def set_depth(self, enable: bool): #🚨
+        self.use_depth = bool(enable)
+        self.log("INFO", f"🟦 Depth {'ON' if self.use_depth else 'OFF'}")
 
     # ----------------------
     # Tello 연결 / 스트리밍
@@ -601,7 +609,7 @@ class TelloWebServer:
                 detections, depth_map, *_ = self.inference_engine.run(proc_frame)
 
                 depth_resized = None
-                if depth_map is not None:
+                if self.use_depth and depth_map is not None: #🚨
                     hh, ww = proc_frame.shape[:2]  #🚨depth_map 시각화/저장도 proc_frame 크기에 맞춰 처리
                     depth_resized = cv2.resize(depth_map, (ww, hh), interpolation=cv2.INTER_LINEAR)
                     
@@ -1197,6 +1205,9 @@ class TelloWebServer:
     # Depth feed (MJPEG) - 컬러맵으로 제공
     # ----------------------
     def get_depth_colormap_jpeg(self):
+        if not self.use_depth: #🚨
+            return None
+    
         with self.lock:
             if self.current_depth_map is None:
                 return None
