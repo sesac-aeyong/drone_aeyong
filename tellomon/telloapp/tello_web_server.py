@@ -1,4 +1,6 @@
 # tello_web_server.py
+import math
+import os
 import traceback
 import cv2
 from djitellopy import Tello
@@ -6,11 +8,12 @@ import threading
 import time
 import numpy as np
 import queue
+import os
+from datetime import datetime
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
 from settings import settings as S
-
 
 class TelloWebServer:
     def __init__(self, socketio):
@@ -19,8 +22,7 @@ class TelloWebServer:
         self.is_streaming = False
         self.is_connected = False
         self.current_frame = None
-        self.current_frame_updated = False
-        self.current_depth_map = None
+        self.current_depth_map = None            # float32 depth (m) visualized by depth_feed
         self.current_detections = []
         self.target_class = None
         self.target_identity_id = None
@@ -30,24 +32,21 @@ class TelloWebServer:
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
-
-        # 이륙 안정화 시간
-        self.last_takeoff_time = None
-        self.takeoff_stabilization_time = 3.0  # 이륙 후 3초간 대기
+        self.target_depth = None
 
         # RC 명령 설정
         self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
         self.rc_speed = 40
-        self.tracking_rc_speed = 30
+        self.tracking_rc_speed = 25
         self.rc_command_duration = 0.4
-        
+
         # 웹 로그 시스템
         self.log_queue = queue.Queue(maxsize=100)  # 최대 100개 로그 저장
         self.log_thread = None
         self.is_logging = True
         self.start_log_broadcaster()
-        
+
         # 추론 엔진 초기화
         self.log("INFO", "Loading inference engine...")
         try:
@@ -56,18 +55,46 @@ class TelloWebServer:
             self.log("SUCCESS", "✅ Inference engine loaded successfully")
         except Exception as e:
             self.log("ERROR", f"❌ Failed to load inference engine: {e}")
+            import traceback
             traceback.print_exc()
             self.inference_engine = None
 
+        # --- Optical Flow 관련 상태/파라미터 ---
+        # focal (픽셀) - 기본값은 네가 줬던 fx 값 사용
+        self.focal_px = 922.837110
+        self.of_max_corners = 300
+        self.of_quality = 0.01
+        self.of_min_dist = 7
+        self.of_lk_params = dict(winSize=(21, 21), maxLevel=3,
+                                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        self.of_bg_percentile = 30          # 하위 퍼센타일을 background 후보로
+        self.is_optical_flow_running = False
+        self.optical_flow_thread_obj = None
+        self.obstacle_dists = None
+        self.of_last_stats = {}
+        self.of_blur_kernel = 51            # sparse->dense 시 Gaussian blur kernel (홀수)
+        # 최소 전진 속도 (m/s) 안정화
+        self.min_forward_speed = 0.02
 
+        # 녹화 관련 변수 추가
+        self.is_recording = False
+        self.video_writer = None
+        self.recording_filename = None
+        self.recording_dir = "recordings"
+        if not os.path.exists(self.recording_dir):
+            os.makedirs(self.recording_dir)
+            self.log("INFO", f"📁 Recording directory created: {self.recording_dir}")
+
+        # # 스크린샷 저장 디렉토리 생성
+        # self.screenshot_dir = "screenshots"
+        # if not os.path.exists(self.screenshot_dir):
+        #     os.makedirs(self.screenshot_dir)
+        #     self.log("INFO", f"📁 Screenshot directory created: {self.screenshot_dir}")
+
+    # ----------------------
+    # 로깅
+    # ----------------------
     def log(self, level, message):
-        """
-        로그 메시지를 터미널과 웹에 동시 전송
-        
-        Args:
-            level: "INFO", "SUCCESS", "WARNING", "ERROR", "DEBUG"
-            message: 로그 메시지
-        """
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         log_entry = {
@@ -75,7 +102,7 @@ class TelloWebServer:
             'level': level,
             'message': message
         }
-        
+
         # 터미널 출력
         if level == "ERROR":
             print(f"[{timestamp}] ❌ {message}")
@@ -87,7 +114,7 @@ class TelloWebServer:
             print(f"[{timestamp}] 🔍 {message}")
         else:
             print(f"[{timestamp}] ℹ️ {message}")
-        
+
         # 웹으로 전송 (큐에 추가)
         try:
             if self.log_queue.full():
@@ -98,7 +125,6 @@ class TelloWebServer:
             self.log_queue.put_nowait(log_entry)
         except queue.Full:
             pass
-    
 
     def start_log_broadcaster(self):
         """로그를 웹으로 전송하는 스레드 시작"""
@@ -111,11 +137,13 @@ class TelloWebServer:
                     continue
                 except Exception as e:
                     print(f"Log broadcast error: {e}")
-        
+
         self.log_thread = threading.Thread(target=broadcast_logs, daemon=True)
         self.log_thread.start()
 
-
+    # ----------------------
+    # Tello 연결 / 스트리밍
+    # ----------------------
     def connect_tello(self):
         """텔로 드론 연결"""
         try:
@@ -123,31 +151,33 @@ class TelloWebServer:
             if not connect_to_tello_wifi():
                 self.log("ERROR", "Failed to connect to Tello WiFi")
                 return False
-            
+
             self.log("SUCCESS", "Tello WiFi connected")
-            
+            time.sleep(2)
+
+            # 기존 연결 정리
             if self.tello:
                 try:
                     self.log("INFO", "Cleaning up old connection...")
                     self.is_streaming = False
-                    
+                    time.sleep(1)
                     if hasattr(self.tello, 'background_frame_read') and self.tello.background_frame_read:
                         try:
                             self.tello.background_frame_read.stop()
                         except:
                             pass
-                    
                     self.tello.streamoff()
+                    time.sleep(1)
                     self.tello.end()
-                    
                 except Exception as e:
                     self.log("WARNING", f"Cleanup error (ignored): {e}")
                 finally:
                     self.tello = None
-            
+                    time.sleep(3)
+
             self.log("INFO", "Creating new Tello connection...")
             self.tello = Tello()
-            
+
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -160,175 +190,328 @@ class TelloWebServer:
                         time.sleep(2)
                     else:
                         raise
-            
+
             self.battery = self.tello.get_battery()
             self.log("SUCCESS", f"Tello connected. Battery: {self.battery}%")
-            # self.log('INFO', f'Tello speed: {self.tello.query_speed()}')
-            
+
             # 배터리 경고
             if self.battery < 20:
                 self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
-            
+
             self.log("INFO", "Starting video stream...")
-            if self.tello.stream_on:
-                try:
-                    self.tello.streamoff()
-                    self.log('INFO', 'Waiting for video stream to end...')
-                except:
-                    pass
-            
+            try:
+                self.tello.streamoff()
+                time.sleep(2)
+            except:
+                pass
+
             self.tello.streamon()
-            self.log('INFO', 'Waiting for tello video stream to start...')
-            
+            time.sleep(3)
+
             self.log("SUCCESS", "🎥 Stream started successfully")
             self.is_connected = True
             return True
-        
+
         except Exception as e:
             self.log("ERROR", f"Connection error: {e}")
-            traceback.print_exc()
             self.is_connected = False
             self.tello = None
             return False
-    
-    
+
+    # ----------------------
+    # 추론 (기존)
+    # ----------------------
+    def process_frame_with_inference(self, frame):
+        """추론 엔진으로 객체 감지 및 깊이 추정"""
+        if self.inference_engine is None:
+            print("❌ Inference engine is None!")
+            return [], None
+
+        try:
+            detections, depth_map, _ = self.inference_engine.run(frame)
+            return detections, depth_map
+        except Exception as e:
+            print(f"❌ Inference error: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], None
+
+    # ----------------------
+    # 자동 추적 (기존)
+    # ----------------------
+    # def tracking_thread(self):
+    #     """자동 추적 스레드"""
+    #     last_command_time = time.time()
+    #     command_interval = 1.0
+    #     target_lost_time = None
+    #     target_lost_warning_sent = False
+    #     depth_threshold = 0.20
+    #     prev_depth = None
+
+    #     self.log("INFO", "🎯 Tracking thread started (safe mode: 1s interval)")
+
+    #     while self.is_tracking:
+    #         try:
+    #             if self.target_bbox and self.current_frame is not None:
+    #                 current_time = time.time()
+
+    #                 # 타겟 재발견 시 경고 리셋
+    #                 if target_lost_time is not None:
+    #                     self.log("SUCCESS", "🎯 Target re-acquired!")
+    #                     target_lost_time = None
+    #                     target_lost_warning_sent = False
+
+    #                 if current_time - last_command_time >= command_interval:
+    #                     # 제어 명령 계산
+    #                     h, w = self.current_frame.shape[:2]
+    #                     center_x = w // 2
+    #                     center_y = h // 2
+
+    #                     # target_bbox is in [x1, y1, x2, y2] format
+    #                     x1, y1, x2, y2 = self.target_bbox
+    #                     target_center_x = (x1 + x2) // 2
+    #                     target_center_y = (y1 + y2) // 2
+
+    #                     # 오차 계산
+    #                     error_x = target_center_x - center_x
+    #                     error_y = target_center_y - center_y
+    #                     if prev_depth is not None:
+    #                         error_d = self.target_depth - prev_depth
+    #                     else:
+    #                         error_d = None
+
+    #                     # depth 계산
+    #                     prev_depth = self.target_depth
+
+    #                     # 타겟 크기
+    #                     target_width = x2 - x1
+    #                     target_height = y2 - y1
+    #                     target_area = target_width * target_height
+    #                     frame_area = w * h
+    #                     target_ratio = target_area / frame_area
+
+    #                     # 임계값
+    #                     threshold_x = w * 0.1
+    #                     threshold_y = h * 0.1
+    #                     threshold_size_min = 0.06
+    #                     threshold_size_max = 0.20
+
+    #                     action = None
+
+    #                     # 우선순위 기반 제어
+    #                     # 1. 좌우 정렬 (Yaw)
+    #                     if abs(error_x) > threshold_x:
+    #                         if self.use_rc_for_tracking:
+    #                             yaw_speed = int(np.clip(error_x * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
+    #                             self.tello.send_rc_control(0, 0, 0, yaw_speed)
+    #                             time.sleep(self.rc_command_duration)
+    #                             self.tello.send_rc_control(0, 0, 0, 0)
+    #                             action = f"RC yaw={yaw_speed}"
+    #                         else:
+    #                             angle = 15
+    #                             if error_x > 0:
+    #                                 self.tello.rotate_clockwise(angle)
+    #                                 action = f"CW {angle}°"
+    #                             else:
+    #                                 self.tello.rotate_counter_clockwise(angle)
+    #                                 action = f"CCW {angle}°"
+
+    #                     # 3. 상하 정렬
+    #                     elif abs(error_y) > threshold_y:
+    #                         if self.use_rc_for_tracking:
+    #                             ud_speed = int(np.clip(-error_y * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
+    #                             self.tello.send_rc_control(0, 0, ud_speed, 0)
+    #                             time.sleep(self.rc_command_duration)
+    #                             self.tello.send_rc_control(0, 0, 0, 0)
+    #                             action = f"RC ud={ud_speed}"
+    #                         else:
+    #                             if error_y > 0:
+    #                                 self.tello.move_down(20)
+    #                                 action = "Down 20cm"
+    #                             else:
+    #                                 self.tello.move_up(20)
+    #                                 action = "Up 20cm"
+    #                     else:
+    #                         action = "Centered ✅"
+
+    #                     if action:
+    #                         self.log("DEBUG", f"🎯 {action} | Error: x={error_x:.0f}, y={error_y:.0f} | Size: {target_ratio:.3f}")
+    #                         action = None
+
+    #                     elif error_d and abs(error_d) > depth_threshold:
+    #                         # 사람이 너무 멀다 → 앞으로 이동해야 함
+    #                         if error_d > 0:
+    #                             if self.use_rc_for_tracking:
+    #                                 self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
+    #                                 time.sleep(self.rc_command_duration)
+    #                                 self.tello.send_rc_control(0, 0, 0, 0)
+    #                                 action = f"RC forward (error_d={error_d:.2f})"
+    #                             else:
+    #                                 self.tello.move_forward(20)
+    #                                 action = "Forward 20cm"
+
+    #                     else:
+    #                         action = "Distance OK (within threshold)"
+
+    #                     if action:
+    #                         self.log("DEBUG", f"🎯 {action} | Error: depth={error_d:.0f} | Size: {target_ratio:.3f}")
+    #                         action = None
+
+    #                     last_command_time = current_time
+    #                     time.sleep(0.5)
+
+    #             else:
+    #                 # 타겟을 잃어버림
+    #                 if target_lost_time is None:
+    #                     target_lost_time = time.time()
+
+    #                 # 3초 이상 타겟을 못 찾으면 경고
+    #                 if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
+    #                     self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
+    #                     target_lost_warning_sent = True
+
+    #             time.sleep(0.2)
+
+    #         except Exception as e:
+    #             self.log("ERROR", f"Tracking error: {e}")
+    #             if self.use_rc_for_tracking:
+    #                 try:
+    #                     self.tello.send_rc_control(0, 0, 0, 0)
+    #                 except:
+    #                     pass
+    #             time.sleep(1)
+
+    #     if self.use_rc_for_tracking:
+    #         try:
+    #             self.tello.send_rc_control(0, 0, 0, 0)
+    #             self.log("INFO", "🛑 Tracking stopped - drone halted")
+    #         except:
+    #             pass
+
+    #     self.log("INFO", "🎯 Tracking thread stopped")
+
     def tracking_thread(self):
-        """자동 추적 스레드"""
-        target_lost_time = None
-        target_lost_warning_sent = False
+        """
+        [컨트롤러] 도둑 추적 + 유동적 회피 기동
+        """
+        # ---------------- 튜닝 파라미터 ----------------
+        MAINTAIN_DIST = 1.8      # 목표 유지 거리 (m)
+        OBSTACLE_WARN = 1.0      # 회피 시작 거리 (m)
+        OBSTACLE_CRITICAL = 0.5  # 충돌 임박 거리 (m)
         
-        # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.80      # 회전 게인
-        gain_lr = 0.80       # 좌우 이동 게인
-        gain_ud = 0.40       # 상하 이동 게인
-        gain_fb = 200         # 전후 이동 게인
+        # PID 게인
+        Kp_dist = 40             # 거리 -> 전진 속도
+        Kp_yaw_normal = 0.5      # 평상시 회전 속도
+        Kp_yaw_fast = 0.9        # 타겟이 많이 벗어났을 때 회전 속도 (부스트)
         
-        # 임계값
-        yaw_threshold = 0.20    # 20% 이상 오차면 회전
-        lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
-        ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
-        size_threshold = 0.025  # 크기 오차 임계값
+        # 회피 기동 게인
+        AVOID_SPEED_SIDE = 30    # 옆으로 피하는 속도
+        AVOID_SPEED_UP = 20      # 위로 피하는 속도
+        # ---------------------------------------------
 
-        self.log("INFO", "🎯 Simple RC tracking started")
-        
+        self.log("INFO", "🚀 Dynamic Tracking Started")
+
         while self.is_tracking:
+            # [안전장치 1] Tello 연결이 끊겼다면 스레드 즉시 종료
+            if self.tello is None:
+                self.log("WARNING", "🛑 Tello instance is None. Stopping tracking thread.")
+                break
             try:
-                # 이륙 후 안정화 시간 체크
-                if self.last_takeoff_time is not None:
-                    time_since_takeoff = time.time() - self.last_takeoff_time
-                    if time_since_takeoff < self.takeoff_stabilization_time:
-                        remaining = self.takeoff_stabilization_time - time_since_takeoff
-                        if int(remaining * 10) % 10 == 0:  # 0.1초마다 로그
-                            self.log("INFO", f"⏳ Stabilizing... {remaining:.1f}s remaining")
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        # 안정화 완료
-                        if self.last_takeoff_time is not None:
-                            self.log("SUCCESS", "✅ Stabilization complete - starting tracking")
-                            self.last_takeoff_time = None  # 한 번만 로그 출력
-
-                if self.target_bbox and self.current_frame is not None:
-                    # 타겟 재발견 시 경고 리셋
-                    if target_lost_time is not None:
-                        self.log("SUCCESS", "🎯 Target re-acquired!")
-                        target_lost_time = None
-                        target_lost_warning_sent = False
+                # 1. 기본 명령 초기화
+                cmd_lr = 0   # 좌우
+                cmd_fb = 0   # 전후
+                cmd_ud = 0   # 상하
+                cmd_yaw = 0  # 회전
+                
+                # 2. [추적 로직] 타겟 따라가기
+                if self.target_bbox is not None and self.target_depth is not None:
+                    # (1) Yaw 제어 (강력한 정렬)
+                    h, w = 480, 360
+                    if self.current_frame is not None:
+                        h, w = self.current_frame.shape[:2]
                     
-                    # 제어 명령 계산
-                    h, w = self.current_frame.shape[:2]
-                    center_x = w // 2
-                    center_y = h // 2
-                    
-                    # target_bbox is in [x1, y1, x2, y2] format
                     x1, y1, x2, y2 = self.target_bbox
-                    target_center_x = (x1 + x2) // 2
-                    target_center_y = (y1 + y2) // 2
+                    target_cx = (x1 + x2) / 2
                     
-                    # 오차 계산 (정규화)
-                    error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
-                    error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
+                    # 에러율 (-0.5 ~ 0.5)
+                    err_x = (target_cx - (w / 2)) / w 
                     
-                    # 타겟 크기
-                    target_width = x2 - x1
-                    target_height = y2 - y1
-                    target_area = target_width * target_height
-                    frame_area = w * h
-                    target_ratio = target_area / frame_area
-                    
-                    # 목표 크기
-                    target_size_ideal = 0.3
-                    error_size = target_size_ideal - target_ratio
-                    
-                    # === 간단한 비례 제어 ===
-                    
-                    # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
-                    if abs(error_x) > yaw_threshold:
-                        # 회전
-                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                        lr_speed = 0
-                    elif abs(error_x) > lr_threshold:
-                        # 좌우 이동
-                        yaw_speed = 0
-                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                    # **[요청사항 반영]** 중앙에서 멀어지면 회전 속도 부스트
+                    if abs(err_x) > 0.15: # 15% 이상 벗어나면
+                        cmd_yaw = int(err_x * 100 * Kp_yaw_fast * 2) # 강력하게 회전
                     else:
-                        # 중앙 정렬됨
-                        yaw_speed = 0
-                        lr_speed = 0
+                        cmd_yaw = int(err_x * 100 * Kp_yaw_normal * 2)
+
+                    # (2) 거리 제어 (전진만 허용)
+                    dist_err = self.target_depth - MAINTAIN_DIST
                     
-                    # 2. 상하 제어
-                    if abs(error_y) > ud_threshold:
-                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                    if dist_err > 0.1: # 타겟이 멀리 있음 -> 전진
+                        cmd_fb = int(dist_err * Kp_dist)
                     else:
-                        ud_speed = 0
-                    
-                    # 3. 전후 제어
-                    if abs(error_size) > size_threshold:
-                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
+                        cmd_fb = 0 # 가까우면 멈춤 (후진 금지)
+
+
+                # 3. [회피 로직] 명령 덮어쓰기가 아닌 '합성(Add)'
+                obs_l = self.obstacle_dists.get('left', 10.0)
+                obs_c = self.obstacle_dists.get('center', 10.0)
+                obs_r = self.obstacle_dists.get('right', 10.0)
+
+                # (A) 전방(Center) 장애물
+                if obs_c < OBSTACLE_WARN:
+                    # 전방이 막혔으므로 전진 속도를 줄임 (충돌 방지)
+                    if obs_c < OBSTACLE_CRITICAL:
+                        cmd_fb = 0  # 너무 가까우면 전진 차단
                     else:
-                        fb_speed = 0
+                        cmd_fb = int(cmd_fb * 0.5) # 속도 절반으로 줄이고 슬라이딩 시도
                     
-                    # RC 명령 전송
-                    self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
+                    # 빈 공간으로 회피 벡터 추가
+                    if obs_l > obs_r: # 왼쪽이 더 넓으면
+                        cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 이동 힘 추가
+                    else:
+                        cmd_lr += AVOID_SPEED_SIDE # 오른쪽 이동 힘 추가
                     
-                    # 로그 출력
-                    # if yaw_speed != 0 or lr_speed != 0 or ud_speed != 0 or fb_speed != 0:
-                        # action = f"RC[lr={lr_speed:+3d}, fb={fb_speed:+3d}, ud={ud_speed:+3d}, yaw={yaw_speed:+3d}]"
-                        # self.log("DEBUG", 
-                            # f"🎯 {action} | Err[x={error_x:+.3f}, y={error_y:+.3f}, s={error_size:+.3f}] | Size={target_ratio:.3f}")
+                    # 아주 가까우면 상승 벡터도 추가
+                    if obs_c < OBSTACLE_CRITICAL:
+                        cmd_ud += AVOID_SPEED_UP
+
+                # (B) 왼쪽 장애물 -> 오른쪽으로 밀어내는 힘 추가
+                if obs_l < OBSTACLE_WARN:
+                    cmd_lr += AVOID_SPEED_SIDE # 오른쪽 힘 추가
                 
-                else:
-                    # 타겟을 잃어버림
-                    if target_lost_time is None:
-                        target_lost_time = time.time()
-                        self.tello.send_rc_control(0, 0, 0, 0)
-                    
-                    # 3초 이상 타겟을 못 찾으면 경고
-                    if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
-                        target_lost_warning_sent = True
+                # (C) 오른쪽 장애물 -> 왼쪽으로 밀어내는 힘 추가
+                if obs_r < OBSTACLE_WARN:
+                    cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 힘 추가
+
+
+                # 4. 최종 명령 클램핑
+                cmd_fb = int(np.clip(cmd_fb, 0, 60))       
+                cmd_lr = int(np.clip(cmd_lr, -40, 40))     
+                cmd_ud = int(np.clip(cmd_ud, -30, 30))     
+                cmd_yaw = int(np.clip(cmd_yaw, -100, 100)) 
+
+                # 5. 전송 (안전장치 포함)
+                if self.tello:
+                    self.tello.send_rc_control(cmd_lr, cmd_fb, cmd_ud, cmd_yaw)
                 
-                time.sleep(0.05)  # 20Hz 제어 루프
-                
+                # 디버깅
+                # if cmd_lr != 0 or cmd_fb != 0:
+                #     print(f"CMD: LR={cmd_lr} FB={cmd_fb} YAW={cmd_yaw} | Obs C={obs_c:.1f}")
+
+                time.sleep(0.05)
+
             except Exception as e:
-                self.log("ERROR", f"Tracking error: {e}")
-                if self.use_rc_for_tracking:
+                # [안전장치 2] 에러 발생 시 정지 명령 보낼 때도 Tello 생존 확인
+                self.log("ERROR", f"Tracking Loop Error: {e}")
+                if self.tello:
                     try:
                         self.tello.send_rc_control(0, 0, 0, 0)
                     except:
                         pass
-                time.sleep(0.5)
-        
-        # 추적 종료 시 정지
-        try:
-            self.tello.send_rc_control(0, 0, 0, 0)
-            self.log("INFO", "🛑 Tracking stopped - drone halted")
-        except:
-            pass
-        
-        self.log("INFO", "🎯 Tracking thread stopped")
+                time.sleep(1)
 
-
+    # ----------------------
+    # Video stream (기존)
+    # ----------------------
     def video_stream_thread(self):
         """비디오 스트리밍 스레드"""
         print("📹 Starting video stream thread...")
@@ -368,6 +551,16 @@ class TelloWebServer:
                 
                 # 추론 실행
                 detections, depth_map, *_ = self.inference_engine.run(frame)
+
+                depth_resized = None
+                if depth_map is not None:
+                    h, w = frame.shape[:2]
+                    # depth_map을 현재 프레임 크기로 늘림
+                    depth_resized = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_LINEAR)
+                    
+                    # 시각화용 맵 업데이트 (웹 전송용)
+                    with self.lock:
+                        self.current_depth_map = depth_resized
                 
                 with self.lock:
                     self.current_detections = detections
@@ -390,6 +583,25 @@ class TelloWebServer:
                             self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
                             self.target_class = (best.get("class", "person") if isinstance(best, dict)
                                                 else getattr(best, "cls", "person"))
+                            
+                            # =========================================================
+                            # [추가] 타겟 중앙의 Depth 값 추출
+                            # =========================================================
+                            if depth_resized is not None:
+                                # bbox 좌표 정수형 변환
+                                x1, y1, x2, y2 = map(int, self.target_bbox)
+                                
+                                # 중앙점 계산
+                                cx = (x1 + x2) // 2
+                                cy = (y1 + y2) // 2
+                                
+                                # 인덱스 범위 초과 방지 (안전장치)
+                                h_map, w_map = depth_resized.shape
+                                cx = max(0, min(cx, w_map - 1))
+                                cy = max(0, min(cy, h_map - 1))
+                                
+                                # 거리값 갱신 (여기가 없으면 전진을 안 함)
+                                self.target_depth = depth_resized[cy, cx]
                         else:
                             # 매칭 실패: 타겟 상실 처리
                             if self.target_bbox is not None:
@@ -450,22 +662,416 @@ class TelloWebServer:
                 time.sleep(0.1)
                 
         print("📹 Video stream thread ended")
-    
 
     def start_streaming(self):
-        """스트리밍 시작"""
+        """스트리밍 시작 + Optical Flow 자동 시작"""
         if not self.is_streaming and self.is_connected:
             self.is_streaming = True
-            thread = threading.Thread(target=self.video_stream_thread)
-            thread.daemon = True
-            thread.start()
+
+            # frame_reader 싱글톤화
+            if not hasattr(self, "frame_reader") or self.frame_reader is None:
+                try:
+                    self.frame_reader = self.tello.get_frame_read()
+                    self.log("INFO", "✅ Frame reader initialized")
+                except Exception as e:
+                    self.log("ERROR", f"Failed to initialize frame reader: {e}")
+                    self.is_streaming = False
+                    self.socketio.emit('stream_error', {'message': 'Failed to start video stream.'})
+                    return False
+
+            # 비디오 스트리밍 쓰레드 시작
+            threading.Thread(target=self.video_stream_thread, daemon=True).start()
+
+            # Optical Flow도 자동 시작
+            self.start_optical_flow()
+
             return True
         return False
-    
 
     def stop_streaming(self):
         """스트리밍 중지"""
         self.is_streaming = False
+
+    # ----------------------
+    # 스크린샷 캡처
+    # ----------------------
+
+    # def save_screenshot(self):
+    #     """현재 프레임을 스크린샷으로 저장"""
+    #     try:
+    #         with self.lock:
+    #             if self.current_frame is None:
+    #                 return {'success': False, 'message': 'No frame available'}
+                
+    #             frame = self.current_frame.copy()
+            
+    #         # 타임스탬프로 파일명 생성
+    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #         filename = f"tello_capture_{timestamp}.jpg"
+    #         filepath = os.path.join(self.screenshot_dir, filename)
+            
+    #         # 이미지 저장
+    #         cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            
+    #         return {
+    #             'success': True, 
+    #             'message': f'Screenshot saved: {filename}',
+    #             'filename': filename,
+    #             'filepath': filepath
+    #         }
+            
+    #     except Exception as e:
+    #         self.log("ERROR", f"Screenshot error: {e}")
+    #         return {'success': False, 'message': str(e)}
+
+    # ----------------------
+    # 녹화 기능
+    # ----------------------
+    
+    def start_recording(self):
+        """녹화 시작"""
+        try:
+            if self.is_recording:
+                return {'success': False, 'message': 'Already recording'}
+            
+            with self.lock:
+                if self.current_frame is None:
+                    return {'success': False, 'message': 'No frame available'}
+                
+                # 비디오 파라미터 설정
+                frame_height, frame_width = self.current_frame.shape[:2]
+                fps = 20  # FPS 설정 (조정 가능)
+            
+            # 타임스탬프로 파일명 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.recording_filename = f"tello_recording_{timestamp}.mp4"
+            filepath = os.path.join(self.recording_dir, self.recording_filename)
+            
+            # VideoWriter 초기화 (XVID 코덱 사용)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                filepath, 
+                fourcc, 
+                fps, 
+                (frame_width, frame_height)
+            )
+            
+            if not self.video_writer.isOpened():
+                self.video_writer = None
+                return {'success': False, 'message': 'Failed to initialize video writer'}
+            
+            self.is_recording = True
+            self.log("SUCCESS", f"🎥 Recording started: {self.recording_filename}")
+            
+            return {
+                'success': True,
+                'message': f'Recording started: {self.recording_filename}',
+                'filename': self.recording_filename
+            }
+            
+        except Exception as e:
+            self.log("ERROR", f"Recording start error: {e}")
+            self.is_recording = False
+            self.video_writer = None
+            return {'success': False, 'message': str(e)}
+
+    def stop_recording(self):
+        """녹화 중지"""
+        try:
+            if not self.is_recording:
+                return {'success': False, 'message': 'Not recording'}
+            
+            self.is_recording = False
+            
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+            
+            filename = self.recording_filename
+            self.recording_filename = None
+            
+            self.log("SUCCESS", f"🎬 Recording stopped: {filename}")
+            
+            return {
+                'success': True,
+                'message': f'Recording saved: {filename}',
+                'filename': filename
+            }
+            
+        except Exception as e:
+            self.log("ERROR", f"Recording stop error: {e}")
+            self.is_recording = False
+            self.video_writer = None
+            return {'success': False, 'message': str(e)}
+    
+    def write_frame_to_video(self):
+        """현재 프레임을 비디오에 기록"""
+        if self.is_recording and self.video_writer is not None:
+            try:
+                with self.lock:
+                    if self.current_frame is not None:
+                        # BGR 형식으로 프레임 기록
+                        self.video_writer.write(self.current_frame)
+            except Exception as e:
+                self.log("ERROR", f"Frame write error: {e}")
+
+    # ----------------------
+    # Optical Flow Depth 관련 함수들 (추가)
+    # ----------------------
+
+    def stop_optical_flow(self):
+        if not self.is_optical_flow_running:
+            return False
+        self.is_optical_flow_running = False
+        if self.optical_flow_thread_obj:
+            self.optical_flow_thread_obj.join(timeout=1.0)
+        self.log("INFO", "Optical flow depth thread stopped")
+        return True
+
+    def optical_flow_thread(self):
+        """Optical Flow 기반 절대 거리 계산 (goodFeaturesToTrack 사용)"""
+
+        # 보내주신 원본 Intrinsic (fx, fy, cx, cy) 적용
+        mtx = np.array([[918.21, 0.0, 481.18],
+                        [0.0, 918.14, 351.57],
+                        [0.0, 0.0, 1.0]])
+        
+        # 보내주신 Distortion Coefficients
+        dist = np.array([0.01513, -0.32790, -0.005906, -0.002002, 0.96441])
+        
+        # 보내주신 New Camera Matrix (Undistort 후)
+        new_camera_mtx = np.array([[917.04620423, 0.0, 479.64715048],
+                                [0.0, 914.76700761, 348.73281015],
+                                [0.0, 0.0, 1.0]])
+
+        fx = new_camera_mtx[0, 0]  # ~917.04
+        fy = new_camera_mtx[1, 1]  # ~914.76
+        cx = new_camera_mtx[0, 2]  # 약 479.64
+        cy = new_camera_mtx[1, 2]  # 약 348.73
+        
+        # 장애물 거리 저장소 (초기값: 10m - 안전함)
+        self.obstacle_dists = {'left': 10.0, 'center': 10.0, 'right': 10.0}
+        
+        # [설정] goodFeaturesToTrack 파라미터
+        MAX_CORNERS = 200        # 추출할 최대 특징점 개수
+        MIN_CORNERS = 100        # 재추출 임계값
+        QUALITY_LEVEL = 0.01     # 코너 품질 (0.01 ~ 0.1)
+        MIN_DISTANCE = 25        # 특징점 간 최소 거리 (픽셀)
+        # =========================================================
+
+        try:
+            frame_reader = self.tello.get_frame_read()
+        except Exception as e:
+            self.log("ERROR", f"OpticalFlow: failed to get frame_read: {e}")
+            self.is_optical_flow_running = False
+            return
+
+        prev_gray = None
+        prev_pts = None
+        prev_time = time.time()
+
+        while self.is_optical_flow_running:
+            # 1. 프레임 획득
+            raw_frame = frame_reader.frame
+            if raw_frame is None:
+                time.sleep(0.01)
+                continue
+
+            # 2. 왜곡 보정 (Undistort)
+            # frame = cv2.undistort(raw_frame, mtx, dist, None, new_camera_mtx)
+            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            # =========================================================
+            # [에러 방지 1] 해상도 변경 감지
+            # 이전 프레임과 현재 프레임 크기가 다르면 리셋합니다.
+            # =========================================================
+            if prev_gray is not None and prev_gray.shape != gray.shape:
+                print(f"[Warning] Frame size changed: {prev_gray.shape} -> {gray.shape}. Resetting Flow.")
+                prev_gray = None
+                prev_pts = None
+
+            # 3. 특징점 추출 (goodFeaturesToTrack 사용)
+            # 초기 상태이거나, 점이 MIN_CORNERS 미만으로 떨어지면 재추출
+            if prev_gray is None or prev_pts is None or len(prev_pts) < MIN_CORNERS:
+                # goodFeaturesToTrack으로 특징점 추출
+                prev_pts = cv2.goodFeaturesToTrack(
+                    gray,
+                    maxCorners=MAX_CORNERS,
+                    qualityLevel=QUALITY_LEVEL,
+                    minDistance=MIN_DISTANCE,
+                    blockSize=7
+                )
+                
+                if prev_pts is None or len(prev_pts) == 0:
+                    # 특징점을 찾지 못한 경우
+                    # with self.lock:
+                    #     self.current_frame = frame
+                    time.sleep(0.01)
+                    continue
+                
+                # self.log("DEBUG", f"🔍 Extracted {len(prev_pts)} feature points")
+                prev_gray = gray
+                prev_time = time.time()
+                # with self.lock:
+                #     self.current_frame = frame
+                time.sleep(0.01)
+                continue
+
+            # 4. Optical Flow 계산 (Lucas-Kanade)
+            # =========================================================
+            # [에러 방지 2] try-except로 감싸서 크래시 방지
+            # =========================================================
+            try:
+                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    prev_gray, gray, prev_pts, None, **self.of_lk_params
+                )
+            except cv2.error as e:
+                # OpenCV 에러 발생 시(크기 불일치 등) 리셋하고 넘어감
+                print(f"[Error] calcOpticalFlowPyrLK failed: {e}")
+                prev_gray = None
+                prev_pts = None
+                continue
+
+            # 추적 성공한 점들만 유지
+            good_prev = prev_pts[status == 1]
+            good_next = next_pts[status == 1]
+
+            # 추적 점이 너무 적으면 다음 루프에서 재생성하도록 유도
+            if len(good_prev) < MIN_CORNERS:
+                self.log("DEBUG", f"⚠️ Feature points dropped to {len(good_prev)}, re-extracting...")
+                prev_gray = None
+                prev_pts = None
+                continue
+
+            vis = raw_frame.copy()
+
+            # =========================================================
+            # 거리 계산 로직
+            # =========================================================
+            current_time = time.time()
+            dt = current_time - prev_time
+            prev_time = current_time
+
+            vx_cm = self.tello.get_speed_x() * 10
+            vy_cm = self.tello.get_speed_y() * 10
+            # vz_cm = self.tello.get_speed_z() * 10
+            yaw = self.tello.get_yaw()
+
+            # yaw를 라디안으로 변환
+            yaw_rad = np.deg2rad(yaw)
+            vx_forward = vx_cm * np.cos(yaw_rad) + vy_cm * np.sin(yaw_rad)  # 드론 앞방향 속도
+            vy_lateral = -vx_cm * np.sin(yaw_rad) + vy_cm * np.cos(yaw_rad) # 드론 좌우방향 속도
+
+            tx = vx_forward / 100.0  # m/s
+            dx = tx * dt        # 이동 거리 (m)
+
+            # draw_count = 0
+            valid_points_count = 0
+            depth_measurements = []  # 유효한 거리 측정값 저장
+
+            # 5. 구역별 거리 측정
+            temp_dists = {'left': [], 'center': [], 'right': []}
+            left_boundary = w * 0.33
+            right_boundary = w * 0.66
+
+            for p0, p1 in zip(good_prev, good_next):
+                x0, y0 = p0.ravel()
+                x1, y1 = p1.ravel()
+
+                # 노이즈 필터링: 이동 거리가 너무 짧으면(호버링 등) 계산 스킵
+                if abs(dx) < 0.001:
+                    continue
+
+                # -----------------------------------------------------
+                # [Step 1] 정밀 각도 계산 (fx, fy 반영)
+                # -----------------------------------------------------
+                # a: 이전 프레임 점의 각도
+                norm_x0 = (x0 - cx) / fx
+                norm_y0 = (y0 - cy) / fy
+                tan_a = math.sqrt(norm_x0**2 + norm_y0**2)
+                
+                # b: 현재 프레임 점의 각도
+                norm_x1 = (x1 - cx) / fx
+                norm_y1 = (y1 - cy) / fy
+                tan_b = math.sqrt(norm_x1**2 + norm_y1**2)
+
+                # 중심 부근 노이즈 필터링
+                if tan_a < 0.01:
+                    continue
+
+                angle_a = math.atan(tan_a)
+                angle_b = math.atan(tan_b)
+                
+                # -----------------------------------------------------
+                # [Step 2] 공식 적용: Z = dx * sin(a) / sin(b - a)
+                # -----------------------------------------------------
+                # delta_angle (b - a)는 시차(Parallax)를 의미합니다.
+                delta_angle = angle_b - angle_a
+                
+                # 각도 변화가 너무 작으면(무한대 거리 or 정지) 스킵
+                if abs(delta_angle) < 1e-5:
+                    continue
+
+                try:
+                    Z = dx * math.sin(angle_a) / math.sin(delta_angle)
+                except ZeroDivisionError:
+                    continue
+                
+                if 0.3 < Z < 5.0: # 0.3m ~ 5m 사이 유효
+                    if x1 < left_boundary:
+                        temp_dists['left'].append(Z)
+                    elif x1 < right_boundary:
+                        temp_dists['center'].append(Z)
+                    else:
+                        temp_dists['right'].append(Z)
+
+                # 유효 거리 필터링 (0 ~ 10m)
+                # if Z <= 0 or Z > 10.0:
+                #     cv2.circle(vis, (int(x1), int(y1)), 2, (0, 0, 255), -1) 
+                #     continue
+
+                valid_points_count += 1
+                depth_measurements.append(Z)
+                
+                # 시각화
+                # cv2.circle(vis, (int(x1), int(y1)), 3, (0, 255, 255), -1)
+                # cv2.line(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 1)
+                
+                # 텍스트 가독성 조절 (3번에 1번 출력)
+                # cv2.putText(vis, f"{Z:.1f}m", (int(x1) - 10, int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 255, 255), 1)
+                # draw_count += 1
+
+            # 구역별 최소값(가장 위험한 장애물) 업데이트
+            for key in self.obstacle_dists:
+                if temp_dists[key]:
+                    # 가장 가까운 하위 10% 평균 (보수적 감지)
+                    self.obstacle_dists[key] = np.percentile(temp_dists[key], 10)
+                else:
+                    self.obstacle_dists[key] = 10.0 # 장애물 없음(안전)
+
+            # 평균/중간값 거리 계산
+            # avg_depth = np.mean(depth_measurements) if depth_measurements else 0.0
+            # median_depth = np.median(depth_measurements) if depth_measurements else 0.0
+
+            # 정보 표시
+            # print(self.tello.get_current_state())
+            # info_text = f"Features: {len(good_next)} | Speed v_forward: {vx_forward/100:.2f} m/s | Speed v_lateral: {vy_lateral/100:.2f} m/s | Yaw: {yaw} degree | Valid: {valid_points_count}"
+            # cv2.putText(vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # cv2.putText(vis, f"query speed: {self.tello.query_speed()}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # 평균 거리 표시
+            # if depth_measurements:
+            #     depth_text = f"Avg Depth: {avg_depth:.2f}m | Median: {median_depth:.2f}m"
+            #     cv2.putText(vis, depth_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # with self.lock:
+            #     self.current_frame = vis
+
+            # 다음 프레임 준비
+            prev_gray = gray.copy()
+            prev_pts = good_next.reshape(-1, 1, 2)
+
+            time.sleep(0.01)
 
     def start_tracking(self):
         """자동 추적 시작 (identity 우선, 실패 시 bbox 폴백)"""
@@ -521,8 +1127,59 @@ class TelloWebServer:
                 })
         except Exception:
             pass
-    
 
+
+    def start_optical_flow(self):
+        """Optical Flow depth 추정 스레드 시작"""
+        if not self.is_connected:
+            self.log("ERROR", "Cannot start optical flow: Not connected")
+            return False
+        if self.is_optical_flow_running:
+            self.log("WARNING", "Optical flow already running")
+            return False
+
+        self.is_optical_flow_running = True
+        threading.Thread(target=self.optical_flow_thread, daemon=True).start()
+        self.log("INFO", "Optical flow depth thread started")
+        return True
+
+
+    # ----------------------
+    # Depth feed (MJPEG) - 컬러맵으로 제공
+    # ----------------------
+    def get_depth_colormap_jpeg(self):
+        with self.lock:
+            if self.current_depth_map is None:
+                return None
+            depth = self.current_depth_map.copy()
+
+        # 0 값(없는 지점)은 min으로 처리해서 시각화 왜곡 방지
+        mask = depth > 0
+        if not np.any(mask):
+            return None
+
+        # normalize to 0-255 for colormap
+        depth_nonzero = depth.copy()
+        # clip extremes
+        vmin = np.percentile(depth_nonzero[mask], 5)
+        vmax = np.percentile(depth_nonzero[mask], 95)
+        if vmin == vmax:
+            vmax = vmin + 1e-3
+        norm = np.zeros_like(depth_nonzero, dtype=np.uint8)
+        clip = np.clip(depth_nonzero, vmin, vmax)
+        norm = ((clip - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
+
+        # fill zeros with 0 (black)
+        norm[~mask] = 0
+
+        colormap = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        # return JPEG bytes
+        _, buffer = cv2.imencode('.jpg', colormap, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buffer.tobytes()
+
+    # ----------------------
+    # 명령 실행 (기존)
+    # ----------------------
     def get_current_frame_jpeg(self):
         """현재 프레임을 JPEG로 반환 (BGR 그대로 인코딩)"""
         frame = None
@@ -566,21 +1223,19 @@ class TelloWebServer:
                 
                 time.sleep(self.takeoff_stabilization_time)
                 return {'success': True, 'message': 'Takeoff successful'}
-                
+
             elif command == 'land':
                 self.log("INFO", "🛬 Landing...")
                 self.tello.land()
-                self.last_takeoff_time = None  # 착륙 시 초기화
                 time.sleep(2)
                 self.log("SUCCESS", "Landing successful")
                 return {'success': True, 'message': 'Landing successful'}
-                
+
             elif command == 'emergency':
                 self.log("WARNING", "🚨 Emergency stop!")
                 self.tello.emergency()
-                self.last_takeoff_time = None  # 비상 정지 시 초기화
                 return {'success': True, 'message': 'Emergency stop'}
-            
+
             elif command == 'up':
                 self.tello.move_up(30)
             elif command == 'down':
@@ -590,7 +1245,9 @@ class TelloWebServer:
             elif command == 'right':
                 self.tello.move_right(30)
             elif command == 'forward':
-                self.tello.move_forward(30)
+                # self.tello.move_forward(30)
+                # self.tello.go_xyz_speed(30, 0, 0, 100)
+                self.tello.send_rc_control(left_right_velocity=0, forward_backward_velocity=100, up_down_velocity=0, yaw_velocity=0)
             elif command == 'back':
                 self.tello.move_back(30)
             elif command == 'cw':
@@ -599,19 +1256,34 @@ class TelloWebServer:
                 self.tello.rotate_counter_clockwise(30)
             else:
                 return {'success': False, 'message': f'Unknown command: {command}'}
-            
+
             time.sleep(1.0)
             self.log("DEBUG", f"Command {command} completed")
             return {'success': True, 'message': f'Command {command} executed'}
-        
+
         except Exception as e:
             self.log("ERROR", f"Command execution error: {e}")
             return {'success': False, 'message': str(e)}
-    
 
     def cleanup(self):
         """리소스 정리"""
         self.is_logging = False
+        # Stop optical flow if running
+        # 녹화 중이면 중지
+        if self.is_recording:
+            try:
+                self.stop_recording()
+            except:
+                pass
+        try:
+            self.stop_optical_flow()
+        except:
+            pass
+        # Stop streaming
+        try:
+            self.stop_streaming()
+        except:
+            pass
         if self.inference_engine:
             self.inference_engine.close()
 
