@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+# hailorun.py
 from functools import partial
 import queue
 import time
@@ -10,68 +10,6 @@ from common.hailo_inference import HailoInfer
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
-
-
-@dataclass
-class BoundingBox:
-    """
-    tlbr Boundingbox, autocast to int on instantiation.
-    it can accept list | float | tuple | np.array, it'll automagically convert them to x1, y1, x2, y2 in order.
-    it can also be iterated so x1, y1, x2, y2 = BoundingBox(...) works.
-    warning, only input either full list of coords or one array.
-    """
-    x1: int | float | list | tuple | np.ndarray
-    y1: int | float | None = None
-    x2: int | float | None = None 
-    y2: int | float | None = None
-
-    def __post_init__(self):
-        if self.y1 is None:
-            #assume array
-            if len(arr := list(self.x1)) != 4:
-                raise ValueError('BoundingBox requires 4 elements when initializing with array-like data')
-            self.x1, self.y1, self.x2, self.y2 = map(int, arr)
-        else:
-            self.x1 = int(self.x1)
-            self.y1 = int(self.y1)
-            self.x2 = int(self.x2)
-            self.y2 = int(self.y2)
-
-
-    def __iter__(self):
-        yield self.x1
-        yield self.y1
-        yield self.x2
-        yield self.y2
-
-    
-    def to_list(self):
-        return [self.x1, self.y1, self.x2, self.y2]
-    
-
-@dataclass
-class Target:
-    """
-    Return dataclass of HailoRun.run
-    """
-    track_id: int
-    confidence: float
-    bbox: BoundingBox
-    cls: str = 'person'
-
-
-    def __post_init__(self):
-        self.confidence = float(self.confidence) 
-
-
-    def to_dict(self):
-        return {
-            'track_id': self.track_id,
-            'confidence': self.confidence,
-            'class': self.cls,
-            'bbox': self.bbox.to_list()
-        }
-
 
 class HailoRun():
     """
@@ -194,7 +132,7 @@ class HailoRun():
         return scale, (left, top)
     
 
-    def run(self, frame: np.ndarray) -> Tuple[List[Target], np.ndarray, List]:
+    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray, List]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
@@ -203,10 +141,7 @@ class HailoRun():
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
         self.vis_m.run([self.vis_fb], self.vis_cb)
-        cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
-        # zfill = np.zeros((self.dep_fb.shape[0], self.dep_fb.shape[1], 1), dtype=self.dep_fb.dtype)
-        # zfill = np.concatenate([self.dep_fb, zfill], axis=2)
-        # self.dep_m.run([zfill], self.dep_cb)
+        self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
@@ -242,12 +177,21 @@ class HailoRun():
             )
         
         rets = []
-        for track in targets:
-            if self.thief_id != 0:
-                t_id = self.thief_id
-            else:
-                t_id = int(getattr(track, 'identity_id', track.track_id))
-            rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
+        for track in targets:            
+            # ① iid는 절대 덮어쓰지 말고 트래커 산출값 유지
+            iid = getattr(track, 'identity_id', None)
+            det = {
+                "identity_id": iid,
+                "confidence": float(track.score),
+                "bbox": list(map(int, track.last_bbox_tlbr)),
+                "class": "person",
+            }
+                
+            # 도둑 모드라면 부가 정보 표시용 필드 추가
+            if (self.thief_id != 0):
+                det["thief_dist"] = float(getattr(track, "thief_dist", 1.0))
+                det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
+            rets.append(det)
         
         depth = self.dep_q.get()
         self.recover_depth(frame, depth)
