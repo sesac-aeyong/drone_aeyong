@@ -197,7 +197,7 @@ class HailoRun():
             rets.append(det)
         
         depth = self.dep_q.get()
-        self.recover_depth(frame, depth)
+        depth = self.recover_depth(frame, depth)
 
         return rets, depth, boxes
     
