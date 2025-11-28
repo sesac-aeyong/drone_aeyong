@@ -392,133 +392,28 @@ class TelloWebServer:
     def video_stream_thread(self):
         """비디오 스트리밍 스레드"""
         print("📹 Starting video stream thread...")
-
+        
         try:
-            self.frame_reader = self.tello.get_frame_read()
+            time.sleep(3)
+            frame_reader = self.tello.get_frame_read()
             print("✅ Frame reader initialized")
         except Exception as e:
             print(f"❌ Failed to initialize frame reader: {e}")
+            traceback.print_exc()
             self.is_streaming = False
             self.socketio.emit('stream_error', {
                 'message': 'Failed to start video stream. Please reconnect.'
             })
             return
-
+            
         error_count = 0
         max_errors = 10
-
+        
         while self.is_streaming:
             try:
-                frame = self.frame_reader.frame
-
-                if frame is not None:
-                    error_count = 0
-
-                    # BGR → RGB 변환 (inference expects RGB)
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    # 추론 실행
-                    detections, depth_map = self.process_frame_with_inference(frame_rgb)
-
-                    with self.lock:
-                        self.current_detections = detections
-                        # inference에서 나온 depth_map 크기와 맞추려면 주의
-                        try:
-                            if depth_map is not None:
-                                self.current_depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
-                        except Exception:
-                            pass
-
-                        # 타겟 추적중이면 해당 객체 찾기
-                        if self.is_tracking and self.target_track_id is not None:
-                            target_found = False
-                            for det in detections:
-                                if det['track_id'] == self.target_track_id:
-                                    # bbox 업데이트 (detections는 dict 포맷 가정)
-                                    self.target_bbox = det['bbox']
-                                    self.target_class = det['class']
-                                    target_found = True
-                                    break
-
-                            if not target_found:
-                                self.log("WARNING", f"⚠️ Target ID {self.target_track_id} lost from view")
-                            else:
-                                x1, y1, x2, y2 = map(int, self.target_bbox)
-
-                                # depth_map에서 bbox 부분만 crop
-                                try:
-                                    bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
-                                except Exception:
-                                    bbox_depth_map = np.array([])
-
-                                if bbox_depth_map.size > 0:
-                                    # 중앙값이 가장 안정적
-                                    target_depth = float(np.median(bbox_depth_map))
-
-                                    # 신뢰도(옵션)
-                                    depth_conf = float(np.var(bbox_depth_map))
-
-                                    # 저장 (다른 쓰레드나 controller가 쓰게)
-                                    self.target_depth = target_depth
-                                    self.target_depth_conf = depth_conf
-
-                                    self.log("INFO", f"🎯 Target depth: {target_depth:.3f}, conf: {depth_conf:.5f}")
-                                else:
-                                    self.log("WARNING", "Target depth crop invalid")
-
-                    # 감지 결과 그리기 (inference 엔진의 helper 사용)
-                    frame_with_detections = frame_rgb.copy()
-                    try:
-                        frame_with_detections = self.inference_engine.draw_detections_on_frame(
-                            frame_with_detections,
-                            detections,
-                            target_track_id=self.target_track_id if self.is_tracking else None
-                        )
-                    except Exception:
-                        pass
-
-                    # 프레임 중심 십자선 표시
-                    h, w = frame_with_detections.shape[:2]
-                    center_x, center_y = w // 2, h // 2
-                    cv2.line(frame_with_detections, (center_x - 30, center_y), (center_x + 30, center_y), (255, 255, 255), 2)
-                    cv2.line(frame_with_detections, (center_x, center_y - 30), (center_x, center_y + 30), (255, 255, 255), 2)
-                    cv2.circle(frame_with_detections, (center_x, center_y), 5, (255, 255, 255), -1)
-
-                    # 배터리 및 높이 정보 업데이트
-                    try:
-                        old_battery = self.battery
-                        self.battery = self.tello.get_battery()
-                        self.height = self.tello.get_height()
-
-                        # 배터리 경고
-                        if self.battery < 15 and old_battery >= 15:
-                            self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
-                        elif self.battery < 25 and old_battery >= 25:
-                            self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
-                    except:
-                        pass
-
-                    # 프레임 저장 (convert back to BGR for web)
-                    # with self.lock:
-                    #     try:
-                    #         frame_bgr = cv2.cvtColor(frame_with_detections, cv2.COLOR_RGB2BGR)
-                    #     except Exception:
-                    #         frame_bgr = frame.copy()
-                    #     self.current_frame = frame_bgr
-                    
-                    self.write_frame_to_video()
-
-                    # 감지 정보를 클라이언트에 전송
-                    self.socketio.emit('detections_update', {
-                        'detections': [det.to_dict() for det in detections],
-                        'battery': self.battery,
-                        'height': self.height,
-                        'is_tracking': self.is_tracking,
-                        'target_track_id': self.target_track_id,
-                        'target_class': self.target_class
-                    })
-
-                else:
+                frame = frame_reader.frame
+                
+                if frame is None:
                     error_count += 1
                     if error_count >= max_errors:
                         print("⚠️ Too many frame errors")
@@ -606,13 +501,14 @@ class TelloWebServer:
                 
             except Exception as e:
                 print(f"Stream error: {e}")
+                traceback.print_exc()
                 error_count += 1
                 if error_count >= max_errors:
                     print("❌ Stream failed completely")
                     self.is_streaming = False
                     break
                 time.sleep(0.1)
-
+                
         print("📹 Video stream thread ended")
 
     def start_streaming(self):
@@ -856,16 +752,16 @@ class TelloWebServer:
                 
                 if prev_pts is None or len(prev_pts) == 0:
                     # 특징점을 찾지 못한 경우
-                    with self.lock:
-                        self.current_frame = frame
+                    # with self.lock:
+                    #     self.current_frame = frame
                     time.sleep(0.01)
                     continue
                 
                 # self.log("DEBUG", f"🔍 Extracted {len(prev_pts)} feature points")
                 prev_gray = gray
                 prev_time = time.time()
-                with self.lock:
-                    self.current_frame = frame
+                # with self.lock:
+                #     self.current_frame = frame
                 time.sleep(0.01)
                 continue
 
@@ -987,7 +883,7 @@ class TelloWebServer:
             median_depth = np.median(depth_measurements) if depth_measurements else 0.0
 
             # 정보 표시
-            print(self.tello.get_current_state())
+            # print(self.tello.get_current_state())
             info_text = f"Features: {len(good_next)} | Speed v_forward: {vx_forward/100:.2f} m/s | Speed v_lateral: {vy_lateral/100:.2f} m/s | Yaw: {yaw} degree | Valid: {valid_points_count}"
             cv2.putText(vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             # cv2.putText(vis, f"query speed: {self.tello.query_speed()}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -996,8 +892,8 @@ class TelloWebServer:
                 depth_text = f"Avg Depth: {avg_depth:.2f}m | Median: {median_depth:.2f}m"
                 cv2.putText(vis, depth_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            with self.lock:
-                self.current_frame = vis
+            # with self.lock:
+            #     self.current_frame = vis
 
             # 다음 프레임 준비
             prev_gray = gray.copy()
