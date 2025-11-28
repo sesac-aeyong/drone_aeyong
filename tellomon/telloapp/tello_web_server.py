@@ -239,6 +239,157 @@ class TelloWebServer:
     # ----------------------
     # 자동 추적 (기존)
     # ----------------------
+    # def tracking_thread(self):
+    #     """자동 추적 스레드"""
+    #     last_command_time = time.time()
+    #     command_interval = 1.0
+    #     target_lost_time = None
+    #     target_lost_warning_sent = False
+    #     depth_threshold = 0.20
+    #     prev_depth = None
+
+    #     self.log("INFO", "🎯 Tracking thread started (safe mode: 1s interval)")
+
+    #     while self.is_tracking:
+    #         try:
+    #             if self.target_bbox and self.current_frame is not None:
+    #                 current_time = time.time()
+
+    #                 # 타겟 재발견 시 경고 리셋
+    #                 if target_lost_time is not None:
+    #                     self.log("SUCCESS", "🎯 Target re-acquired!")
+    #                     target_lost_time = None
+    #                     target_lost_warning_sent = False
+
+    #                 if current_time - last_command_time >= command_interval:
+    #                     # 제어 명령 계산
+    #                     h, w = self.current_frame.shape[:2]
+    #                     center_x = w // 2
+    #                     center_y = h // 2
+
+    #                     # target_bbox is in [x1, y1, x2, y2] format
+    #                     x1, y1, x2, y2 = self.target_bbox
+    #                     target_center_x = (x1 + x2) // 2
+    #                     target_center_y = (y1 + y2) // 2
+
+    #                     # 오차 계산
+    #                     error_x = target_center_x - center_x
+    #                     error_y = target_center_y - center_y
+    #                     if prev_depth is not None:
+    #                         error_d = self.target_depth - prev_depth
+    #                     else:
+    #                         error_d = None
+
+    #                     # depth 계산
+    #                     prev_depth = self.target_depth
+
+    #                     # 타겟 크기
+    #                     target_width = x2 - x1
+    #                     target_height = y2 - y1
+    #                     target_area = target_width * target_height
+    #                     frame_area = w * h
+    #                     target_ratio = target_area / frame_area
+
+    #                     # 임계값
+    #                     threshold_x = w * 0.1
+    #                     threshold_y = h * 0.1
+    #                     threshold_size_min = 0.06
+    #                     threshold_size_max = 0.20
+
+    #                     action = None
+
+    #                     # 우선순위 기반 제어
+    #                     # 1. 좌우 정렬 (Yaw)
+    #                     if abs(error_x) > threshold_x:
+    #                         if self.use_rc_for_tracking:
+    #                             yaw_speed = int(np.clip(error_x * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
+    #                             self.tello.send_rc_control(0, 0, 0, yaw_speed)
+    #                             time.sleep(self.rc_command_duration)
+    #                             self.tello.send_rc_control(0, 0, 0, 0)
+    #                             action = f"RC yaw={yaw_speed}"
+    #                         else:
+    #                             angle = 15
+    #                             if error_x > 0:
+    #                                 self.tello.rotate_clockwise(angle)
+    #                                 action = f"CW {angle}°"
+    #                             else:
+    #                                 self.tello.rotate_counter_clockwise(angle)
+    #                                 action = f"CCW {angle}°"
+
+    #                     # 3. 상하 정렬
+    #                     elif abs(error_y) > threshold_y:
+    #                         if self.use_rc_for_tracking:
+    #                             ud_speed = int(np.clip(-error_y * 0.06, -self.tracking_rc_speed, self.tracking_rc_speed))
+    #                             self.tello.send_rc_control(0, 0, ud_speed, 0)
+    #                             time.sleep(self.rc_command_duration)
+    #                             self.tello.send_rc_control(0, 0, 0, 0)
+    #                             action = f"RC ud={ud_speed}"
+    #                         else:
+    #                             if error_y > 0:
+    #                                 self.tello.move_down(20)
+    #                                 action = "Down 20cm"
+    #                             else:
+    #                                 self.tello.move_up(20)
+    #                                 action = "Up 20cm"
+    #                     else:
+    #                         action = "Centered ✅"
+
+    #                     if action:
+    #                         self.log("DEBUG", f"🎯 {action} | Error: x={error_x:.0f}, y={error_y:.0f} | Size: {target_ratio:.3f}")
+    #                         action = None
+
+    #                     elif error_d and abs(error_d) > depth_threshold:
+    #                         # 사람이 너무 멀다 → 앞으로 이동해야 함
+    #                         if error_d > 0:
+    #                             if self.use_rc_for_tracking:
+    #                                 self.tello.send_rc_control(0, self.tracking_rc_speed, 0, 0)
+    #                                 time.sleep(self.rc_command_duration)
+    #                                 self.tello.send_rc_control(0, 0, 0, 0)
+    #                                 action = f"RC forward (error_d={error_d:.2f})"
+    #                             else:
+    #                                 self.tello.move_forward(20)
+    #                                 action = "Forward 20cm"
+
+    #                     else:
+    #                         action = "Distance OK (within threshold)"
+
+    #                     if action:
+    #                         self.log("DEBUG", f"🎯 {action} | Error: depth={error_d:.0f} | Size: {target_ratio:.3f}")
+    #                         action = None
+
+    #                     last_command_time = current_time
+    #                     time.sleep(0.5)
+
+    #             else:
+    #                 # 타겟을 잃어버림
+    #                 if target_lost_time is None:
+    #                     target_lost_time = time.time()
+
+    #                 # 3초 이상 타겟을 못 찾으면 경고
+    #                 if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
+    #                     self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
+    #                     target_lost_warning_sent = True
+
+    #             time.sleep(0.2)
+
+    #         except Exception as e:
+    #             self.log("ERROR", f"Tracking error: {e}")
+    #             if self.use_rc_for_tracking:
+    #                 try:
+    #                     self.tello.send_rc_control(0, 0, 0, 0)
+    #                 except:
+    #                     pass
+    #             time.sleep(1)
+
+    #     if self.use_rc_for_tracking:
+    #         try:
+    #             self.tello.send_rc_control(0, 0, 0, 0)
+    #             self.log("INFO", "🛑 Tracking stopped - drone halted")
+    #         except:
+    #             pass
+
+    #     self.log("INFO", "🎯 Tracking thread stopped")
+
     def tracking_thread(self):
         """
         [컨트롤러] 도둑 추적 + 유동적 회피 기동
@@ -261,6 +412,10 @@ class TelloWebServer:
         self.log("INFO", "🚀 Dynamic Tracking Started")
 
         while self.is_tracking:
+            # [안전장치 1] Tello 연결이 끊겼다면 스레드 즉시 종료
+            if self.tello is None:
+                self.log("WARNING", "🛑 Tello instance is None. Stopping tracking thread.")
+                break
             try:
                 # 1. 기본 명령 초기화
                 cmd_lr = 0   # 좌우
@@ -328,15 +483,15 @@ class TelloWebServer:
                     cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 힘 추가
 
 
-                # 4. 최종 명령 클램핑 (안전 범위)
-                cmd_fb = np.clip(cmd_fb, 0, 60)       # 후진 금지(0), 최대 60
-                cmd_lr = np.clip(cmd_lr, -40, 40)     # 좌우 최대 40
-                cmd_ud = np.clip(cmd_ud, -30, 30)     # 상하 최대 30
-                cmd_yaw = np.clip(cmd_yaw, -100, 100) # 회전 최대 100
+                # 4. 최종 명령 클램핑
+                cmd_fb = int(np.clip(cmd_fb, 0, 60))       
+                cmd_lr = int(np.clip(cmd_lr, -40, 40))     
+                cmd_ud = int(np.clip(cmd_ud, -30, 30))     
+                cmd_yaw = int(np.clip(cmd_yaw, -100, 100)) 
 
-                cmd_fb, cmd_lr, cmd_ud, cmd_yaw = map(int, (cmd_fb, cmd_lr, cmd_ud, cmd_yaw))
-                # 5. 전송
-                self.tello.send_rc_control(cmd_lr, cmd_fb, cmd_ud, cmd_yaw)
+                # 5. 전송 (안전장치 포함)
+                if self.tello:
+                    self.tello.send_rc_control(cmd_lr, cmd_fb, cmd_ud, cmd_yaw)
                 
                 # 디버깅
                 # if cmd_lr != 0 or cmd_fb != 0:
@@ -345,8 +500,13 @@ class TelloWebServer:
                 time.sleep(0.05)
 
             except Exception as e:
-                self.log("ERROR", f"Tracking Error: {e}")
-                self.tello.send_rc_control(0, 0, 0, 0)
+                # [안전장치 2] 에러 발생 시 정지 명령 보낼 때도 Tello 생존 확인
+                self.log("ERROR", f"Tracking Loop Error: {e}")
+                if self.tello:
+                    try:
+                        self.tello.send_rc_control(0, 0, 0, 0)
+                    except:
+                        pass
                 time.sleep(1)
 
     # ----------------------
@@ -400,7 +560,7 @@ class TelloWebServer:
                     
                     # 시각화용 맵 업데이트 (웹 전송용)
                     with self.lock:
-                        self.current_depth_map = depth_resized                
+                        self.current_depth_map = depth_resized
                 
                 with self.lock:
                     self.current_detections = detections
@@ -423,12 +583,19 @@ class TelloWebServer:
                             self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
                             self.target_class = (best.get("class", "person") if isinstance(best, dict)
                                                 else getattr(best, "cls", "person"))
+                            
+                            # =========================================================
+                            # [추가] 타겟 중앙의 Depth 값 추출
+                            # =========================================================
                             if depth_resized is not None:
+                                # bbox 좌표 정수형 변환
                                 x1, y1, x2, y2 = map(int, self.target_bbox)
+                                
+                                # 중앙점 계산
                                 cx = (x1 + x2) // 2
                                 cy = (y1 + y2) // 2
                                 
-                                # 인덱스 에러 방지
+                                # 인덱스 범위 초과 방지 (안전장치)
                                 h_map, w_map = depth_resized.shape
                                 cx = max(0, min(cx, w_map - 1))
                                 cy = max(0, min(cy, h_map - 1))
@@ -682,6 +849,9 @@ class TelloWebServer:
         cx = new_camera_mtx[0, 2]  # 약 479.64
         cy = new_camera_mtx[1, 2]  # 약 348.73
         
+        # 장애물 거리 저장소 (초기값: 10m - 안전함)
+        self.obstacle_dists = {'left': 10.0, 'center': 10.0, 'right': 10.0}
+        
         # [설정] goodFeaturesToTrack 파라미터
         MAX_CORNERS = 200        # 추출할 최대 특징점 개수
         MIN_CORNERS = 100        # 재추출 임계값
@@ -695,9 +865,6 @@ class TelloWebServer:
             self.log("ERROR", f"OpticalFlow: failed to get frame_read: {e}")
             self.is_optical_flow_running = False
             return
-        t = threading.Thread(target=self.tracking_thread, daemon=True)
-        t.start()
-        self._tracking_thread = t
 
         prev_gray = None
         prev_pts = None
@@ -711,8 +878,9 @@ class TelloWebServer:
                 continue
 
             # 2. 왜곡 보정 (Undistort)
-            frame = cv2.undistort(raw_frame, mtx, dist, None, new_camera_mtx)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # frame = cv2.undistort(raw_frame, mtx, dist, None, new_camera_mtx)
+            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
 
             # =========================================================
             # [에러 방지 1] 해상도 변경 감지
@@ -776,7 +944,7 @@ class TelloWebServer:
                 prev_pts = None
                 continue
 
-            vis = frame.copy()
+            vis = raw_frame.copy()
 
             # =========================================================
             # 거리 계산 로직
@@ -798,9 +966,14 @@ class TelloWebServer:
             tx = vx_forward / 100.0  # m/s
             dx = tx * dt        # 이동 거리 (m)
 
-            draw_count = 0
+            # draw_count = 0
             valid_points_count = 0
             depth_measurements = []  # 유효한 거리 측정값 저장
+
+            # 5. 구역별 거리 측정
+            temp_dists = {'left': [], 'center': [], 'right': []}
+            left_boundary = w * 0.33
+            right_boundary = w * 0.66
 
             for p0, p1 in zip(good_prev, good_next):
                 x0, y0 = p0.ravel()
@@ -844,38 +1017,52 @@ class TelloWebServer:
                     Z = dx * math.sin(angle_a) / math.sin(delta_angle)
                 except ZeroDivisionError:
                     continue
+                
+                if 0.3 < Z < 5.0: # 0.3m ~ 5m 사이 유효
+                    if x1 < left_boundary:
+                        temp_dists['left'].append(Z)
+                    elif x1 < right_boundary:
+                        temp_dists['center'].append(Z)
+                    else:
+                        temp_dists['right'].append(Z)
 
                 # 유효 거리 필터링 (0 ~ 10m)
-                if Z <= 0 or Z > 10.0:
-                    cv2.circle(vis, (int(x1), int(y1)), 2, (0, 0, 255), -1) 
-                    continue
+                # if Z <= 0 or Z > 10.0:
+                #     cv2.circle(vis, (int(x1), int(y1)), 2, (0, 0, 255), -1) 
+                #     continue
 
                 valid_points_count += 1
                 depth_measurements.append(Z)
                 
                 # 시각화
-                cv2.circle(vis, (int(x1), int(y1)), 3, (0, 255, 255), -1)
-                cv2.line(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 1)
+                # cv2.circle(vis, (int(x1), int(y1)), 3, (0, 255, 255), -1)
+                # cv2.line(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 1)
                 
                 # 텍스트 가독성 조절 (3번에 1번 출력)
-                if draw_count % 3 == 0:
-                    cv2.putText(vis, f"{Z:.1f}m", (int(x1) - 10, int(y1) - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 255, 255), 1)
-                draw_count += 1
+                # cv2.putText(vis, f"{Z:.1f}m", (int(x1) - 10, int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 255, 255), 1)
+                # draw_count += 1
+
+            # 구역별 최소값(가장 위험한 장애물) 업데이트
+            for key in self.obstacle_dists:
+                if temp_dists[key]:
+                    # 가장 가까운 하위 10% 평균 (보수적 감지)
+                    self.obstacle_dists[key] = np.percentile(temp_dists[key], 10)
+                else:
+                    self.obstacle_dists[key] = 10.0 # 장애물 없음(안전)
 
             # 평균/중간값 거리 계산
-            avg_depth = np.mean(depth_measurements) if depth_measurements else 0.0
-            median_depth = np.median(depth_measurements) if depth_measurements else 0.0
+            # avg_depth = np.mean(depth_measurements) if depth_measurements else 0.0
+            # median_depth = np.median(depth_measurements) if depth_measurements else 0.0
 
             # 정보 표시
             # print(self.tello.get_current_state())
-            info_text = f"Features: {len(good_next)} | Speed v_forward: {vx_forward/100:.2f} m/s | Speed v_lateral: {vy_lateral/100:.2f} m/s | Yaw: {yaw} degree | Valid: {valid_points_count}"
-            cv2.putText(vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # info_text = f"Features: {len(good_next)} | Speed v_forward: {vx_forward/100:.2f} m/s | Speed v_lateral: {vy_lateral/100:.2f} m/s | Yaw: {yaw} degree | Valid: {valid_points_count}"
+            # cv2.putText(vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             # cv2.putText(vis, f"query speed: {self.tello.query_speed()}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             # 평균 거리 표시
-            if depth_measurements:
-                depth_text = f"Avg Depth: {avg_depth:.2f}m | Median: {median_depth:.2f}m"
-                cv2.putText(vis, depth_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # if depth_measurements:
+            #     depth_text = f"Avg Depth: {avg_depth:.2f}m | Median: {median_depth:.2f}m"
+            #     cv2.putText(vis, depth_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             # with self.lock:
             #     self.current_frame = vis
