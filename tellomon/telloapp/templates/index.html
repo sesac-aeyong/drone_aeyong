@@ -405,6 +405,7 @@
             <div class="header-controls">
                 <button class="header-btn header-btn-primary" onclick="connectTello()" id="connectBtn">연결</button>
                 <button class="header-btn header-btn-warning" onclick="reconnectTello()" id="reconnectBtn" disabled>재연결</button>
+                <button class="header-btn header-btn-primary" onclick="toggleUndistort()" id="undistortBtn" disabled>왜곡보정: OFF</button>
             </div>
         </div>
         
@@ -510,6 +511,7 @@
     let isTracking = false;
     let currentDetections = [];
     let logCollapsed = false;
+    let undistortOn = false;
 
     const videoFeed = document.getElementById('videoFeed');
 
@@ -610,14 +612,27 @@
         // 재연결 버튼 활성화
         const r = document.getElementById('reconnectBtn');
         if (r) r.disabled = false;
+        // 🔽 연결되면 왜곡보정 버튼 활성화
+        const u = document.getElementById('undistortBtn');
+        if (u) {
+            u.disabled = false;
+            // 서버가 tello_status에 초기 undistort를 싣는다면 즉시 라벨 동기화
+            if (typeof data.undistort_enabled === 'boolean') {
+                undistortOn = data.undistort_enabled;
+                u.textContent = `왜곡보정: ${undistortOn ? 'ON' : 'OFF'}`;
+            }
+        }
         addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
-        } else {
+    } else {
         statusEl.textContent = '● OFF';
         statusEl.className = 'status-item disconnected';
         enableControls(false);
+        // 🔽 끊기면 비활성화
+        const u = document.getElementById('undistortBtn');
+        if (u) u.disabled = true;
         addLog('ERROR', '연결 실패');
-        }
-    });
+    }
+});
 
     socket.on('detections_update', (data) => {
         currentDetections = data?.detections || [];
@@ -648,6 +663,13 @@
         updateTrackingStatus(isTracking);
     });
 
+    // ✅ 서버의 왜곡 보정 상태 방송 수신
+    socket.on('undistort_status', ({ enable }) => {
+        undistortOn = !!enable;
+        const b = document.getElementById('undistortBtn');
+        if (b) b.textContent = `왜곡보정: ${undistortOn ? 'ON' : 'OFF'}`;
+    });
+
     // ---------- 소켓 송신 ----------
     function connectTello() {
         addLog('INFO', 'Tello 연결중...');
@@ -667,6 +689,11 @@
     function shutdownServer() {
         addLog('WARNING', '서버 종료 요청…');
         socket.emit('shutdown_server');
+    }
+    function toggleUndistort() {
+        const next = !undistortOn;
+        socket.emit('set_undistort', { enable: next });
+        // 실제 적용/라벨 반영은 서버가 'undistort_status'로 방송하는 값으로 동기화
     }
 
     // ---------- 리스트 렌더 ----------

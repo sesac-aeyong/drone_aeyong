@@ -91,6 +91,28 @@ class TelloWebServer:
         #     os.makedirs(self.screenshot_dir)
         #     self.log("INFO", f"📁 Screenshot directory created: {self.screenshot_dir}")
 
+
+        # ---- Undistort(왜곡 보정) 설정 ----
+        self.use_undistort = False
+        self._ud_maps_ready = False
+        self._ud_size = None
+        self._ud_map1 = None
+        self._ud_map2 = None
+
+        self.camera_mtx = np.array([ # 원본 카메라 내·외부 파라미터 (파란텔로)
+            [921.74,   0.  , 484.94],
+            [  0.  , 921.07, 355.52],
+            [  0.  ,   0.  ,   1.  ]
+        ], dtype=np.float32)
+        self.dist_coeffs = np.array([0.01635, -0.19644, -0.0002157, 0.0011699, 0.56532], dtype=np.float32)
+
+        
+        self.new_camera_mtx_hint = np.array([ # getOptimalNewCameraMatrix로 런타임에 재계산해 덮어씁니다.
+            [922.83538766,   0.         , 485.70362399],
+            [  0.         , 920.62929167, 355.42781255],
+            [  0.         ,   0.         ,   1.        ]
+        ], dtype=np.float32)
+
     # ----------------------
     # 로깅
     # ----------------------
@@ -140,6 +162,26 @@ class TelloWebServer:
 
         self.log_thread = threading.Thread(target=broadcast_logs, daemon=True)
         self.log_thread.start()
+
+    def _ensure_undistort_maps(self, w: int, h: int):
+        """프레임 크기에 맞춰 undistort remap을 1회 준비"""
+        if self._ud_maps_ready and self._ud_size == (w, h):
+            return
+        # ROI 손실 최소화를 위해 alpha=0.0(가장 타이트)~0.5 정도가 무난. 먼저 0.0로 시작.
+        newK, _ = cv2.getOptimalNewCameraMatrix(
+            self.camera_mtx, self.dist_coeffs, (w, h), alpha=0.0, newImgSize=(w, h)
+        )
+        # 참고로 사용자가 미리 구한 new_camera_mtx와 큰 차 없을 가능성이 높음
+        self._ud_map1, self._ud_map2 = cv2.initUndistortRectifyMap(
+            self.camera_mtx, self.dist_coeffs, None, newK, (w, h), cv2.CV_16SC2
+        )
+        self._ud_maps_ready = True
+        self._ud_size = (w, h)
+        self.log("INFO", f"📐 Undistort maps ready for {w}x{h}")
+
+    def set_undistort(self, enable: bool):
+        self.use_undistort = bool(enable)
+        self.log("INFO", f"🎛️ Undistortion toggled {'ON' if enable else 'OFF'}")
 
     # ----------------------
     # Tello 연결 / 스트리밍
@@ -452,9 +494,10 @@ class TelloWebServer:
 
 
                 # 3. [회피 로직] 명령 덮어쓰기가 아닌 '합성(Add)'
-                obs_l = self.obstacle_dists.get('left', 10.0)
-                obs_c = self.obstacle_dists.get('center', 10.0)
-                obs_r = self.obstacle_dists.get('right', 10.0)
+                od = self.obstacle_dists or {'left':10.0,'center':10.0,'right':10.0} #🚨tracking_thread가 optical flow보다 먼저 돌면 크래시나므로 가드
+                obs_l = od.get('left', 10.0)
+                obs_c = od.get('center', 10.0)
+                obs_r = od.get('right', 10.0)
 
                 # (A) 전방(Center) 장애물
                 if obs_c < OBSTACLE_WARN:
@@ -549,14 +592,18 @@ class TelloWebServer:
             
                 error_count = 0
                 
-                # 추론 실행
-                detections, depth_map, *_ = self.inference_engine.run(frame)
+                #🚨=== 왜곡 보정 적용 (토글 ON일 때만) ===
+                proc_frame = frame
+                if self.use_undistort and frame is not None:
+                    h, w = frame.shape[:2]
+                    self._ensure_undistort_maps(w, h)
+                    proc_frame = cv2.remap(frame, self._ud_map1, self._ud_map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                detections, depth_map, *_ = self.inference_engine.run(proc_frame)
 
                 depth_resized = None
                 if depth_map is not None:
-                    h, w = frame.shape[:2]
-                    # depth_map을 현재 프레임 크기로 늘림
-                    depth_resized = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_LINEAR)
+                    hh, ww = proc_frame.shape[:2]  #🚨depth_map 시각화/저장도 proc_frame 크기에 맞춰 처리
+                    depth_resized = cv2.resize(depth_map, (ww, hh), interpolation=cv2.INTER_LINEAR)
                     
                     # 시각화용 맵 업데이트 (웹 전송용)
                     with self.lock:
@@ -608,9 +655,10 @@ class TelloWebServer:
                                 self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
                             self.target_bbox = None
                 
-                # 감지 결과 그리기
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_with_detections = draw_detections_on_frame(frame, detections)
+                #🚨감지 결과 그리기
+                vis_src = proc_frame
+                rgb = cv2.cvtColor(vis_src, cv2.COLOR_BGR2RGB)
+                frame_with_detections = draw_detections_on_frame(rgb, detections)
                 
                 # 프레임 중심 십자선 표시
                 h, w = frame_with_detections.shape[:2]
@@ -637,6 +685,7 @@ class TelloWebServer:
                 with self.lock:
                     self.current_frame = frame_with_detections
                     self.current_frame_updated = True
+                self.write_frame_to_video() #🚨녹화가 실제로 파일에 써지도록 루프에서 호출
                 
                 # 감지 정보를 클라이언트에 전송
                 self.socketio.emit('detections_update', {

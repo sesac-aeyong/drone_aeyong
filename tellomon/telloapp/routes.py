@@ -2,7 +2,7 @@
 import time, os
 import cv2
 import numpy as np
-from flask import Blueprint, render_template, Response
+from flask import Blueprint, render_template, Response, request, jsonify #🚨
 
 def create_routes(socketio, get_tello_server, disconnect_wifi):
     """
@@ -43,6 +43,16 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         return Response(generate(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
+    @bp.route('/api/undistort', methods=['POST'])
+    def api_undistort(): #🚨depth map 껐다키기
+        """JSON {"enable": true/false} 를 받아 왜곡보정 토글"""
+        data = request.get_json(force=True, silent=True) or {}
+        enable = bool(data.get("enable", False))
+        s = get_tello_server()
+        s.set_undistort(enable)
+        socketio.emit('undistort_status', {"enable": enable})
+        return jsonify({"ok": True, "enable": enable})
+
     # SocketIO events
     @socketio.on('connect')
     def handle_connect():
@@ -60,16 +70,15 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         if success:
             ts.start_streaming()
             socketio.emit('tello_status', {'connected': True, 'battery': ts.battery})
+            socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
         else:
             socketio.emit('tello_status', {'connected': False})
 
     @socketio.on('get_tello_status')
     def handle_get_tello_status():
         ts = get_tello_server()
-        socketio.emit('tello_status', {
-            'connected': ts.is_connected,
-            'battery': ts.battery
-        })
+        socketio.emit('tello_status', {'connected': ts.is_connected, 'battery': ts.battery})
+        socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
 
     @socketio.on('reconnect_tello')
     def handle_reconnect_tello():
@@ -87,6 +96,7 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         if success:
             ts.start_streaming()
             socketio.emit('tello_status', {'connected': True, 'battery': ts.battery})
+            socketio.emit('undistort_status', {"enable": ts.use_undistort}) #🚨
         else:
             socketio.emit('tello_status', {'connected': False})
 
@@ -96,6 +106,14 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         command = data.get('command')
         result = ts.execute_command(command)
         socketio.emit('command_response', result)
+
+    @socketio.on('set_undistort')
+    def set_undistort_event(data): #🚨depth map 껐다키기
+        # data: {"enable": true/false}
+        enable = bool(data.get("enable", False))
+        s = get_tello_server()
+        s.set_undistort(enable)
+        socketio.emit('undistort_status', {"enable": enable})
 
     # ---------------------------
     # 🎯 Target Selection (identity_id only)
