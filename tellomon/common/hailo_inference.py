@@ -1,5 +1,5 @@
 from typing import Tuple, Dict, List
-from typing import Callable, Optional
+from typing import Optional
 from functools import partial
 import numpy as np
 

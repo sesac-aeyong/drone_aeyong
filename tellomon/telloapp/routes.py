@@ -1,5 +1,5 @@
 # routes.py
-import time
+import time, os
 from flask import Blueprint, render_template, Response
 
 def create_routes(socketio, get_tello_server, disconnect_wifi):
@@ -72,44 +72,86 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
         result = ts.execute_command(command)
         socketio.emit('command_response', result)
 
+    # ---------------------------
+    # 🎯 Target Selection (identity_id only)
+    # ---------------------------
     @socketio.on('set_target')
     def handle_set_target(data):
         ts = get_tello_server()
-        target_track_id = data.get('track_id')
-        target_class = data.get('class')
-        target_bbox = data.get('bbox')
 
-        ts.target_track_id = target_track_id
+        # 웹에서 무조건 'target_identity_id' 로 보냄
+        target_identity_id = data.get('target_identity_id')
+        target_class = data.get('class')
+        target_bbox  = data.get('bbox')
+
+        if target_identity_id is None:
+            socketio.emit('target_response', {
+                'ok': False,
+                'error': 'target_identity_id is required'
+            })
+            return
+
+        ts.target_identity_id = target_identity_id
         ts.target_class = target_class
-        ts.target_bbox = target_bbox
-        ts.log("INFO", f"🎯 Target set to: ID {target_track_id} ({target_class}), bbox: {target_bbox}")
+        ts.target_bbox  = target_bbox
+        ts.log("INFO", f"🎯 Target identity set: {target_identity_id} ({target_class}), bbox={target_bbox}")
 
         socketio.emit('target_response', {
-            'track_id': target_track_id,
+            'ok': True,
+            'target_identity_id': target_identity_id,
             'class': target_class,
             'bbox': target_bbox
         })
 
+    # ---------------------------
+    # 🚀 Start Tracking
+    # ---------------------------
     @socketio.on('start_tracking')
     def handle_start_tracking():
         ts = get_tello_server()
-        if ts.target_track_id is not None:
+        if ts.target_identity_id is not None:
             success = ts.start_tracking()
             socketio.emit('tracking_status', {
                 'is_tracking': success,
-                'target_track_id': ts.target_track_id,
-                'target_class': ts.target_class
+                'target_identity_id': ts.target_identity_id,
+                'class': ts.target_class,
             })
         else:
             socketio.emit('tracking_status', {
                 'is_tracking': False,
-                'message': 'No target selected'
+                'message': 'No identity selected'
             })
 
+    # ---------------------------
+    # 🛑 Stop Tracking
+    # ---------------------------
     @socketio.on('stop_tracking')
     def handle_stop_tracking():
         ts = get_tello_server()
         ts.stop_tracking()
-        socketio.emit('tracking_status', {'is_tracking': False})
+        socketio.emit('tracking_status', {
+            'is_tracking': False,
+            'target_identity_id': ts.target_identity_id,
+            'class': ts.target_class,
+        })
+
+    # ---------------------------
+    # ✔️ Shutdown Server
+    # ---------------------------
+    @socketio.on('shutdown_server')
+    def handle_shutdown():
+        ts = get_tello_server()
+        try:
+            ts.stop_tracking()
+            ts.stop_streaming()
+        except Exception:
+            pass
+        socketio.emit('log_message', {
+            'timestamp': time.strftime('%H:%M:%S'),
+            'level': 'WARNING',
+            'message': '서버를 종료합니다…'
+        })
+        # 그 외(uvicorn/gevent 등) 안전 종료가 어려우면 프로세스 종료
+        os._exit(0)
 
     return bp

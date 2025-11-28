@@ -3,7 +3,6 @@ import math
 import os
 import traceback
 import cv2
-import patches
 from djitellopy import Tello
 import threading
 import time
@@ -13,49 +12,8 @@ import os
 from datetime import datetime
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
-from .app_tools import *
+from .app_tools import connect_to_tello_wifi
 from settings import settings as S
-
-class TelloOpticalFlow:
-    def __init__(self, tello_instance, drone_color='blue'):
-        self.tello = tello_instance
-        self.is_optical_flow_running = True
-        self.lock = ... # (기존 lock 객체 등 필요)
-        
-        # ==========================================
-        # 1. 드론 선택 및 캘리브레이션 데이터 로드
-        # ==========================================
-        if drone_color == 'blue':
-            # 파란 텔로 (Tello 1)
-            self.mtx = np.array([[921.73863554, 0.0, 484.9439379],
-                                 [0.0, 921.06520894, 355.5162763],
-                                 [0.0, 0.0, 1.0]])
-            self.dist = np.array([0.01635261, -0.19644455, -0.00021575, 0.00116993, 0.56532416])
-            self.new_camera_mtx = np.array([[922.83538766, 0.0, 485.70362399],
-                                            [0.0, 920.62929167, 355.42781255],
-                                            [0.0, 0.0, 1.0]])
-            print(">>> [INFO] Loaded Calibration Data: BLUE Tello")
-            
-        elif drone_color == 'white':
-            # 흰색 텔로 (Tello 2)
-            self.mtx = np.array([[918.20765312, 0.0, 481.1811003],
-                                 [0.0, 918.144143, 351.56850948],
-                                 [0.0, 0.0, 1.0]])
-            self.dist = np.array([0.01513358, -0.32789949, -0.00590646, -0.00200168, 0.96440547])
-            self.new_camera_mtx = np.array([[917.04620423, 0.0, 479.64715048],
-                                            [0.0, 914.76700761, 348.73281015],
-                                            [0.0, 0.0, 1.0]])
-            print(">>> [INFO] Loaded Calibration Data: WHITE Tello")
-
-        # 정확한 초점거리 (fx) 추출 (Undistort 후의 newCameraMatrix 사용)
-        self.fx = self.new_camera_mtx[0, 0] 
-        
-        # Optical Flow 파라미터
-        self.of_lk_params = dict(winSize=(15, 15), maxLevel=2,
-                                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
-        self.of_max_corners = 100
-        self.of_quality = 0.3
-        self.of_min_dist = 7
 
 class TelloWebServer:
     def __init__(self, socketio):
@@ -67,7 +25,7 @@ class TelloWebServer:
         self.current_depth_map = None            # float32 depth (m) visualized by depth_feed
         self.current_detections = []
         self.target_class = None
-        self.target_track_id = None
+        self.target_identity_id = None
         self.target_bbox = None  # Store in [x1, y1, x2, y2] format
         self.is_tracking = False
         self.battery = 0
@@ -405,7 +363,7 @@ class TelloWebServer:
 
                     # 3초 이상 타겟을 못 찾으면 경고
                     if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_track_id})")
+                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
                         target_lost_warning_sent = True
 
                 time.sleep(0.2)
@@ -568,10 +526,84 @@ class TelloWebServer:
                         self.socketio.emit('stream_error', {
                             'message': 'Video stream lost. Please reconnect.'
                         })
-                        break
+                        break                    
+                    continue
+            
+                error_count = 0
+                
+                # 추론 실행
+                detections, depth_map, *_ = self.inference_engine.run(frame)
+                
+                with self.lock:
+                    self.current_detections = detections
+                    
+                    if self.is_tracking:
+                        # 1) 도둑 모드 후보 찾기: thief_dist <= gate 인 것 중 최솟값
+                        best = None
+                        for det in detections:
+                            get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
+                            td = get("thief_dist")
+                            tg = get("thief_cos_dist")
+                            if td is None or tg is None:
+                                continue
+                            if td <= tg:
+                                if (best is None) or (td < best.get("thief_dist", 1e9)):
+                                    best = det
 
-                time.sleep(0.033)
-
+                        if best is not None:
+                            # 매칭 통과: 이 bbox만 추적 대상으로
+                            self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
+                            self.target_class = (best.get("class", "person") if isinstance(best, dict)
+                                                else getattr(best, "cls", "person"))
+                        else:
+                            # 매칭 실패: 타겟 상실 처리
+                            if self.target_bbox is not None:
+                                self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
+                            self.target_bbox = None
+                
+                # 감지 결과 그리기
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_with_detections = draw_detections_on_frame(frame, detections)
+                
+                # 프레임 중심 십자선 표시
+                h, w = frame_with_detections.shape[:2]
+                cx, cy = w // 2, h // 2
+                cv2.line(frame_with_detections, (cx - 30, cy), (cx + 30, cy), (255, 255, 255), 2)
+                cv2.line(frame_with_detections, (cx, cy - 30), (cx, cy + 30), (255, 255, 255), 2)
+                cv2.circle(frame_with_detections, (cx, cy), 5, (255, 255, 255), -1)
+                
+                # 배터리 및 높이 정보 업데이트
+                try:
+                    old_battery = self.battery
+                    self.battery = self.tello.get_battery()
+                    self.height = self.tello.get_distance_tof()
+                    
+                    # 배터리 경고
+                    if self.battery < 15 and old_battery >= 15:
+                        self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
+                    elif self.battery < 25 and old_battery >= 25:
+                        self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
+                except:
+                    pass
+                
+                # 프레임 저장
+                with self.lock:
+                    self.current_frame = frame_with_detections
+                    self.current_frame_updated = True
+                
+                # 감지 정보를 클라이언트에 전송
+                self.socketio.emit('detections_update', {
+                    'detections': detections,
+                    'battery': self.battery,
+                    'height': self.height,
+                    'is_tracking': self.is_tracking,
+                    'target_identity_id': self.target_identity_id,
+                    'target_class': self.target_class
+                })
+                
+                
+                # time.sleep(0.033)
+                
             except Exception as e:
                 print(f"Stream error: {e}")
                 error_count += 1
@@ -747,180 +779,10 @@ class TelloWebServer:
             self.optical_flow_thread_obj.join(timeout=1.0)
         self.log("INFO", "Optical flow depth thread stopped")
         return True
-    
-
-    # def optical_flow_thread(self):
-    #     """Optical Flow 기반 절대 거리 계산 (Grid Sampling + 에러 방지)"""
-        
-    #     # =========================================================
-    #     # 1. 텔로 캘리브레이션 데이터
-    #     # =========================================================
-    #     # [옵션 A] 파란 텔로 (Blue Tello)
-    #     mtx = np.array([[921.73863554, 0.0, 484.9439379],
-    #                     [0.0, 921.06520894, 355.5162763],
-    #                     [0.0, 0.0, 1.0]])
-    #     dist = np.array([0.01635261, -0.19644455, -0.00021575, 0.00116993, 0.56532416])
-    #     new_camera_mtx = np.array([[922.83538766, 0.0, 485.70362399],
-    #                             [0.0, 920.62929167, 355.42781255],
-    #                             [0.0, 0.0, 1.0]])
-
-    #     fx = new_camera_mtx[0, 0]
-        
-    #     # [설정] 격자 간격 (픽셀 단위)
-    #     GRID_STEP = 40 
-    #     # =========================================================
-
-    #     try:
-    #         frame_reader = self.tello.get_frame_read()
-    #     except Exception as e:
-    #         self.log("ERROR", f"OpticalFlow: failed to get frame_read: {e}")
-    #         self.is_optical_flow_running = False
-    #         return
-
-    #     prev_gray = None
-    #     prev_pts = None
-    #     prev_time = time.time()
-
-    #     while self.is_optical_flow_running:
-    #         # 1. 프레임 획득
-    #         raw_frame = frame_reader.frame
-    #         if raw_frame is None:
-    #             time.sleep(0.01)
-    #             continue
-
-    #         # 2. 왜곡 보정 (Undistort)
-    #         frame = cv2.undistort(raw_frame, mtx, dist, None, new_camera_mtx)
-    #         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    #         # =========================================================
-    #         # [에러 방지 1] 해상도 변경 감지
-    #         # 이전 프레임과 현재 프레임 크기가 다르면 리셋합니다.
-    #         # =========================================================
-    #         if prev_gray is not None and prev_gray.shape != gray.shape:
-    #             print(f"[Warning] Frame size changed: {prev_gray.shape} -> {gray.shape}. Resetting Flow.")
-    #             prev_gray = None
-    #             prev_pts = None
-
-    #         # 3. 특징점(격자) 생성
-    #         # 초기 상태이거나, 점이 너무 적게 남았거나, 리셋된 경우
-    #         if prev_gray is None or prev_pts is None or len(prev_pts) < 50:
-    #             h, w = gray.shape
-                
-    #             # np.mgrid를 사용하여 격자 좌표 생성
-    #             grid_y, grid_x = np.mgrid[GRID_STEP//2:h:GRID_STEP, GRID_STEP//2:w:GRID_STEP].astype(np.float32)
-                
-    #             # (N, 1, 2) 형태로 변환
-    #             prev_pts = np.expand_dims(np.stack((grid_x.flatten(), grid_y.flatten()), axis=1), axis=1)
-                
-    #             prev_gray = gray
-    #             prev_time = time.time()
-    #             time.sleep(0.01)
-    #             continue
-
-    #         # 4. Optical Flow 계산 (Lucas-Kanade)
-    #         # =========================================================
-    #         # [에러 방지 2] try-except로 감싸서 크래시 방지
-    #         # =========================================================
-    #         try:
-    #             next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-    #                 prev_gray, gray, prev_pts, None, **self.of_lk_params
-    #             )
-    #         except cv2.error as e:
-    #             # OpenCV 에러 발생 시(크기 불일치 등) 리셋하고 넘어감
-    #             print(f"[Error] calcOpticalFlowPyrLK failed: {e}")
-    #             prev_gray = None
-    #             prev_pts = None
-    #             continue
-
-    #         # 추적 성공한 점들만 유지
-    #         good_prev = prev_pts[status == 1]
-    #         good_next = next_pts[status == 1]
-
-    #         # 추적 점이 너무 적으면 다음 루프에서 재생성하도록 유도
-    #         if len(good_prev) < 10:
-    #             prev_gray = None
-    #             continue
-
-    #         vis = frame.copy()
-
-    #         # =========================================================
-    #         # 거리 계산 로직
-    #         # =========================================================
-    #         current_time = time.time()
-    #         dt = current_time - prev_time
-    #         prev_time = current_time
-
-    #         vx_cm = self.tello.get_speed_x()
-    #         vy_cm = self.tello.get_speed_y()
-    #         vz_cm = self.tello.get_speed_z()
-    #         tx = vx_cm / 100.0  # m/s
-    #         dx = tx * dt        # 이동 거리 (m)
-
-    #         draw_count = 0
-    #         valid_points_count = 0
-
-    #         for p0, p1 in zip(good_prev, good_next):
-    #             x0, y0 = p0.ravel()
-    #             x1, y1 = p1.ravel()
-                
-    #             u = (x1 - x0)
-                
-    #             # 필터링: 움직임이 너무 작거나(노이즈), 드론이 멈춰있으면 스킵
-    #             if abs(u) < 0.1 or abs(dx) < 0.001:
-    #                 cv2.circle(vis, (int(x1), int(y1)), 2, (0, 150, 0), -1)
-    #                 continue
-
-    #             try:
-    #                 Z = (dx * fx) / u
-    #             except ZeroDivisionError:
-    #                 continue
-
-    #             # 유효 거리 필터링 (0 ~ 10m)
-    #             if Z <= 0 or Z > 10.0:
-    #                 cv2.circle(vis, (int(x1), int(y1)), 2, (0, 0, 255), -1) 
-    #                 continue
-
-    #             valid_points_count += 1
-                
-    #             # 시각화
-    #             cv2.circle(vis, (int(x1), int(y1)), 3, (0, 255, 255), -1)
-    #             cv2.line(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 1)
-                
-    #             # 텍스트 가독성 조절 (2번에 1번 출력)
-    #             if draw_count % 2 == 0:
-    #                 cv2.putText(vis, f"{Z:.1f}m", (int(x1) - 10, int(y1) - 5),
-    #                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 255, 255), 1)
-    #             draw_count += 1
-
-    #         # 정보 표시
-    #         info_text = f"Grid Mode | Speed vx: {vx_cm} cm/s | Speed vy: {vy_cm} cm/s | Speed vz: {vz_cm} cm/s | Valid: {valid_points_count}"
-    #         cv2.putText(vis, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    #         with self.lock:
-    #             self.current_frame = vis
-
-    #         # 다음 프레임 준비
-    #         prev_gray = gray.copy()
-    #         prev_pts = good_next.reshape(-1, 1, 2)
-
-    #         time.sleep(0.01)
 
     def optical_flow_thread(self):
         """Optical Flow 기반 절대 거리 계산 (goodFeaturesToTrack 사용)"""
-        
-        # =========================================================
-        # 1. 텔로 캘리브레이션 데이터
-        # =========================================================
-        # [옵션 A] 파란 텔로 (Blue Tello) - 주석 처리됨
-        # mtx = np.array([[921.73863554, 0.0, 484.9439379],
-        #                 [0.0, 921.06520894, 355.5162763],
-        #                 [0.0, 0.0, 1.0]])
-        # dist = np.array([0.01635261, -0.19644455, -0.00021575, 0.00116993, 0.56532416])
-        # new_camera_mtx = np.array([[922.83538766, 0.0, 485.70362399],
-        #                            [0.0, 920.62929167, 355.42781255],
-        #                            [0.0, 0.0, 1.0]])
 
-        # [옵션 B] 흰색 텔로 (White Tello) - 현재 적용 중!
         # 보내주신 원본 Intrinsic (fx, fy, cx, cy) 적용
         mtx = np.array([[918.21, 0.0, 481.18],
                         [0.0, 918.14, 351.57],
@@ -952,6 +814,9 @@ class TelloWebServer:
             self.log("ERROR", f"OpticalFlow: failed to get frame_read: {e}")
             self.is_optical_flow_running = False
             return
+        t = threading.Thread(target=self.tracking_thread, daemon=True)
+        t.start()
+        self._tracking_thread = t
 
         prev_gray = None
         prev_pts = None
@@ -996,7 +861,7 @@ class TelloWebServer:
                     time.sleep(0.01)
                     continue
                 
-                self.log("DEBUG", f"🔍 Extracted {len(prev_pts)} feature points")
+                # self.log("DEBUG", f"🔍 Extracted {len(prev_pts)} feature points")
                 prev_gray = gray
                 prev_time = time.time()
                 with self.lock:
@@ -1059,18 +924,6 @@ class TelloWebServer:
             for p0, p1 in zip(good_prev, good_next):
                 x0, y0 = p0.ravel()
                 x1, y1 = p1.ravel()
-                
-                # u = (x1 - x0)
-                
-                # # 필터링: 움직임이 너무 작거나(노이즈), 드론이 멈춰있으면 스킵
-                # if abs(u) < 0.1 or abs(dx) < 0.001:
-                #     cv2.circle(vis, (int(x1), int(y1)), 2, (0, 150, 0), -1)
-                #     continue
-
-                # try:
-                #     Z = (dx * fx) / u
-                # except ZeroDivisionError:
-                #     continue
 
                 # 노이즈 필터링: 이동 거리가 너무 짧으면(호버링 등) 계산 스킵
                 if abs(dx) < 0.001:
@@ -1152,6 +1005,61 @@ class TelloWebServer:
 
             time.sleep(0.01)
 
+    def start_tracking(self):
+        """자동 추적 시작 (identity 우선, 실패 시 bbox 폴백)"""
+        if self.is_tracking:
+            self.log("WARNING", "Already tracking. Ignoring start request.")
+            self._emit_tracking_status(True, target_identity_id=self.target_identity_id)
+            return True
+
+        iid = None if self.target_identity_id is None else int(self.target_identity_id)
+        bbox = self.target_bbox
+
+        # 1) identity 우선
+        if iid is not None:
+            if self.inference_engine.enter_thief_mode(iid):
+                self.is_tracking = True
+                self._spawn_tracking_thread()
+                self._emit_tracking_status(True, target_identity_id=iid)
+                self.log("SUCCESS", f"🎯 Started tracking: ID {iid} ({self.target_class})")
+                return True
+            self.log("WARNING", f"enter_thief_mode failed for ID {iid}; trying bbox fallback...")
+
+        # 2) bbox 폴백
+        if bbox is not None and self.inference_engine.lock_by_bbox(bbox):
+            self.is_tracking = True
+            self._spawn_tracking_thread()
+            self._emit_tracking_status(True, target_identity_id=None)
+            self.log("SUCCESS", "🎯 Started tracking by bbox-lock (ID pending)")
+            return True
+
+        # 3) 실패
+        self._emit_tracking_status(False, message="lock_by_identity and bbox fallback both failed")
+        self.log("ERROR", "Failed to start tracking")
+        return False
+
+
+    def _spawn_tracking_thread(self):
+        """트래킹 스레드 안전 생성 (중복 방지)"""
+        if getattr(self, "_tracking_thread", None) and self._tracking_thread.is_alive():
+            return
+        t = threading.Thread(target=self.tracking_thread, daemon=True)
+        t.start()
+        self._tracking_thread = t
+
+    def _emit_tracking_status(self, is_on, target_identity_id=None, message=None):
+        """프론트로 추적 상태 송신 (routes.py에서 socketio.emit 쓰는 콜백을 주입해도 됨)"""
+        try:
+            if hasattr(self, "socketio"):
+                self.socketio.emit('tracking_status', {
+                    'is_tracking': bool(is_on),
+                    'target_identity_id': target_identity_id,
+                    'class': getattr(self, 'target_class', None),
+                    'message': message,
+                })
+        except Exception:
+            pass
+
 
     def start_optical_flow(self):
         """Optical Flow depth 추정 스레드 시작"""
@@ -1205,14 +1113,30 @@ class TelloWebServer:
     # 명령 실행 (기존)
     # ----------------------
     def get_current_frame_jpeg(self):
-        """현재 프레임을 JPEG로 반환"""
+        """현재 프레임을 JPEG로 반환 (BGR 그대로 인코딩)"""
+        frame = None
         with self.lock:
-            if self.current_frame is not None:
-                _, buffer = cv2.imencode('.jpg', self.current_frame,
-                                        [cv2.IMWRITE_JPEG_QUALITY, 80])
-                return buffer.tobytes()
-        return None
+            if self.current_frame is not None and self.current_frame_updated:
+                frame = self.current_frame  # copy() 불필요: 바로 imencode 하고 끝
+                self.current_frame_updated = False
+        if frame is None:
+            return None
 
+        try:
+            # >>> 색 변환 금지! (OpenCV는 BGR 그대로 JPEG 인코딩)
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                with self.lock:
+                    self.current_frame_updated = True
+                return None
+            return buf.tobytes()
+        except Exception as e:
+            with self.lock:
+                self.current_frame_updated = True
+            self.log("ERROR", f"JPEG encode failed: {e}")
+            return None
+    
+    
     def execute_command(self, command):
         """드론 명령 실행"""
         if not self.is_connected or not self.tello:
@@ -1287,7 +1211,35 @@ class TelloWebServer:
         except:
             pass
         if self.inference_engine:
-            try:
-                self.inference_engine.close()
-            except:
-                pass
+            self.inference_engine.close()
+
+
+    def stop_tracking(self):
+        """자동 추적 중지 → 일반 모드로 복귀"""
+        if not self.is_tracking:
+            self._emit_tracking_status(False, message="Already stopped")
+            return
+
+        # 도둑 모드 해제(있으면)
+        try:
+            if hasattr(self.inference_engine, "exit_thief_mode"):
+                self.inference_engine.exit_thief_mode()
+        except Exception as e:
+            self.log("WARNING", f"exit_thief_mode error: {e}")
+
+        # 상태 초기화
+        self.is_tracking = False
+        self.target_identity_id = None
+        self.target_bbox = None
+        self.target_class = None
+
+        # 드론 정지 (안전)
+        try:
+            if self.tello:
+                self.tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+
+        # 프론트 알림
+        self._emit_tracking_status(False, message="Back to normal mode")
+        self.log("INFO", "Stopped tracking and returned to normal mode.")
