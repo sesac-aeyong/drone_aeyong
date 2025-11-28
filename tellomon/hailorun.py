@@ -92,6 +92,7 @@ class HailoRun():
         self.vm_shape = None
         self.em_shape = None
         self.dm_shape = None
+        self.dm_scale = None
 
         self.vis_q = queue.Queue()
         self.dep_q = queue.Queue()
@@ -107,6 +108,10 @@ class HailoRun():
         self.active_tracker = self.longterm_tracker
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
+        
+        S.laser_x_pixels = np.array([85, 63.35, 48.5, 42.45, 40.1, 38])
+        S.laser_y_pixels = np.array([38, 26, 17.2, 14.35, 12.9, 12])
+        S.laser_distances = np.array([30, 60, 120, 180, 240, 300])
 
 
     def load(self):
@@ -116,7 +121,7 @@ class HailoRun():
         print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
         self.vis_m = HailoInfer(S.vis_model)
-        self.dep_m = HailoInfer(S.depth_model, output_type='FLOAT32')
+        self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
         self.emb_m = HailoInfer(S.embed_model, output_type='FLOAT32') 
 
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
@@ -130,6 +135,8 @@ class HailoRun():
         """depth model framebuffer"""
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
+        self.vis_to_dep_ratio = (self.dm_shape[0] / self.vm_shape[0],
+                                 self.dm_shape[1] / self.vm_shape[1])
 
     def enter_thief_mode(self, thief_id: int) -> bool:
         """
@@ -197,6 +204,9 @@ class HailoRun():
         self.letterbox_buffer(frame, self.vis_fb)
         self.vis_m.run([self.vis_fb], self.vis_cb)
         cv2.resize(frame, self.dm_shape, self.dep_fb, interpolation=cv2.INTER_LINEAR)
+        # zfill = np.zeros((self.dep_fb.shape[0], self.dep_fb.shape[1], 1), dtype=self.dep_fb.dtype)
+        # zfill = np.concatenate([self.dep_fb, zfill], axis=2)
+        # self.dep_m.run([zfill], self.dep_cb)
         self.dep_m.run([self.dep_fb], self.dep_cb)
 
         # wait for vision model to run embeddings on.
@@ -240,6 +250,7 @@ class HailoRun():
             rets.append(Target(t_id, track.score, BoundingBox(track.last_bbox_tlbr)))
         
         depth = self.dep_q.get()
+        self.recover_depth(frame, depth)
 
         return rets, depth, boxes
     
@@ -269,6 +280,87 @@ class HailoRun():
 
     def __del__(self):
         self.close()
+
+
+    def recover_depth(self, frame, dep_rel_quant) -> np.array:
+        """
+        returns depth_abs recovered from laser point
+        """
+        ### dequantize and apply hailo's post process
+        qi = self.dep_m.infer_model.outputs[0].quant_infos[0]
+        dep_rel = (dep_rel_quant.astype(np.float32) - qi.qp_zp) * qi.qp_scale
+        dep_rel = 1 / (1 + np.exp(-dep_rel))
+        dep_rel = 1.0 / (dep_rel * 10.0 + 0.009)
+        # normalize
+        dep_rel = cv2.normalize(dep_rel, None, 0, 255, cv2.NORM_MINMAX)
+
+        laser_roi = frame[S.laser_roi_y1:S.laser_roi_y2, S.laser_roi_x1:S.laser_roi_x2]
+        laser_roi_b = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2GRAY)
+        laser_roi_b = cv2.GaussianBlur(laser_roi_b, (3, 3), 0)
+        laser_roi_hsv = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2HSV)
+        # h, s, v = cv2.split(laser_roi_hsv)
+
+        edges = cv2.Canny(laser_roi_b, S.laser_canny_lower_threshold, S.laser_canny_high_threshold)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        frame_vis = frame.copy()
+        
+        for cnt in contours:
+            #skip big contours
+            if cv2.contourArea(cnt) > 80:
+                continue
+            _m = cv2.moments(cnt)
+            if _m['m00'] == 0:
+                continue
+
+            peri = cv2.arcLength(cnt, True)
+            area = cv2.contourArea(cnt)
+            circularity = 4 * np.pi * (area / (peri * peri))
+            if circularity < S.laser_circularity_threshold:  # adjustable
+                continue
+            (_x, _y), r = cv2.minEnclosingCircle(cnt)
+
+            cx_crop = _m['m10'] / _m['m00']
+            cy_crop = _m['m01'] / _m['m00']
+            ax, ay = S.laser_roi_x1 + int(cx_crop), S.laser_roi_y1 + int(cy_crop)
+            dx, dy = int(ax * self.vis_to_dep_ratio[1]), int(ay * self.vis_to_dep_ratio[0])
+            dx = np.clip(dx, 0, self.dm_shape[1] - 1)
+            dy = np.clip(dy, 0, self.dm_shape[0] - 1)
+
+            cv2.circle(frame_vis, (ax, ay), 9, (0, 255, 255), 1)
+            # cv2.imshow('vis', frame_vis) imshows left for later debugging
+            # cv2.imshow('h', h)
+            # cv2.imshow('s', s)
+            # cv2.imshow('v', v)
+            red_mask = cv2.inRange(laser_roi_hsv, S.red_mll, S.red_mlu)
+            red_mask |= cv2.inRange(laser_roi_hsv, S.red_mul, S.red_muu)
+            red_mask = cv2.dilate(red_mask, np.ones((3, 3), np.uint8), 1)
+            # cv2.imshow('rm', red_mask)
+            laser_dotm = np.zeros_like(laser_roi_b)
+            cv2.circle(laser_dotm, (int(cx_crop), int(cy_crop)), int(r) + 3, 255, -1)
+            # cv2.imshow('laser_dotm', laser_dotm)
+            laser_dotm = cv2.bitwise_and(red_mask, laser_dotm)
+            # cv2.imshow('bwa', laser_dotm)
+            # cv2.waitKey(999999)
+            if cv2.countNonZero(laser_dotm) <= 0:
+                continue
+
+            laser_abs_depth = float(S.laser_rbf(cx_crop, cy_crop))
+            # _a, _b, _c = S.laser_coeffs
+            # laser_abs_depth = _a * cx_crop + _b * cy_crop + _c
+            # pick and average nearby values 
+            patch = dep_rel[max(0, dy - 1):dy + 2, max(0, dx - 1):dx + 2]
+            laser_rel_depth = np.mean(patch)
+            
+            self.dm_scale = laser_abs_depth / laser_rel_depth
+            break
+
+        if self.dm_scale:
+            return dep_rel * self.dm_scale
+        else:
+            return dep_rel
+        
 
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:
