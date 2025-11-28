@@ -1,5 +1,8 @@
-from dataclasses import dataclass
-import json
+from dataclasses import dataclass, field
+from scipy.interpolate import Rbf
+
+
+import numpy as np
 """
 Usage:
 from settings import settings [as S]
@@ -27,6 +30,27 @@ class Settings:
     """max number of threads to run embedding on"""
     min_emb_cropsize: int = 200
     """minimum crop size to run embedding on"""
+
+    laser_canny_lower_threshold: int = 50
+    laser_canny_high_threshold: int = 90
+    laser_roi_x1: int = 120
+    laser_roi_x2: int = 250
+    laser_roi_y1: int = 490
+    laser_roi_y2: int = 550
+    laser_circularity_threshold: float = 0.7
+    """1.0: perfect circle"""       
+    laser_x_pixels: np.ndarray = field(default_factory=lambda: np.array([84, 62.0, 48.0, 43, 41, 39.5]))
+    laser_y_pixels: np.ndarray = field(default_factory=lambda: np.array([43, 31, 21.7, 20, 18.2, 17]))
+    laser_distances: np.ndarray = field(default_factory=lambda: np.array([30, 60, 120, 180, 240, 300]))
+    laser_rbf: Rbf = field(init=False)
+
+    # Precompute linear model coefficients
+    _laser_dat: np.ndarray = field(init=False)
+    laser_coeffs: np.ndarray = field(init=False)
+    red_mll: np.ndarray = field(default_factory= lambda: np.array(np.array([0, 0, 50])))
+    red_mlu: np.ndarray = field(default_factory= lambda: np.array(np.array([15, 255, 255])))
+    red_mul: np.ndarray = field(default_factory= lambda: np.array(np.array([168, 0, 50])))
+    red_muu: np.ndarray = field(default_factory= lambda: np.array(np.array([180, 255, 255])))
 
 
     ###WIP
@@ -57,23 +81,11 @@ class Settings:
     # tello_ws_stream_on_off_timeout: int = 3
     """time in seconds to wait for streamon/streamoff command"""
 
-    def __post_init__(self): #
-        try:
-            with open('config.json') as f:
-                sjson:dict = json.load(f)
-                for k, v in sjson.items():
-                    if k.startswith('_'):
-                        continue
-                    if hasattr(self, k):
-                        setattr(self, k, v)
-                    else:
-                        print(f'Unknown config key {k} with value {v} was ignored.')
-        except FileNotFoundError:
-            print('failed to load config.json, using defaults!')
-        except json.JSONDecodeError:
-            print('failed to convert config.json to json. Using defaults!')
-        self._emb_out_size: int = 2048 if '2048' in self.embed_model else 512 
-        self.min_emb_confidence: float = self.min_vis_score_threshold
+
+    def __post_init__(self):
+        self.laser_rbf = Rbf(self.laser_x_pixels, self.laser_y_pixels, self.laser_distances, function='multiquadric')
+    #     self._laser_dat = np.column_stack([self.laser_x_pixels, self.laser_y_pixels, np.ones(len(self.laser_x_pixels))])
+    #     self.laser_coeffs = np.linalg.lstsq(self._laser_dat, self.laser_distances, rcond=None)[0]
 
 settings = Settings()
 
