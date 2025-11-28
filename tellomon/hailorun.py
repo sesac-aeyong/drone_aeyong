@@ -137,6 +137,9 @@ class HailoRun():
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
+        if frame.shape[0] != S.frame_height or frame.shape[1] != S.frame_width:
+            # print('[HailoRun] Skipping wrong inputs')
+            return [], np.zeros((self.dm_shape[0], self.dm_shape[1], 1)), []
         # prepare and run vis and dep models
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
