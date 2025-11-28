@@ -117,9 +117,18 @@ class TelloWebServer:
         # 웹으로 전송 (큐에 추가)
         try:
             if self.log_queue.full():
+<<<<<<< HEAD
                 self.log_queue.get()
             self.log_queue.put(log_entry)
         except:
+=======
+                try:
+                    self.log_queue.get_nowait()  # 오래된 로그 제거
+                except queue.Empty:
+                    pass
+            self.log_queue.put_nowait(log_entry)
+        except queue.Full:
+>>>>>>> 6f7d7addf20f2a4adda012710f750907a693c3aa
             pass
 
     def start_log_broadcaster(self):
@@ -1037,13 +1046,27 @@ class TelloWebServer:
         """드론 명령 실행"""
         if not self.is_connected or not self.tello:
             return {'success': False, 'message': 'Not connected to Tello'}
+<<<<<<< HEAD
+=======
+        
+        manual_commands = ['up', 'down', 'left', 'right', 'forward', 'back', 'cw', 'ccw']
+        if self.is_tracking and command in manual_commands:
+            return {'success': False, 'message': 'Manual control disabled during tracking. Stop tracking first.'}
+>>>>>>> 6f7d7addf20f2a4adda012710f750907a693c3aa
 
         try:
             if command == 'takeoff':
                 self.log("INFO", "🚁 Taking off...")
                 self.tello.takeoff()
+<<<<<<< HEAD
                 time.sleep(3)
                 self.log("SUCCESS", "Takeoff successful")
+=======
+                self.last_takeoff_time = time.time()  # 이륙 시간 기록
+                self.log("SUCCESS", f"Takeoff successful - stabilizing for {self.takeoff_stabilization_time}s")
+                
+                time.sleep(self.takeoff_stabilization_time)
+>>>>>>> 6f7d7addf20f2a4adda012710f750907a693c3aa
                 return {'success': True, 'message': 'Takeoff successful'}
 
             elif command == 'land':
