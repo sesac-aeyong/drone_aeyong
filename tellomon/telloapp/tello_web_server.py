@@ -20,7 +20,6 @@ class TelloWebServer:
         self.is_connected = False
         self.current_frame = None
         self.current_frame_updated = False
-        #self.current_depth_map = None
         self.current_detections = []
         self.target_class = None
         self.target_identity_id = None
@@ -29,18 +28,14 @@ class TelloWebServer:
         self.battery = 0
         self.height = 0
         self.lock = threading.Lock()
-        #self.frame_center = (480, 360)
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
         self.takeoff_stabilization_time = 3.0  # 이륙 후 3초간 대기
 
         # RC 명령 설정
-        #self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
-        #self.rc_speed = 40
         self.tracking_rc_speed = 30
-        #self.rc_command_duration = 0.4
         
         # 웹 로그 시스템
         self.log_queue = queue.Queue(maxsize=100)  # 최대 100개 로그 저장
@@ -61,6 +56,14 @@ class TelloWebServer:
         self._escape_mode       = None   # None | 'UP' | 'HOLD' | 'DOWN'
         self._escape_origin_alt = None   # 회피 시작 시 고도(cm)
         self._escape_t0         = None   # 모드 시작 시각(time.time())
+        
+        # --- undistort state ---
+        self._ud_size = None  # (w, h)
+        self._ud_map1 = None
+        self._ud_map2 = None
+        self._crop_roi = None  # (x1, y1, x2, y2)
+        self._ud_initialized = False
+        self.show_calib_debug = getattr(S, "SHOW_CALIB_DEBUG", True)
 
         # 추론 엔진 초기화
         self.log("INFO", "Loading inference engine...")
@@ -205,6 +208,61 @@ class TelloWebServer:
     
 # === Add/Replace inside class TelloWebServer =================================
 
+    # === performance constants (class-level) =================================
+    # 제어 루프/필터 상수: 매 프레임 재할당 방지
+    LOOP_HZ                = 30.0
+    DT                     = 1.0 / LOOP_HZ
+    EMA_ALPHA_ERR          = 0.35
+    EMA_ALPHA_VEL          = 0.50
+    EMA_ALPHA_SIZE         = 0.30
+    EMA_ALPHA_RATIO        = 0.40
+
+    YAW_DEADBAND           = 0.06
+    LR_DEADBAND            = 0.02
+    UD_DEADBAND            = 0.02
+    SIZE_DEADBAND          = 0.02
+
+    K_YAW                  = 130.0
+    K_LR                   = 100.0
+    K_UD                   = 110.0
+    K_FB_P                 = 250.0
+    K_FB_I                 = 25.0
+
+    SLEW_RC_STEP           = 18
+    COAST_DECAY            = 0.85
+    COAST_MAX_TIME         = 1.0
+
+    TARGET_RATIO           = 0.40
+    NEAR_RATIO             = 0.35
+    PUSHBACK_RATIO         = 0.45
+    HARD_STOP_RATIO        = 0.50
+    SAFE_FB_FWD_CAP        = 20
+    SAFE_FB_BWD_CAP        = 20
+    FB_ACCEL_STEP_FWD      = 8
+    FB_ACCEL_STEP_BWD      = 12
+
+    EDGE_FRAC              = 0.06
+    EDGE_BOOST             = 0.6
+
+    SEARCH_YAW_SPEED       = 40
+    SEARCH_UD_SPEED        = 28
+    SEARCH_FB_SPEED        = 0
+
+    OCCLUDED_GRACE_S       = 3.0
+    OCC_FWD_MAX_S          = 2.5
+    OCC_CENTER_BAND        = 0.25
+    RATIO_GOAL_OCCLUDED    = 0.30
+    SWEEP_HALF_PERIOD_S    = 1.2
+
+    MIN_BATT               = 10
+    
+    RAPID_ENLARGE_WARN     = 0.25   # ratio가 초당 이 값 이상 증가하면 전진 금지
+    RAPID_ENLARGE_PANIC    = 0.35   # 이 값 이상이면 즉시 소폭 후퇴
+    
+    UNDISTORT_ALPHA = getattr(S, "UNDISTORT_ALPHA", 1.0)  # 1.0=FOV 최대(테두리 O), 0.0=자동 크롭(테두리 X)
+    DEPTH_USE_CROP  = getattr(S, "DEPTH_USE_CROP", True)  # depth에는 crop 적용
+    DEPTH_IN_SIZE   = getattr(S, "DEPTH_IN_SIZE", (384, 256))  # (W,H) scdepth 등 입력
+
     # ---------------------------
     # Helpers for smooth control
     # ---------------------------
@@ -217,30 +275,146 @@ class TelloWebServer:
 
     def _ema(self, name, value, alpha):
         """self._ema_state[name]에 EMA 저장"""
-        if not hasattr(self, "_ema_state"):
-            self._ema_state = {}
-        if name not in self._ema_state:
-            self._ema_state[name] = value
-        self._ema_state[name] = (1 - alpha) * self._ema_state[name] + alpha * value
-        return self._ema_state[name]
+        s = self._ema_state
+        prev = s.get(name, value)
+        s[name] = (1 - alpha) * prev + alpha * value
+        return s[name]
+
+    def _get_altitude_cm(self):
+        # 지상 튜닝 모드면 가상 고도
+        if self.ground_tune_mode and not self._airborne:
+            return float(self.virtual_height_cm)
+        try:
+            h = self.tello.get_distance_tof()
+            if isinstance(h, (int, float)) and 0 < h < 1000:
+                return float(h)
+        except:
+            pass
+        return None
+
+    def _enforce_altitude_limits(self, ud_cmd):
+        h_cm = self._get_altitude_cm()
+        if h_cm is None:
+            return int(np.clip(ud_cmd, -10, +10))
+        # ceiling hard
+        if h_cm >= self.alt_max_cm:
+            return min(0, -10)
+        # ceiling soft
+        if h_cm >= self.alt_max_cm - self.alt_guard_cm and ud_cmd > 0:
+            ud_cmd = 0
+        # floor hard
+        if h_cm <= self.alt_min_cm:
+            return max(ud_cmd, +10)
+        # floor soft
+        if h_cm <= self.alt_min_cm + self.alt_guard_cm and ud_cmd < 0:
+            ud_cmd = 0
+        return ud_cmd
+
+    def _apply_slew_and_send(self, yaw_cmd, lr_cmd, ud_cmd, fb_cmd):
+        self._cmd_yaw = int(self._slew(self._cmd_yaw, yaw_cmd, self.SLEW_RC_STEP))
+        self._cmd_lr  = int(self._slew(self._cmd_lr,  lr_cmd,  self.SLEW_RC_STEP))
+        self._cmd_ud  = int(self._slew(self._cmd_ud,  ud_cmd,  self.SLEW_RC_STEP))
+        self._cmd_fb  = int(self._slew(self._cmd_fb,  fb_cmd,  self.SLEW_RC_STEP))
+        if self.use_rc_for_tracking:
+            self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
+
+    def _select_best_thief_detection(self, detections):
+        # thief_dist <= thief_cos_dist (gate) 이면서 최소값
+        best = None
+        best_td = 1e9
+        for d in detections:
+            get = d.get if isinstance(d, dict) else (lambda k, default=None: getattr(d, k, default))
+            td = get("thief_dist"); gate = get("thief_cos_dist")
+            if td is None or gate is None or td > gate: 
+                continue
+            if td < best_td:
+                best = d; best_td = td
+        return best
+
+    def _throttle(self, name, interval_s):
+        now = time.time()
+        tmap = getattr(self, "_throttle_map", None)
+        if tmap is None:
+            self._throttle_map = {}
+            tmap = self._throttle_map
+        last = tmap.get(name, 0.0)
+        if now - last >= interval_s:
+            tmap[name] = now
+            return True
+        return False
 
     def _init_tracker_state(self):
         """트래킹 상태 변수 초기화"""
-        self._cmd_lr = 0
-        self._cmd_fb = 0
-        self._cmd_ud = 0
-        self._cmd_yaw = 0
+        self._cmd_lr = self._cmd_fb = self._cmd_ud = self._cmd_yaw = 0
         self._last_bbox = None
         self._last_seen_t = None
         self._lost_since_t = None
-        self._ema_state = {}
-        self._integral_fb = 0.0     # 거리(I) 성분 약간
-        self._integral_clip = 50.0  # 바람/기체 바이어스 보정용
-        # >>> ADD: occlusion strategy
-        self._lost_strategy = None   # None | 'FWD' | 'SWEEP'
+        self._integral_fb = 0.0
+        self._integral_clip = 50.0
+        self._lost_strategy = None
         self._lost_t0 = None
-        self._last_ratio = None      # 마지막 관측 ratio 저장
-        self._last_center_norm = None # 마지막 관측 중심 (cx/W, cy/H)
+        self._last_ratio = None
+        self._last_center_norm = None
+        self._ema_state = {}
+        self.ground_tune_mode = getattr(S, "GROUND_TUNE_MODE", False)
+        self.virtual_height_cm = getattr(S, "VIRTUAL_HEIGHT_CM", 80)
+        self._airborne = False
+        
+    def _init_undistort_if_needed(self, frame_shape_hw):
+        """첫 유효 프레임 크기(H,W)로 remap 맵과 5% 크롭 ROI를 1회 준비"""
+        if self._ud_initialized:
+            return
+        h, w = frame_shape_hw
+        if w < 640 or h < 360:
+            return
+        img_size = (w, h)
+
+        # ⚙️ alpha를 설정 가능하게: 표시/탐지는 alpha=1.0(=FOV 보존), depth는 validROI 사용
+        newK, validROI = cv2.getOptimalNewCameraMatrix(
+            S.CAMERA_MATRIX, S.DIST_COEFFS, img_size,
+            self.UNDISTORT_ALPHA, img_size, centerPrincipalPoint=True
+        )
+        self._ud_map1, self._ud_map2 = cv2.initUndistortRectifyMap(
+            S.CAMERA_MATRIX, S.DIST_COEFFS, None, newK, img_size, cv2.CV_32FC1
+        )
+
+        # 표시/탐지용 기본 ROI는 전체 —> depth 전용 ROI로 validROI 따로 보관
+        self._crop_roi = (0, 0, w, h)
+        # validROI는 (x, y, w, h) 형태
+        self._valid_roi_xywh = validROI  # depth 전용으로 사용 예정
+
+        self._ud_initialized = True
+        self._ud_size = (w, h)
+        self.log("INFO", f"[CALIB] UD ready → proc {w}x{h}, validROI={validROI}, alpha={self.UNDISTORT_ALPHA}")
+
+    def _undistort_and_crop(self, bgr_frame):
+        """미리 계산된 맵으로 빠르게 보정 (크롭 없음, 검은 테두리 허용)"""
+        undist = cv2.remap(
+            bgr_frame, self._ud_map1, self._ud_map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,  # 검은 테두리
+            borderValue=(0, 0, 0)
+        )
+        # 전체 ROI (0,0,w,h)라 slicing 영향 없음
+        return undist
+
+    def _make_depth_input(self, undistorted_bgr):
+        """
+        depth 전용 입력 프레임 생성:
+        - DEPTH_USE_CROP=True면 validROI로 잘라 검은 테두리 제거
+        - DEPTH_IN_SIZE로 리사이즈 (W,H)
+        """
+        src = undistorted_bgr
+        if self.DEPTH_USE_CROP and hasattr(self, "_valid_roi_xywh") and self._valid_roi_xywh is not None:
+            x, y, w, h = self._valid_roi_xywh
+            # validROI가 너무 작거나 비정상일 때 안전장치
+            if w > 0 and h > 0 and (x+w) <= src.shape[1] and (y+h) <= src.shape[0]:
+                src = src[y:y+h, x:x+w]
+
+        W, H = self.DEPTH_IN_SIZE
+        if (src.shape[1], src.shape[0]) != (W, H):
+            src = cv2.resize(src, (W, H), interpolation=cv2.INTER_AREA)
+        return src
 
     # -------------------------------------------------------------------------
     # New tracking thread (drop-in replacement)
@@ -252,507 +426,222 @@ class TelloWebServer:
         - 입력: self.target_bbox = [x1,y1,x2,y2] (픽셀)
         - 출력: send_rc_control(lr, fb, ud, yaw)
         """
-
-        # ====== 제어 파라미터 (필요시 조절) ===================================
-        LOOP_HZ                = 30.0
-        DT                     = 1.0 / LOOP_HZ
-        EMA_ALPHA_ERR          = 0.35    # 오차 EMA
-        EMA_ALPHA_VEL          = 0.50    # 속도 EMA
-        EMA_ALPHA_SIZE         = 0.30
-
-        # Deadbands & 게인
-        YAW_DEADBAND           = 0.06     # x정규오차 6% 이하면 yaw 안함
-        LR_DEADBAND            = 0.02
-        UD_DEADBAND            = 0.02
-        SIZE_DEADBAND          = 0.02     # log-area 오차
-
-        K_YAW                  = 130.0    # yaw 스케일 (deg/s 환산 없이 RC 단위)
-        K_LR                   = 100.0
-        K_UD                   = 110.0
-        K_FB_P                 = 300.0    # 거리 P
-        K_FB_I                 =  25.0    # 거리 I(소량만)
-
-        # 속도/명령 제한
-        MAX_RC                 = int(self.tracking_rc_speed)  # 기존 설정 사용
-        SLEW_RC_STEP           = 18        # 루프당 최대 변화 (부드러움)
-        COAST_DECAY            = 0.85      # 타겟 상실 시 점감
-        COAST_MAX_TIME         = 1.0       # 최대 coast 유지 시간(s)
-
-        # 목표 크기(프레임 면적 대비 비율)
-        TARGET_RATIO           = 0.28      # 28% 정도 화면 차지하도록
-        
-        # SAFETY 파라미터
-        NEAR_RATIO             = 0.35   # 이 이상은 근거리: 전진 금지(또는 후퇴만 허용)
-        PUSHBACK_RATIO         = 0.45   # 강한 근접: 전진 금지 + 약한 후퇴
-        HARD_STOP_RATIO        = 0.50   # 절대 상한: 즉시 후퇴(면적 50% 초과 금지)
-        SAFE_FB_FWD_CAP        = 20     # 전진 soft cap
-        SAFE_FB_BWD_CAP        = 20     # 후퇴 soft cap(|-|)
-
-        # 급접근(급확대) 감지: ratio의 시간 미분 임계값(초당 면적비 변화)
-        EMA_ALPHA_RATIO        = 0.40
-        RAPID_ENLARGE_WARN     = 0.25   # 이 이상(+/s)이면 전진 금지
-        RAPID_ENLARGE_PANIC    = 0.35   # 이 이상(+/s)이면 소폭 후퇴
-
-        # 전진 가속도 제한: 루프당 전진 목표 증가량 제한(추가 안전)
-        FB_ACCEL_STEP_FWD      = 8      # +방향(전진) 증분 제한
-        FB_ACCEL_STEP_BWD      = 12     # -방향(후퇴) 증분 제한
-        
-        # 프레임 경계 근접 힌트
-        EDGE_FRAC              = 0.06      # 가장자리 6%를 '위험영역'으로 판단
-        EDGE_BOOST             = 0.6       # 경계 근접 시 해당 축 추가 가중
-
-        # 재탐색(Search) 파라미터
-        SEARCH_YAW_SPEED       = 40        # 분실 시 회전 기본속도
-        SEARCH_UD_SPEED        = 28
-        SEARCH_FB_SPEED        = 0         # 분실 시 전후는 보수적으로 0
-
-        # 안전/기타
-        MIN_BATT               = 10        # 10% 이하면 즉시 정지
-        STABILIZE_AFTER_TAKEOFF= self.takeoff_stabilization_time
-
-        # >>> ADD: Occlusion-forward strategy params
-        OCCLUDED_GRACE_S       = 3.0   # 3초 이상 끊기면 '가림'으로 가정
-        OCC_FWD_MAX_S          = 2.5   # 전진 시도 최대 시간
-        OCC_FWD_SPEED          = min(MAX_RC, 18)  # 전진 속도 캡
-        OCC_CENTER_BAND        = 0.25  # 마지막 중심이 화면 중앙 ±25% 안이면 '프레임 내 가림'으로 추정
-        RATIO_GOAL_OCCLUDED    = 0.30  # 재관측 시 이 이상이면 충분히 붙었다고 판단
-        SWEEP_HALF_PERIOD_S    = 1.2   # 좌/우 반주기(초)로 지그재그 회전 탐색
-        
-        # ======================================================================
         self.log("INFO", "🎯 IBVS tracking thread started")
         self._init_tracker_state()
 
-        # 이륙 안정화 대기 (버퍼)
+        # 이륙 안정화
         if self.last_takeoff_time is not None:
-            while True:
-                dt_take = time.time() - self.last_takeoff_time
-                if dt_take >= STABILIZE_AFTER_TAKEOFF:
-                    break
-                self.tello.send_rc_control(0, 0, 0, 0)
-                self.log("INFO", f"⏳ Stabilizing... {STABILIZE_AFTER_TAKEOFF - dt_take:.1f}s")
-                time.sleep(0.1)
+            while time.time() - self.last_takeoff_time < self.takeoff_stabilization_time:
+                self.tello.send_rc_control(0,0,0,0); time.sleep(0.1)
             self.last_takeoff_time = None
             self.log("SUCCESS", "✅ Stabilization complete - starting IBVS tracking")
 
         while self.is_tracking:
-            loop_start = time.time()
+            t0 = time.time()
             try:
-                # ===== 안전 가드 =====
-                try:
-                    if self.tello and isinstance(self.battery, (int, float)) and self.battery <= MIN_BATT:
-                        self.log("WARNING", "🔋 Critically low battery - halting RC")
-                        self.tello.send_rc_control(0, 0, 0, 0)
-                        time.sleep(0.5)
-                        continue
-                except Exception:
-                    pass
+                # 배터리 가드(스로틀 無: 프레임 임계)
+                if self.tello and isinstance(self.battery, (int,float)) and self.battery <= self.MIN_BATT:
+                    self.tello.send_rc_control(0,0,0,0); time.sleep(0.2); continue
 
-                bbox = None
                 with self.lock:
                     bbox = self.target_bbox
-                    frm = self.current_frame
+                    frm  = self.current_frame
 
                 if frm is None:
-                    time.sleep(DT)
-                    continue
+                    time.sleep(self.DT); continue
 
-                h, w = frm.shape[:2]
-                cx, cy = w * 0.5, h * 0.5
+                H,W = frm.shape[:2]; cx, cy = 0.5*W, 0.5*H
 
                 if bbox is not None:
-                    # ------------------ 타겟 관측 유효 -------------------------
-                    x1, y1, x2, y2 = bbox
-                    bx = (x1 + x2) * 0.5
-                    by = (y1 + y2) * 0.5
-                    bw = max(1, x2 - x1)
-                    bh = max(1, y2 - y1)
-                    area = bw * bh
-                    ratio = area / float(w * h)
+                    # --- 관측 유효 ---
+                    x1,y1,x2,y2 = bbox
+                    bx,by = 0.5*(x1+x2), 0.5*(y1+y2)
+                    bw,bh = max(1,x2-x1), max(1,y2-y1)
+                    ratio  = (bw*bh)/(W*H)
 
-                    # 정규 오차(화면 대비)
-                    ex = (bx - cx) / w      # -0.5 ~ 0.5
-                    ey = (by - cy) / h
-                    # log-area 오차: TARGET_RATIO를 기준으로 곱배 변화에 민감
-                    e_size_raw = np.log(max(1e-6, ratio) / max(1e-6, TARGET_RATIO))
+                    ex = (bx - cx)/W
+                    ey = (by - cy)/H
+                    es = np.log(max(1e-6,self.TARGET_RATIO)/max(1e-6,ratio))
 
-                    # EMA로 노이즈 완화
-                    ex_f   = self._ema("ex",   ex,   EMA_ALPHA_ERR)
-                    ey_f   = self._ema("ey",   ey,   EMA_ALPHA_ERR)
-                    es_f   = self._ema("esz",  e_size_raw, EMA_ALPHA_SIZE)
+                    ex_f = self._ema("ex", ex, self.EMA_ALPHA_ERR)
+                    ey_f = self._ema("ey", ey, self.EMA_ALPHA_ERR)
+                    es_f = self._ema("esz", es, self.EMA_ALPHA_SIZE)
 
-                    # 속도 추정(프레임 속 좌표 변화율)
                     if self._last_bbox is not None and self._last_seen_t is not None:
-                        dtv = max(1e-3, loop_start - self._last_seen_t)
-                        last_cx = (self._last_bbox[0] + self._last_bbox[2]) * 0.5
-                        last_cy = (self._last_bbox[1] + self._last_bbox[3]) * 0.5
-                        vx = ((bx - last_cx) / w) / dtv
-                        vy = ((by - last_cy) / h) / dtv
+                        dtv = max(1e-3, t0 - self._last_seen_t)
+                        last_cx = 0.5*(self._last_bbox[0]+self._last_bbox[2])
+                        last_cy = 0.5*(self._last_bbox[1]+self._last_bbox[3])
+                        vx = ((bx-last_cx)/W)/dtv; vy = ((by-last_cy)/H)/dtv
                     else:
-                        vx = vy = 0.0
-                    vx_f = self._ema("vx", vx, EMA_ALPHA_VEL)
-                    vy_f = self._ema("vy", vy, EMA_ALPHA_VEL)
+                        vx=vy=0.0
+                    vx_f = self._ema("vx", vx, self.EMA_ALPHA_VEL)
+                    vy_f = self._ema("vy", vy, self.EMA_ALPHA_VEL)
 
-                    # 프레임 가장자리 근접 가중 (이탈 방지용)
-                    edge_x = 0.0
-                    edge_y = 0.0
-                    if bx < w * EDGE_FRAC:        edge_x = -EDGE_BOOST
-                    elif bx > w * (1 - EDGE_FRAC):edge_x =  EDGE_BOOST
-                    if by < h * EDGE_FRAC:        edge_y = -EDGE_BOOST
-                    elif by > h * (1 - EDGE_FRAC):edge_y =  EDGE_BOOST
+                    edge_x = (-self.EDGE_BOOST if bx < W*self.EDGE_FRAC else
+                            self.EDGE_BOOST  if bx > W*(1-self.EDGE_FRAC) else 0.0)
+                    edge_y = (-self.EDGE_BOOST if by < H*self.EDGE_FRAC else
+                            self.EDGE_BOOST  if by > H*(1-self.EDGE_FRAC) else 0.0)
 
-                    # ----------- 제어 로직 (IBVS) -----------------------------
-                    # yaw: 좌우 큰 오차일수록 yaw 우선 -> 잔여 오차는 LR로 병행
-                    if abs(ex_f) > YAW_DEADBAND:
-                        yaw_cmd = int(np.clip(K_YAW * ex_f, -MAX_RC, MAX_RC))
-                        lr_cmd  = 0
+                    # yaw/lr
+                    if abs(ex_f) > self.YAW_DEADBAND:
+                        yaw_cmd = int(np.clip(self.K_YAW*ex_f, -self.tracking_rc_speed, self.tracking_rc_speed)); lr_cmd=0
                     else:
                         yaw_cmd = 0
-                        lr_cmd  = int(np.clip(K_LR * (ex_f + 0.35 * vx_f + edge_x), -MAX_RC, MAX_RC))
-                        if abs(lr_cmd) < int(MAX_RC * 0.1):
-                            lr_cmd = 0
+                        lr_cmd  = int(np.clip(self.K_LR*(ex_f + 0.35*vx_f + edge_x), -self.tracking_rc_speed, self.tracking_rc_speed))
+                        if abs(lr_cmd) < int(self.tracking_rc_speed*0.1): lr_cmd = 0
 
-                    # ud: 세로 오차 + 경계 근접 + 약간의 속도 선행
-                    if abs(ey_f) > UD_DEADBAND:
-                        ud_cmd = int(np.clip(-K_UD * (ey_f + 0.25 * vy_f + edge_y), -MAX_RC, MAX_RC))
-                    else:
-                        ud_cmd = 0
+                    # ud (alt limit 적용은 나중에)
+                    ud_cmd = int(np.clip(-self.K_UD*(ey_f + 0.25*vy_f + edge_y), -self.tracking_rc_speed, self.tracking_rc_speed)) \
+                            if abs(ey_f) > self.UD_DEADBAND else 0
 
-                    # ----- ALTITUDE LIMITS (ceiling/floor clamp) -----
-                    h_cm = None
-                    try:
-                        # TOF는 간헐적으로 -1/0이 나올 수 있으니 유효성 검사
-                        if isinstance(self.height, (int, float)) and self.height > 0:
-                            h_cm = float(self.height)
-                    except:
-                        h_cm = None
-
-                    if h_cm is not None:
-                        # 1) 절대 천장: alt_max_cm 초과 시 무조건 하강 방향(양의 ud는 금지)
-                        if h_cm >= self.alt_max_cm:
-                            if ud_cmd > 0: ud_cmd = 0
-                            ud_cmd = min(ud_cmd, -10)  # 살짝이라도 내려오게
-                            self.log("WARNING", f"[ALT] HARD_CEILING h={h_cm:.0f}cm → ud={ud_cmd}")
-
-                        # 2) 천장 근접 소프트 밴드: 더 올라가지 못하게(상승 금지)
-                        elif h_cm >= self.alt_max_cm - self.alt_guard_cm:
-                            if ud_cmd > 0: ud_cmd = 0  # 상승 차단
-                            # 필요시 천장 근접시 FB도 살짝 캡: 대각상향 추세 억제
-                            # self._cmd_fb = min(self._cmd_fb, SAFE_FB_FWD_CAP // 2)
-
-                        # 3) 절대 바닥: alt_min_cm 이하이면 반드시 상승 방향(음의 ud 금지)
-                        if h_cm <= self.alt_min_cm:
-                            if ud_cmd < 0: ud_cmd = 0
-                            ud_cmd = max(ud_cmd, +10)
-                            self.log("WARNING", f"[ALT] HARD_FLOOR h={h_cm:.0f}cm → ud={ud_cmd}")
-
-                        # 4) 바닥 근접 소프트 밴드: 더 내려가지 못하게(하강 금지)
-                        elif h_cm <= self.alt_min_cm + self.alt_guard_cm:
-                            if ud_cmd < 0: ud_cmd = 0  # 하강 차단
-                    else:
-                        # TOF 불가 시 보수적으로: 과한 상승/하강 제한(실내 안전)
-                        ud_cmd = int(np.clip(ud_cmd, -10, +10))
-
-                    # fb: 거리(log-area) P + I. (n배 멀어지면 n배 전진 느낌)
-                    if abs(es_f) > SIZE_DEADBAND:
-                        self._integral_fb += es_f * DT * K_FB_I
-                        self._integral_fb = float(np.clip(self._integral_fb, -self._integral_clip, self._integral_clip))
-                        fb_raw = K_FB_P * es_f + self._integral_fb
-                        fb_cmd = int(np.clip(fb_raw, -MAX_RC, MAX_RC))
-                        if fb_cmd < 0:
-                            fb_cmd = int(0.4 * fb_cmd)  # 후퇴는 보수적으로
+                    # fb (PI)
+                    if abs(es_f) > self.SIZE_DEADBAND:
+                        self._integral_fb = float(np.clip(self._integral_fb + es_f*self.DT*self.K_FB_I,
+                                                        -self._integral_clip, self._integral_clip))
+                        fb_cmd = int(np.clip(self.K_FB_P*es_f + self._integral_fb,
+                                            -self.tracking_rc_speed, self.tracking_rc_speed))
+                        if fb_cmd < 0: fb_cmd = int(0.4*fb_cmd)
                     else:
                         self._integral_fb *= 0.98
                         fb_cmd = 0
 
-                    # ---------- 🔒 SAFETY: ratio 변화율(급확대·급축소) 계산 ----------
-                    ratio_f = self._ema("ratio", ratio, EMA_ALPHA_RATIO)
+                    # ratio dynamics
+                    ratio_f = self._ema("ratio", ratio, self.EMA_ALPHA_RATIO)
                     if not hasattr(self, "_ratio_prev"):
-                        self._ratio_prev = ratio_f
-                        self._ratio_prev_t = loop_start
-                    dt_ratio = max(1e-3, loop_start - getattr(self, "_ratio_prev_t", loop_start))
-                    dratio_dt = (ratio_f - getattr(self, "_ratio_prev", ratio_f)) / dt_ratio
-                    self._ratio_prev = ratio_f
-                    self._ratio_prev_t = loop_start
+                        self._ratio_prev, self._ratio_prev_t = ratio_f, t0
+                    dt_r = max(1e-3, t0 - getattr(self, "_ratio_prev_t", t0))
+                    drdt = (ratio_f - getattr(self, "_ratio_prev", ratio_f))/dt_r
+                    self._ratio_prev, self._ratio_prev_t = ratio_f, t0
 
-                    # ---------- 🔒 SAFETY: 근접·상한·급접근 보호 ----------
-                    # >>> ADD: Simple escape trigger (rush or too close)
-                    should_escape = (ratio_f >= PUSHBACK_RATIO) or (dratio_dt >= RAPID_ENLARGE_PANIC)
-                    if (self._escape_mode is None) and should_escape:
-                        # 캡된 목표고도 계산(천장 보호)
+                    # ESCAPE trigger
+                    if (self._escape_mode is None) and (ratio_f >= self.PUSHBACK_RATIO or drdt >= self.RAPID_ENLARGE_PANIC):
                         ceiling_soft = self.alt_max_cm - self.alt_guard_cm
-                        target_alt = min(self.ESCAPE_ALT_CM, ceiling_soft)
-
-                        # 현재 고도 스냅샷
-                        origin = None
+                        self._escape_target_alt = min(self.ESCAPE_ALT_CM, ceiling_soft)
                         try:
-                            if isinstance(self.height, (int, float)) and self.height > 0:
-                                origin = float(self.height)
+                            self._escape_origin_alt = float(self.height) if self.height and self.height > 0 else None
                         except:
-                            pass
+                            self._escape_origin_alt = None
+                        self._escape_mode = 'UP'; self._escape_t0 = time.time()
+                        self.log("WARNING", f"[ESCAPE] Triggered → UP to ~{self._escape_target_alt:.0f} cm")
 
-                        self._escape_origin_alt = origin
-                        self._escape_target_alt = target_alt
-                        self._escape_mode = 'UP'
-                        self._escape_t0 = time.time()
-                        self.log("WARNING", f"[ESCAPE] Triggered → UP to ~{target_alt:.0f} cm (origin={origin})")
-                    
-                    # 1) 절대 상한: 화면 50% 초과 금지 → 즉시 후퇴
-                    if ratio_f >= HARD_STOP_RATIO:
-                        self.log("WARNING", f"[SAFETY] HARD_STOP ratio={ratio_f:.2f} fb -> {fb_cmd}")
-                        if fb_cmd > 0: fb_cmd = 0
-                        fb_cmd = min(fb_cmd, -15)   # 강제 살짝 후퇴
-                        # 근접 시 yaw/lr 우선(전진 금지)
-                        # (yaw/lr 제한은 아래 근거리 규칙에서 처리)
-
-                    # 2) 강한 근접: 45% 이상 → 전진 금지 + 가벼운 후퇴
-                    elif ratio_f >= PUSHBACK_RATIO:
-                        self.log("WARNING", f"[SAFETY] PUSHBACK ratio={ratio_f:.2f} fb -> {fb_cmd}")
-                        if fb_cmd > 0: fb_cmd = 0
-                        fb_cmd = min(fb_cmd, -10)
-
-                    # 3) 근거리 일반: 35% 이상 → 전진 금지(0) 또는 후퇴만 허용
-                    elif ratio_f >= NEAR_RATIO:
-                        if fb_cmd > 0: fb_cmd = 0  # 근거리에서는 전진 금지(충돌 방지)
-
-                    # 4) 급접근 보호: ratio가 빠르게 커짐(양수) → 전진 차단/후퇴
-                    if dratio_dt >= RAPID_ENLARGE_PANIC:
-                        self.log("WARNING", f"[SAFETY] RAPID_ENLARGE_PANIC dr/dt={dratio_dt:.2f} fb -> {fb_cmd}")
-                        # 매우 빠르게 가까워짐 → 즉시 약간 후퇴
+                    # 근접/속증가 보호 + caps
+                    if ratio_f >= self.HARD_STOP_RATIO:
+                        fb_cmd = min(0, -15)
+                    elif ratio_f >= self.PUSHBACK_RATIO:
+                        fb_cmd = min(0, -10)
+                    elif ratio_f >= self.NEAR_RATIO and fb_cmd > 0:
+                        fb_cmd = 0
+                    if drdt >= self.RAPID_ENLARGE_PANIC:
                         fb_cmd = min(fb_cmd, -12)
-                    elif dratio_dt >= RAPID_ENLARGE_WARN:
-                        # 빠르게 가까워짐 → 전진 금지
-                        if fb_cmd > 0: fb_cmd = 0
+                    elif drdt >= self.RAPID_ENLARGE_WARN and fb_cmd > 0:
+                        fb_cmd = 0
 
-                    # 5) 전진/후퇴 소프트 캡
-                    if fb_cmd > 0:
-                        fb_cmd = min(fb_cmd, SAFE_FB_FWD_CAP)
-                    else:
-                        fb_cmd = max(fb_cmd, -SAFE_FB_BWD_CAP)
+                    fb_cmd = min(fb_cmd, self.SAFE_FB_FWD_CAP) if fb_cmd > 0 else max(fb_cmd, -self.SAFE_FB_BWD_CAP)
+                    # accel limit
+                    fb_cmd = (min(self._cmd_fb + self.FB_ACCEL_STEP_FWD, fb_cmd) if fb_cmd > self._cmd_fb
+                            else max(self._cmd_fb - self.FB_ACCEL_STEP_BWD, fb_cmd))
 
-                    # 6) 전진/후퇴 가속도(증분) 제한: 이전 명령 대비 증분 제한
-                    #    (slew에 앞서 fb만 한 번 더 보수적으로 제한)
-                    fb_target = fb_cmd
-                    if fb_target > self._cmd_fb:
-                        # 전진 쪽으로 증가
-                        fb_cmd = min(self._cmd_fb + FB_ACCEL_STEP_FWD, fb_target)
-                    else:
-                        # 후퇴 쪽으로 증가
-                        fb_cmd = max(self._cmd_fb - FB_ACCEL_STEP_BWD, fb_target)
+                    # ALT limits (여기서만 한번)
+                    ud_cmd = self._enforce_altitude_limits(ud_cmd)
 
-                    # ---------- 대각선 추종: yaw와 lr를 상보적으로 병합 ----------
-                    # 큰 ex면 yaw에, 작은 ex면 lr에 더 배분했으므로 그 상태 유지 (근거리에서는 fb가 0 또는 음수라 yaw/lr 중심으로 대각 추종)
-
-                    # >>> ADD: Simple ESCAPE state machine (UP -> HOLD -> DOWN)
+                    # ESCAPE state machine (활성시 IBVS 덮어씀)
                     if self._escape_mode is not None:
-                        esc_lr, esc_fb, esc_ud, esc_yaw = 0, 0, 0, 0  # 정면 고정, 수직만 사용
-
-                        # 현재 고도 읽기
                         h_cm = None
                         try:
-                            if isinstance(self.height, (int, float)) and self.height > 0:
-                                h_cm = float(self.height)
-                        except:
-                            pass
-
-                        mode = self._escape_mode
-                        now  = time.time()
-
-                        if mode == 'UP':
-                            # 목표 고도 근처까지 상승
-                            target = self._escape_target_alt
+                            if isinstance(self.height,(int,float)) and self.height>0: h_cm=float(self.height)
+                        except: pass
+                        esc_lr=esc_fb=esc_yaw=0; esc_ud=0
+                        mode=self._escape_mode; now=time.time()
+                        if mode=='UP':
+                            target=self._escape_target_alt
                             if (h_cm is not None) and (h_cm < target - self.alt_guard_cm):
-                                esc_ud = +min(20, int(self.tracking_rc_speed))  # 부드럽게 상승
+                                esc_ud=+min(20, int(self.tracking_rc_speed))
                             else:
-                                # 고도 도달 → HOLD로 전환
-                                self._escape_mode = 'HOLD'
-                                self._escape_t0   = now
-                                self.log("INFO", f"[ESCAPE] Reached ~{h_cm} cm → HOLD {self.ESCAPE_HOLD_S}s")
-
-                        elif mode == 'HOLD':
-                            # 3초 정지
+                                self._escape_mode='HOLD'; self._escape_t0=now
+                        elif mode=='HOLD':
                             if (now - self._escape_t0) >= self.ESCAPE_HOLD_S:
-                                self._escape_mode = 'DOWN'
-                                self._escape_t0   = now
-                                self.log("INFO", "[ESCAPE] HOLD done → DOWN")
-                            # esc_* 모두 0 (정지 유지)
-
-                        elif mode == 'DOWN':
-                            # 원고도(있으면) 또는 안전 최소고도까지 하강
-                            fallback = self.alt_min_cm + max(40, self.alt_guard_cm)  # 너무 낮게 붙지 않도록
-                            target_down = self._escape_origin_alt if (self._escape_origin_alt is not None) else fallback
-
+                                self._escape_mode='DOWN'; self._escape_t0=now
+                        elif mode=='DOWN':
+                            fallback = self.alt_min_cm + max(40, self.alt_guard_cm)
+                            target_down = self._escape_origin_alt if self._escape_origin_alt is not None else fallback
                             if (h_cm is not None) and (h_cm > target_down + self.alt_guard_cm):
-                                esc_ud = -min(18, int(self.tracking_rc_speed))  # 부드럽게 하강
+                                esc_ud = -min(18, int(self.tracking_rc_speed))
                             else:
-                                # 회피 종료
                                 self._escape_mode = None
-                                self._escape_origin_alt = None
-                                self._escape_target_alt = None
-                                self._escape_t0 = None
-                                self.log("SUCCESS", f"[ESCAPE] Down complete (~{h_cm} cm) → RESUME tracking")
+                                self._escape_origin_alt = self._escape_target_alt = self._escape_t0 = None
+                        self._apply_slew_and_send(esc_yaw, esc_lr, esc_ud, esc_fb)
+                        time.sleep(max(0.0, self.DT - (time.time()-t0))); continue
 
-                        # 명령 적용(회피가 활성화된 동안에는 IBVS를 덮어씀)
-                        self._cmd_lr  = int(self._slew(self._cmd_lr,  esc_lr,  SLEW_RC_STEP))
-                        self._cmd_fb  = int(self._slew(self._cmd_fb,  esc_fb,  SLEW_RC_STEP))
-                        self._cmd_ud  = int(self._slew(self._cmd_ud,  esc_ud,  SLEW_RC_STEP))
-                        self._cmd_yaw = int(self._slew(self._cmd_yaw, esc_yaw, SLEW_RC_STEP))
-                        if self.use_rc_for_tracking:
-                            self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
-                        # 회피 루틴이 이 루프의 RC를 소비했으니, 아래 IBVS 일반 경로는 건너뜀
-                        # (이 줄이 중요)
-                        continue
-
-                    # ---------- Slew-rate limit + 적용 ----------
-                    self._cmd_yaw = int(self._slew(self._cmd_yaw, yaw_cmd, SLEW_RC_STEP))
-                    self._cmd_lr  = int(self._slew(self._cmd_lr,  lr_cmd,  SLEW_RC_STEP))
-                    self._cmd_ud  = int(self._slew(self._cmd_ud,  ud_cmd,  SLEW_RC_STEP))
-                    self._cmd_fb  = int(self._slew(self._cmd_fb,  fb_cmd,  SLEW_RC_STEP))
-
-                    # 전송
-                    if self.use_rc_for_tracking:
-                        self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
+                    # 정상 IBVS 적용
+                    self._apply_slew_and_send(yaw_cmd, lr_cmd, ud_cmd, fb_cmd)
 
                     # 기록
-                    self._last_bbox = bbox
-                    self._last_seen_t = loop_start
-                    self._lost_since_t = None
-
-                    # >>> ADD: keep last hints for occlusion-strategy
-                    self._last_ratio = ratio_f
-                    self._last_center_norm = (bx / w, by / h)
-
-                    # >>> ADD: if we were in occlusion strategy and 이제 충분히 가까워졌다면 전략 해제
-                    if self._lost_strategy is not None and self._last_ratio is not None:
-                        if self._last_ratio >= RATIO_GOAL_OCCLUDED:
-                            self._lost_strategy = None
-                            self._lost_t0 = None
-                            self.log("INFO", "[OCC] Reacquired with sufficient size → resume normal IBVS")
+                    self._last_bbox = bbox; self._last_seen_t = t0; self._lost_since_t = None
+                    self._last_ratio = ratio_f; self._last_center_norm = (bx/W, by/H)
+                    if self._lost_strategy is not None and self._last_ratio is not None and self._last_ratio >= self.RATIO_GOAL_OCCLUDED:
+                        self._lost_strategy = None; self._lost_t0 = None
 
                 else:
-                    # ------------------ 타겟 분실/가림 -------------------------
-                    now = loop_start
+                    # --- 분실/가림 ---
+                    now = t0
                     last_seen_ago = 1e9 if self._last_seen_t is None else (now - self._last_seen_t)
 
-
-                    # >>> ADD: '프레임 내 가림'으로 보이면 먼저 전진해서 30%까지 붙고, 그 후 회전 탐색
-                    # 판단 기준:
-                    #  - 3초 이상 미관측 (OCCLUDED_GRACE_S)
-                    #  - 마지막 중심이 화면 중앙부 (±OCC_CENTER_BAND) 안이었다면 '프레임 내 가림'으로 가정
-                    #  - 배터리/고도 안전은 기존 가드 + 전/후 캡 사용
-                    in_center_band = False
+                    in_center = False
                     if self._last_center_norm is not None:
-                        lx, ly = self._last_center_norm
-                        in_center_band = (abs(lx - 0.5) <= OCC_CENTER_BAND) and (abs(ly - 0.5) <= OCC_CENTER_BAND)
+                        lx,ly = self._last_center_norm
+                        in_center = (abs(lx-0.5)<=self.OCC_CENTER_BAND) and (abs(ly-0.5)<=self.OCC_CENTER_BAND)
+                    last_small = (self._last_ratio is None) or (self._last_ratio < self.RATIO_GOAL_OCCLUDED)
 
-                    # 마지막 ratio 힌트가 있고, 이미 충분히 컸던 상황이라면 FWD 생략(근접 돌진 방지)
-                    last_small_enough = (self._last_ratio is None) or (self._last_ratio < RATIO_GOAL_OCCLUDED)
-                    if (last_seen_ago >= OCCLUDED_GRACE_S) and in_center_band and last_small_enough:
-                        # 전략 진입 결정
+                    if (last_seen_ago >= self.OCCLUDED_GRACE_S) and in_center and last_small:
                         if self._lost_strategy is None:
-                            self._lost_strategy = 'FWD'
-                            self._lost_t0 = now
-                            self.log("WARNING", "[OCC] Likely occlusion (not out-of-frame) → FWD-to-30% then SWEEP")
-
-                        # --- FWD 단계: 일정 시간 전진해서 시야 확보 ---
-                        if self._lost_strategy == 'FWD':
-                            # 전진만 수행, yaw/ud는 0 (충돌 방지 위해 전진은 제한)
-                            yaw_cmd = 0
-                            lr_cmd  = 0
-                            ud_cmd  = 0
-                            fb_cmd  = min(SAFE_FB_FWD_CAP, OCC_FWD_SPEED)
-
-                            # Slew 적용
-                            self._cmd_yaw = int(self._slew(self._cmd_yaw, yaw_cmd, SLEW_RC_STEP))
-                            self._cmd_lr  = int(self._slew(self._cmd_lr,  lr_cmd,  SLEW_RC_STEP))
-                            self._cmd_ud  = int(self._slew(self._cmd_ud,  ud_cmd,  SLEW_RC_STEP))
-                            self._cmd_fb  = int(self._slew(self._cmd_fb,  fb_cmd,  SLEW_RC_STEP))
-
-                            if self.use_rc_for_tracking:
-                                self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
-
-                            # 전진 시간 종료 → SWEEP 전환
-                            if (now - self._lost_t0) >= OCC_FWD_MAX_S:
-                                self._lost_strategy = 'SWEEP'
-                                self._lost_t0 = now
-                                self.log("INFO", "[OCC] FWD stage done → SWEEP rotate-search")
-                            # 이 루프는 소비되었으므로 아래 일반 로직은 건너뜀
-                            time.sleep(DT)
-                            continue
-
-                        # --- SWEEP 단계: 좌/우 교대 회전으로 가림면 가장자리를 찾아줌 ---
-                        elif self._lost_strategy == 'SWEEP':
-                            # 반주기마다 부호를 바꿈: ... ← → ← → ...
-                            phase = int((now - self._lost_t0) / SWEEP_HALF_PERIOD_S)
+                            self._lost_strategy='FWD'; self._lost_t0=now
+                            self.log("WARNING", "[OCC] Occlusion → FWD then SWEEP")
+                        if self._lost_strategy=='FWD':
+                            self._apply_slew_and_send(0,0,0, min(self.SAFE_FB_FWD_CAP, 18))
+                            if (now - self._lost_t0) >= self.OCC_FWD_MAX_S:
+                                self._lost_strategy='SWEEP'; self._lost_t0=now
+                            time.sleep(max(0.0, self.DT - (time.time()-t0))); continue
+                        elif self._lost_strategy=='SWEEP':
+                            phase = int((now - self._lost_t0)/self.SWEEP_HALF_PERIOD_S)
                             yaw_dir = -1 if (phase % 2 == 0) else 1
-                            yaw_cmd = int(np.clip(yaw_dir * SEARCH_YAW_SPEED, -MAX_RC, MAX_RC))
-                            ud_cmd  = 0
-                            lr_cmd  = 0
-                            fb_cmd  = 0  # 회전 중심 탐색
+                            self._apply_slew_and_send(int(np.clip(yaw_dir*self.SEARCH_YAW_SPEED,-self.tracking_rc_speed,self.tracking_rc_speed)),
+                                                    0,0,0)
+                            time.sleep(max(0.0, self.DT - (time.time()-t0))); continue
 
-                            self._cmd_yaw = int(self._slew(self._cmd_yaw, yaw_cmd, SLEW_RC_STEP))
-                            self._cmd_ud  = int(self._slew(self._cmd_ud,  ud_cmd,  SLEW_RC_STEP))
-                            self._cmd_lr  = int(self._slew(self._cmd_lr,  lr_cmd,  SLEW_RC_STEP))
-                            self._cmd_fb  = int(self._slew(self._cmd_fb,  fb_cmd,  SLEW_RC_STEP))
-
-                            if self.use_rc_for_tracking:
-                                self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
-
-                            # SWEEP은 타임아웃 없이 지속 (재관측 되면 위에서 전략 자동 해제)
-                            time.sleep(DT)
-                            continue
-
-                    # ===== 기존 기본 동작(프레임 밖/일반 분실) =====
-
-                    # 1) 직후(<= COAST_MAX_TIME)는 마지막 명령을 점감(coast)
-                    if last_seen_ago <= COAST_MAX_TIME:
-                        self._cmd_lr  = int(self._cmd_lr  * COAST_DECAY)
-                        self._cmd_fb  = int(self._cmd_fb  * COAST_DECAY)
-                        self._cmd_ud  = int(self._cmd_ud  * COAST_DECAY)
-                        self._cmd_yaw = int(self._cmd_yaw * COAST_DECAY)
+                    if last_seen_ago <= self.COAST_MAX_TIME:
+                        self._cmd_lr  = int(self._cmd_lr  * self.COAST_DECAY)
+                        self._cmd_fb  = int(self._cmd_fb  * self.COAST_DECAY)
+                        self._cmd_ud  = int(self._cmd_ud  * self.COAST_DECAY)
+                        self._cmd_yaw = int(self._cmd_yaw * self.COAST_DECAY)
+                        if self.use_rc_for_tracking:
+                            self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
                     else:
-                        # 2) 재탐색: 마지막 관측 에러/속도 부호를 이용해 회전/상하 스캔
                         ex_f = self._ema_state.get("ex", 0.0)
                         ey_f = self._ema_state.get("ey", 0.0)
                         vx_f = self._ema_state.get("vx", 0.0)
                         vy_f = self._ema_state.get("vy", 0.0)
-
-                        yaw_cmd = int(np.clip(np.sign(ex_f if abs(ex_f) > YAW_DEADBAND else vx_f) * SEARCH_YAW_SPEED,
-                                              -MAX_RC, MAX_RC))
-                        ud_cmd  = int(np.clip(-np.sign(ey_f if abs(ey_f) > UD_DEADBAND else vy_f) * SEARCH_UD_SPEED,
-                                              -MAX_RC, MAX_RC))
-                        lr_cmd  = 0
-                        fb_cmd  = SEARCH_FB_SPEED
-
-                        self._cmd_yaw = int(self._slew(self._cmd_yaw, yaw_cmd, SLEW_RC_STEP))
-                        self._cmd_ud  = int(self._slew(self._cmd_ud,  ud_cmd,  SLEW_RC_STEP))
-                        self._cmd_lr  = int(self._slew(self._cmd_lr,  lr_cmd,  SLEW_RC_STEP))
-                        self._cmd_fb  = int(self._slew(self._cmd_fb,  fb_cmd,  SLEW_RC_STEP))
-
-                    if self.use_rc_for_tracking:
-                        self.tello.send_rc_control(self._cmd_lr, self._cmd_fb, self._cmd_ud, self._cmd_yaw)
+                        yaw_cmd = int(np.clip(np.sign(ex_f if abs(ex_f) > self.YAW_DEADBAND else vx_f)*self.SEARCH_YAW_SPEED,
+                                            -self.tracking_rc_speed, self.tracking_rc_speed))
+                        ud_cmd  = int(np.clip(-np.sign(ey_f if abs(ey_f) > self.UD_DEADBAND else vy_f)*self.SEARCH_UD_SPEED,
+                                            -self.tracking_rc_speed, self.tracking_rc_speed))
+                        self._apply_slew_and_send(yaw_cmd, 0, ud_cmd, self.SEARCH_FB_SPEED)
 
                     if self._lost_since_t is None:
                         self._lost_since_t = now
                         self.log("WARNING", "⚠️ Target lost - entering search mode")
 
-                # 루프 타이밍 정렬
-                elapsed = time.time() - loop_start
-                sleep_t = max(0.0, DT - elapsed)
-                time.sleep(sleep_t)
+                # 주기 정렬
+                time.sleep(max(0.0, self.DT - (time.time()-t0)))
 
             except Exception as e:
                 self.log("ERROR", f"Tracking error: {e}")
-                try:
-                    self.tello.send_rc_control(0, 0, 0, 0)
-                except:
-                    pass
+                try: self.tello.send_rc_control(0,0,0,0)
+                except: pass
                 time.sleep(0.2)
 
-        # 종료 시 안전 정지
-        try:
-            self.tello.send_rc_control(0, 0, 0, 0)
-        except:
-            pass
+        # 종료 안전정지
+        try: self.tello.send_rc_control(0,0,0,0)
+        except: pass
         self.log("INFO", "🛑 IBVS tracking thread stopped")
 
     # start_tracking에서 트래킹 상태 초기화 훅 추가 (선택)
@@ -789,102 +678,104 @@ class TelloWebServer:
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
-                
                 if frame is None:
                     error_count += 1
                     if error_count >= max_errors:
-                        print("⚠️ Too many frame errors")
                         self.is_streaming = False
-                        self.socketio.emit('stream_error', {
-                            'message': 'Video stream lost. Please reconnect.'
-                        })
-                        break                    
+                        self.socketio.emit('stream_error', {'message': 'Video stream lost. Please reconnect.'})
+                        break
+                    time.sleep(0.01)
                     continue
-            
-                error_count = 0
+
+                h, w = frame.shape[:2]
+                if self._throttle("raw_size_log", 1.0):
+                    self.log("DEBUG", f"[RAW] {w}x{h} (UD init:{self._ud_initialized}, ud_size:{self._ud_size})")
+                if (not self._ud_initialized) or (self._ud_size != (w, h)):
+                    # 사이즈가 바뀌었거나 아직 초기화 안됨 → 다시 준비
+                    self._ud_initialized = False
+                    self._init_undistort_if_needed((h, w))
+                # 이후에만 undistort 적용
+                if self._ud_initialized:
+                    frame = self._undistort_and_crop(frame)
+
+                frame = self._make_depth_input(frame)
                 
-                # 추론 실행
+                # 추론 (BGR 입력 그대로)
                 detections, depth_map, *_ = self.inference_engine.run(frame)
-                
+
+                # 트래킹 타겟 갱신 (잠금일관성)
                 with self.lock:
                     self.current_detections = detections
-                    
                     if self.is_tracking:
-                        # 1) 도둑 모드 후보 찾기: thief_dist <= gate 인 것 중 최솟값
-                        best = None
-                        for det in detections:
-                            get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
-                            td = get("thief_dist")
-                            tg = get("thief_cos_dist")
-                            if td is None or tg is None:
-                                continue
-                            if td <= tg:
-                                if (best is None) or (td < best.get("thief_dist", 1e9)):
-                                    best = det
-
+                        best = self._select_best_thief_detection(detections)
                         if best is not None:
-                            # 매칭 통과: 이 bbox만 추적 대상으로
                             self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
                             self.target_class = (best.get("class", "person") if isinstance(best, dict)
                                                 else getattr(best, "cls", "person"))
                         else:
-                            # 매칭 실패: 타겟 상실 처리
                             if self.target_bbox is not None:
-                                self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
+                                self.log("WARNING", "⚠️ Thief not found under gate; holding position")
                             self.target_bbox = None
-                
-                # 감지 결과 그리기
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_with_detections = draw_detections_on_frame(frame, detections)
-                
-                # 프레임 중심 십자선 표시
-                h, w = frame_with_detections.shape[:2]
-                cx, cy = w // 2, h // 2
-                cv2.line(frame_with_detections, (cx - 30, cy), (cx + 30, cy), (255, 255, 255), 2)
-                cv2.line(frame_with_detections, (cx, cy - 30), (cx, cy + 30), (255, 255, 255), 2)
-                cv2.circle(frame_with_detections, (cx, cy), 5, (255, 255, 255), -1)
-                
-                # 배터리 및 높이 정보 업데이트
-                try:
-                    old_battery = self.battery
-                    self.battery = self.tello.get_battery()
-                    self.height = self.tello.get_distance_tof()
-                    
-                    # 배터리 경고
-                    if self.battery < 15 and old_battery >= 15:
-                        self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
-                    elif self.battery < 25 and old_battery >= 25:
-                        self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
-                except:
-                    pass
-                
-                # 프레임 저장
+
+                # 오버레이는 비용이 크므로 한 번만 변환 → 표시 경로만 RGB
+                disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if self.show_calib_debug:
+                    h, w = disp.shape[:2]
+                    color = (0,255,0) if self._ud_initialized else (0,255,255)
+                    cv2.rectangle(disp, (0,0), (w-1,h-1), color, 1)
+                    cv2.putText(disp, f"{'UD ONLY'} {w}x{h}", (10, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+                    for px,py in [(3,3),(w-4,3),(3,h-4),(w-4,h-4)]:
+                        cv2.circle(disp, (px,py), 2, color, -1)
+
+                disp = draw_detections_on_frame(disp, detections)
+
+                # 십자선
+                h, w = disp.shape[:2]
+                cx, cy = w//2, h//2
+                cv2.line(disp, (cx-30, cy), (cx+30, cy), (255,255,255), 2)
+                cv2.line(disp, (cx, cy-30), (cx, cy+30), (255,255,255), 2)
+                cv2.circle(disp, (cx, cy), 5, (255,255,255), -1)
+
+                # 배터리/높이 5Hz 스로틀
+                if self._throttle("poll_state", 0.2):
+                    try:
+                        old_batt = self.battery
+                        self.battery = self.tello.get_battery()
+                        if self.ground_tune_mode and not self._airborne:
+                            self.height = self.virtual_height_cm
+                        else:
+                            self.height = self.tello.get_distance_tof()
+                        if self.battery < 15 <= old_batt:
+                            self.log("WARNING", f"⚠️ Critical battery: {self.battery}% - Land soon!")
+                        elif self.battery < 25 <= old_batt:
+                            self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
+                    except:
+                        pass
+
+                # 프레임 저장 (표시 프레임만 저장 → 송출/트래커가 공유)
                 with self.lock:
-                    self.current_frame = frame_with_detections
+                    self.current_frame = disp
                     self.current_frame_updated = True
-                
-                # 감지 정보를 클라이언트에 전송
-                self.socketio.emit('detections_update', {
-                    'detections': detections,
-                    'battery': self.battery,
-                    'height': self.height,
-                    'is_tracking': self.is_tracking,
-                    'target_identity_id': self.target_identity_id,
-                    'target_class': self.target_class
-                })
-                
-                
-                # time.sleep(0.033)
-                
+
+                # UI 업데이트 10Hz 스로틀 (소켓 부하 절감)
+                if self._throttle("emit_ui", 0.1):
+                    self.socketio.emit('detections_update', {
+                        'detections': detections,
+                        'battery': self.battery,
+                        'height': self.height,
+                        'is_tracking': self.is_tracking,
+                        'target_identity_id': self.target_identity_id,
+                        'target_class': self.target_class
+                    })
+
             except Exception as e:
-                print(f"Stream error: {e}")
                 traceback.print_exc()
                 error_count += 1
                 if error_count >= max_errors:
-                    print("❌ Stream failed completely")
                     self.is_streaming = False
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
                 
         print("📹 Video stream thread ended")
     
@@ -983,6 +874,7 @@ class TelloWebServer:
         
         try:
             if command == 'takeoff':
+                self._airborne = True
                 self.log("INFO", "🚁 Taking off...")
                 self.tello.takeoff()
                 self.last_takeoff_time = time.time()  # 이륙 시간 기록
@@ -1006,6 +898,7 @@ class TelloWebServer:
                 return {'success': True, 'message': 'Takeoff successful'}
                 
             elif command == 'land':
+                self._airborne = False
                 self.log("INFO", "🛬 Landing...")
                 self.tello.land()
                 self.last_takeoff_time = None  # 착륙 시 초기화
@@ -1014,6 +907,7 @@ class TelloWebServer:
                 return {'success': True, 'message': 'Landing successful'}
                 
             elif command == 'emergency':
+                self._airborne = False
                 self.log("WARNING", "🚨 Emergency stop!")
                 self.tello.emergency()
                 self.last_takeoff_time = None  # 비상 정지 시 초기화

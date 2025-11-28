@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import numpy as np
 """
 Usage:
 from settings import settings [as S]
@@ -53,8 +54,21 @@ class Settings:
     tello_ip: str = '192.168.10.1'
     """set tello_id to None for automatic connection"""
 
-    """TelloWebServer"""
-    # tello_ws_stream_on_off_timeout: int = 3
+    """Camera calibration"""
+    CAMERA_MATRIX = np.array([
+        [921.73863554, 0.00000000, 484.9439379],
+        [0.00000000, 921.06520894, 355.5162763],
+        [0.00000000, 0.00000000, 1.00000000]
+    ], dtype=np.float32)
+
+    NEW_CAMERA_MATRIX = np.array([
+        [922.83538766, 0.00000000, 485.70362399],
+        [0.00000000, 920.62929167, 355.42781255],
+        [0.00000000, 0.00000000, 1.00000000]
+    ], dtype=np.float32)
+
+    DIST_COEFFS = np.array([0.01635261, -0.19644455, -0.00021575, 0.00116993, 0.56532416], dtype=np.float32)
+    CROP_MARGIN_RATIO = 0.05  # 가장자리 자를 비율 (좌우/상하 각각 5%)
     """time in seconds to wait for streamon/streamoff command"""
 
     def __post_init__(self): #
