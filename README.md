@@ -51,7 +51,6 @@ git clone https://github.com/sesac-aeyong/drone_aeyong.git
     └── yolo_tools.py                             # yolo 추론 결과 표시
 
 ```
-## Prerequisites
 
 ## ✅ Prerequisites
 
