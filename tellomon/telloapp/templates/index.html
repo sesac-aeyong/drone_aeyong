@@ -592,8 +592,12 @@
     }
 
     // ---------- 소켓 수신 ----------
-    socket.on('connect', () => addLog('SUCCESS', '서버 연결'));
-
+    socket.on('connect', () => {
+        addLog('SUCCESS', '서버 연결');
+        // 연결 후 현재 Tello 상태 요청
+        socket.emit('get_tello_status');
+    });
+    
     socket.on('log_message', (data) => addLog(data.level, data.message, data.timestamp));
 
     socket.on('tello_status', (data) => {

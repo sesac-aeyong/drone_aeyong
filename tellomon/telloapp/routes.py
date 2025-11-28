@@ -1,5 +1,7 @@
 # routes.py
 import time, os
+import cv2
+import numpy as np
 from flask import Blueprint, render_template, Response
 
 def create_routes(socketio, get_tello_server, disconnect_wifi):
@@ -9,6 +11,11 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
     """
     bp = Blueprint('main', __name__)
 
+    # 1x1 검정 placeholder JPEG 생성
+    _placeholder_img = np.zeros((1, 1, 3), dtype=np.uint8)
+    _, _placeholder_buf = cv2.imencode('.jpg', _placeholder_img)
+    PLACEHOLDER_JPEG = _placeholder_buf.tobytes()
+
     # Flask routes
     @bp.route('/')
     def index():
@@ -17,12 +24,22 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
     @bp.route('/video_feed')
     def video_feed():
         def generate():
-            while True:
-                frame = get_tello_server().get_current_frame_jpeg()
-                if frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                time.sleep(0.01)
+            try:
+                # 첫 프레임 즉시 전송 (start_response 오류 방지)
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + PLACEHOLDER_JPEG + b'\r\n')
+                
+                while True:
+                    frame = get_tello_server().get_current_frame_jpeg()
+                    if frame is not None:
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                    else:
+                        time.sleep(0.05)  # 프레임 없으면 잠시 대기
+                    time.sleep(0.01)
+            except GeneratorExit:
+                # 클라이언트 연결 종료 시 정상 종료
+                pass
         return Response(generate(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
@@ -35,6 +52,14 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
     @socketio.on('disconnect')
     def handle_disconnect():
         print('Client disconnected')
+
+    @socketio.on('get_tello_status')
+    def handle_get_tello_status():
+        ts = get_tello_server()
+        socketio.emit('tello_status', {
+            'connected': ts.is_connected,
+            'battery': ts.battery
+        })
 
     @socketio.on('connect_tello')
     def handle_connect_tello():

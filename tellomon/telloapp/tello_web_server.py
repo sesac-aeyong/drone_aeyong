@@ -10,7 +10,7 @@ from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
 from settings import settings as S
-
+from tracking_controller import DroneTrackingController, TrackingConfig
 
 class TelloWebServer:
     def __init__(self, socketio):
@@ -48,19 +48,28 @@ class TelloWebServer:
         self.is_logging = True
         self.start_log_broadcaster()
 
+        self.tracking_controller = DroneTrackingController(TrackingConfig())
         # Optical flow 데이터 저장
         self.current_ego_velocity = None
         self.ego_velocity_history = []
-        self.max_ego_history = 5
+        self.max_ego_history = 15
         
         # 거리 유지 목표
         self.forward_only = True
         self.target_distance = 3.0  # 3m 유지
-        self.min_safe_distance = 1.0 # 최소 안전 거리
-        self.max_track_distance = 5.0   # 최대 추적 거리
+        self.min_safe_distance = 1.8 # 최소 안전 거리
+        self.max_track_distance = 6.0   # 최대 추적 거리
         self.depth_history = []
         self.max_depth_history = 5
   
+        self.depth_scale = 0.85
+        self.depth_scale_history = []
+        self.max_scale_history = 20
+        self.frame_count = 0
+        self.depth_diagnostic_interval = 40  # 20Hz * 2s
+        self.last_depth_values = []
+        self._last_control_log_time = time.time()
+
         # 추론 엔진 초기화
         self.log("INFO", "Loading inference engine...")
         try:
@@ -72,6 +81,153 @@ class TelloWebServer:
             traceback.print_exc()
             self.inference_engine = None
 
+    def _log_depth_diagnostic(self, raw_depth, smoothed_depth):
+        """
+        Depth 필터링 진단 로깅
+        
+        Args:
+            raw_depth: 필터링 전 depth 값
+            smoothed_depth: 필터링 후 depth 값
+        """
+        import numpy as np
+        
+        # 최근 값 저장 (최대 20개)
+        if len(self.last_depth_values) >= 20:
+            self.last_depth_values.pop(0)
+        
+        self.last_depth_values.append({
+            'raw': raw_depth,
+            'smoothed': smoothed_depth,
+            'time': time.time()
+        })
+        
+        # 5개 이상 모았을 때만 로그
+        if len(self.last_depth_values) < 5:
+            return
+        
+        # 통계 계산
+        raw_values = [v['raw'] for v in self.last_depth_values]
+        smoothed_values = [v['smoothed'] for v in self.last_depth_values]
+        
+        raw_mean = np.mean(raw_values)
+        raw_std = np.std(raw_values)
+        raw_min = np.min(raw_values)
+        raw_max = np.max(raw_values)
+        
+        smoothed_mean = np.mean(smoothed_values)
+        smoothed_std = np.std(smoothed_values)
+        
+        # # 간단한 로그 (매번)
+        # self.log("DEBUG",
+        #     f"[DEPTH] Raw={raw_mean:.2f}±{raw_std:.3f}m "
+        #     f"({raw_min:.2f}~{raw_max:.2f}) | "
+        #     f"Smoothed={smoothed_mean:.2f}±{smoothed_std:.3f}m")
+        
+        # 상세 로그 (2초마다)
+        if self.frame_count % 60 == 0:
+            recent_raw = [f"{v['raw']:.2f}" for v in self.last_depth_values[-5:]]
+            recent_smooth = [f"{v['smoothed']:.2f}" for v in self.last_depth_values[-5:]]
+            
+            self.log("DEBUG",
+                f"[DEPTH DETAIL] Raw: {recent_raw} | "
+                f"Smoothed: {recent_smooth}")
+            
+            # 필터링 효율 계산
+            if raw_std > 0:
+                reduction_ratio = (raw_std - smoothed_std) / raw_std * 100
+                self.log("DEBUG",
+                    f"[FILTER] Std reduction: {reduction_ratio:.1f}% "
+                    f"({raw_std:.3f}m → {smoothed_std:.3f}m)")
+            
+
+
+    def _log_control_state(self, depth, state_str, rc_cmd):
+        """
+        제어 상태 로깅
+        
+        Args:
+            depth: 현재 depth 값
+            state_str: 상태 문자열
+            rc_cmd: RC 명령 dict
+        """
+        # 1초마다 로그
+        current_time = time.time()
+        if current_time - self._last_control_log_time < 1.0:
+            return
+        
+        self.log("DEBUG",
+            f"[CONTROL] Depth={depth:.2f}m | State={state_str} | "
+            f"RC[LR={rc_cmd['left_right']:+3d}, "
+            f"FB={rc_cmd['forward_backward']:+3d}, "
+            f"UD={rc_cmd['up_down']:+3d}, "
+            f"YAW={rc_cmd['yaw']:+3d}]")
+        
+        self._last_control_log_time = current_time
+
+    def update_adaptive_depth_scale(self, ego_velocity, depth_history):
+        """
+        Optical flow + Depth로 스케일 자동 조정
+        
+        필요한 데이터:
+        - ego_velocity: 현재 프레임의 드론 이동
+        - depth_history: 최근 깊이 히스토리
+        """
+
+        if ego_velocity is None or depth_history is None:
+            return self.depth_scale
+
+        # 데이터 충분 체크
+        if len(depth_history) < 2:
+            return self.depth_scale
+
+        if isinstance(ego_velocity, (tuple, list)):
+            if len(ego_velocity) >= 2:
+                # 속도의 크기(magnitude) 계산
+                # ego_velocity = (vx, vy)
+                ego_vel = (ego_velocity[0]**2 + ego_velocity[1]**2) ** 0.5
+            else:
+                return self.depth_scale
+        else:
+            ego_vel = abs(ego_velocity)
+
+        # 드론이 거의 안 움직임
+        if abs(ego_vel) < 0.01:  # 1cm 미만
+            return self.depth_scale
+        
+        # 깊이 변화 계산
+        delta_depth = depth_history[-1] - depth_history[-2]
+        
+        # 깊이가 거의 안 변함
+        if abs(delta_depth) < 0.001:  # 1mm 미만
+            return self.depth_scale
+        
+        # 스케일 계산
+        # 예상 깊이 변화 = -드론 이동 / 현재 스케일
+        expected_delta_depth = -ego_vel / self.depth_scale
+        
+        # 오류율 계산
+        error_ratio = delta_depth / expected_delta_depth
+        
+        # EMA 평활화 (천천히 적응)
+        alpha = 0.05
+        new_scale = (alpha * self.depth_scale / error_ratio +
+                     (1 - alpha) * self.depth_scale)
+        
+        # 타당성 검사
+        if 0.5 < new_scale < 2.0:
+            # 범위 내 - 업데이트
+            self.depth_scale_history.append(new_scale)
+            
+            if len(self.depth_scale_history) > self.max_scale_history:
+                self.depth_scale_history.pop(0)
+            
+            # 로그 출력
+            print(f"[SCALE] {self.depth_scale:.3f} -> {new_scale:.3f}, "
+                  f"avg={np.median(self.depth_scale_history):.3f}")
+            
+            self.depth_scale = new_scale
+        
+        return self.depth_scale
 
     def log(self, level, message):
         """
@@ -207,20 +363,7 @@ class TelloWebServer:
         target_lost_time = None
         target_lost_warning_sent = False
         
-        # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.30      # 회전 게인
-        gain_lr = 0.20       # 좌우 이동 게인
-        gain_ud = 0.30       # 상하 이동 게인
-        gain_fb_depth = 30.0 # 전후 이동 게인
-        
-        # 임계값
-        yaw_threshold = 0.20    # 20% 이상 오차면 회전
-        lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
-        ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
-        size_threshold = 0.025  # 크기 오차 임계값
-        depth_threshold = 0.25
-
-        self.log("INFO", "🎯 Simple RC tracking started")
+        self.log("INFO", "🎯 PID-based tracking started")
         
         while self.is_tracking:
             try:
@@ -229,184 +372,169 @@ class TelloWebServer:
                     time_since_takeoff = time.time() - self.last_takeoff_time
                     if time_since_takeoff < self.takeoff_stabilization_time:
                         remaining = self.takeoff_stabilization_time - time_since_takeoff
-                        if int(remaining * 10) % 10 == 0:  # 0.1초마다 로그
-                            self.log("INFO", f"⏳ Stabilizing... {remaining:.1f}s remaining")
+                        if int(remaining * 10) % 10 == 0:
+                            self.log("INFO", f"⏳ Stabilizing... {remaining:.1f}s")
                         time.sleep(0.1)
                         continue
                     else:
-                        # 안정화 완료
                         if self.last_takeoff_time is not None:
-                            self.log("SUCCESS", "✅ Stabilization complete - starting tracking")
-                            self.last_takeoff_time = None  # 한 번만 로그 출력
-
-                if self.target_bbox and self.current_frame is not None:
-                    # 타겟 재발견 시 경고 리셋
-                    if target_lost_time is not None:
-                        self.log("SUCCESS", "🎯 Target re-acquired!")
-                        target_lost_time = None
-                        target_lost_warning_sent = False
-                    
-                    # 제어 명령 계산
-                    h, w = self.current_frame.shape[:2]
-                    center_x = w // 2
-                    center_y = h // 2
-                    
-                    # target_bbox is in [x1, y1, x2, y2] format
-                    x1, y1, x2, y2 = self.target_bbox
-                    target_center_x = (x1 + x2) // 2
-                    target_center_y = (y1 + y2) // 2
-                    
-                    # 오차 계산 (정규화)
-                    error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
-                    error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
-                    
-                    if hasattr(self, 'current_depth_map') and self.current_depth_map is not None:
-                        target_depth = self.inference_engine.extract_target_depth(
-                            self.current_depth_map,
-                            self.target_bbox
-                        )
-                        
-                        if target_depth is not None:
-                            self.depth_history.append(target_depth)
-                            if len(self.depth_history) > self.max_depth_history:
-                                self.depth_history.pop(0)
-
-                    # Depth 평활화
-                    if len(self.depth_history) > 0:
-                        smoothed_depth = np.median(self.depth_history)
-                        distance_error = smoothed_depth - self.target_distance
-                    else:
-                        smoothed_depth = None
-                        distance_error = 0
-
-                    # 타겟 크기
-                    target_width = x2 - x1
-                    target_height = y2 - y1
-                    target_area = target_width * target_height
-                    frame_area = w * h
-                    target_ratio = target_area / frame_area
-                    
-                    # 목표 크기
-                    target_size_ideal = 0.3
-                    error_size = target_size_ideal - target_ratio
-                    
-                    # === 간단한 비례 제어 ===
-                    
-                    # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
-                    if abs(error_x) > yaw_threshold:
-                        # 회전
-                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                        lr_speed = 0
-                    elif abs(error_x) > lr_threshold:
-                        # 좌우 이동
-                        yaw_speed = 0
-                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        # 중앙 정렬됨
-                        yaw_speed = 0
-                        lr_speed = 0
-                    
-                    # 2. 상하 제어
-                    if abs(error_y) > ud_threshold:
-                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        ud_speed = 0
-
-
-                    # 3. 전후 제어 (FB - Depth 기반, 앞으로만)
-                    if smoothed_depth:
-                        distance_error = smoothed_depth - self.target_distance
-                        
-                        # 안전 거리 체크
-                        if smoothed_depth < self.min_safe_distance:
-                            # 너무 가까움 - 정지 + 경고
-                            fb_speed = 0
-                            self.log("WARNING", 
-                                    f"Too close! (depth={smoothed_depth:.2f}m < min={self.min_safe_distance}m)")
-                        
-                        elif smoothed_depth > self.max_track_distance:
-                            # 너무 멀음 - 정지 + 경고
-                            fb_speed = 0
-                            self.log("WARNING", 
-                                    f"Too far! (depth={smoothed_depth:.2f}m > max={self.max_track_distance}m)")
-                        
-                        elif distance_error > depth_threshold:
-                            # 사람이 멀어짐 - 앞으로 추적
-                            if self.forward_only:
-                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
-                                                    0,  # ← 최소값 0 (뒤로 안 감!)
-                                                    self.tracking_rc_speed))
-                                
-                                if fb_speed > 0:
-                                    self.log("DEBUG", 
-                                            f"Forward (depth={smoothed_depth:.2f}m, target={self.target_distance}m)")
-                            else:
-                                # 양방향 (원래 로직)
-                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
-                                                    -self.tracking_rc_speed, 
-                                                    self.tracking_rc_speed))
-                        
-                        elif distance_error < -depth_threshold:
-                            # 사람이 가까워짐
-                            if self.forward_only:
-                                # 뒤로 안 가고 정지!
-                                fb_speed = 0
-                                self.log("DEBUG", 
-                                        f"top (too close: depth={smoothed_depth:.2f}m < target={self.target_distance}m)")
-                            else:
-                                # 뒤로 이동 (원래)
-                                fb_speed = int(np.clip(distance_error * gain_fb_depth, 
-                                                    -self.tracking_rc_speed, 
-                                                    self.tracking_rc_speed))
-                        
-                        else:
-                            # 안전 범위 내 - 정지
-                            fb_speed = 0
-                            self.log("DEBUG", 
-                                    f"✓ In range (depth={smoothed_depth:.2f}m)")
-
-                    else:
-                        fb_speed = 0
-
-                    # RC 명령 전송
-                    self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
-                    
-                    # 로그 출력
-                    # if yaw_speed != 0 or lr_speed != 0 or ud_speed != 0 or fb_speed != 0:
-                        # action = f"RC[lr={lr_speed:+3d}, fb={fb_speed:+3d}, ud={ud_speed:+3d}, yaw={yaw_speed:+3d}]"
-                        # self.log("DEBUG", 
-                            # f"🎯 {action} | Err[x={error_x:+.3f}, y={error_y:+.3f}, s={error_size:+.3f}] | Size={target_ratio:.3f}")
+                            self.log("SUCCESS", "✅ Stabilization complete")
+                            self.last_takeoff_time = None
                 
-                else:
-                    # 타겟을 잃어버림
+                # 타겟 존재 여부 확인
+                if not (self.target_bbox and self.current_frame is not None):
+                    # 타겟 상실
                     if target_lost_time is None:
                         target_lost_time = time.time()
-                        self.tello.send_rc_control(0, 0, 0, 0)
                     
-                    # 3초 이상 타겟을 못 찾으면 경고
+                    self.tello.send_rc_control(0, 0, 0, 0)
+                    
                     if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
+                        self.log("WARNING", f"⚠️ Target lost for 3s (ID: {self.target_identity_id})")
                         target_lost_warning_sent = True
+                    
+                    time.sleep(0.05)
+                    continue
                 
+                # 타겟 재발견 처리
+                if target_lost_time is not None:
+                    self.log("SUCCESS", "🎯 Target re-acquired!")
+                    target_lost_time = None
+                    target_lost_warning_sent = False
+                
+                # ===== 제어 명령 계산 =====
+                
+                h, w = self.current_frame.shape[:2]
+                frame_center = (w // 2, h // 2)
+                
+                # Depth 정보 추출
+                if self.current_depth_map is None:
+                    self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.05)
+                    continue
+                
+                target_depth = self.inference_engine.extract_target_depth(
+                    self.current_depth_map,
+                    self.target_bbox
+                )
+                
+                if target_depth is None:
+                    self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.05)
+                    continue
+                
+                # Optical flow ego-velocity (있으면 사용)
+                ego_velocity = None
+                if self.current_ego_velocity is not None:
+                    ego_velocity = self.current_ego_velocity
+                
+                # 🆕 개선된 제어 명령 생성
+                control_cmd = self.tracking_controller.compute_control_command(
+                    frame=self.current_frame,
+                    bbox=self.target_bbox,
+                    depth=target_depth,
+                    ego_velocity=ego_velocity,
+                    frame_center=frame_center
+                )
+                
+                # RC 명령 전송
+                lr_speed = control_cmd['left_right']
+                fb_speed = control_cmd['forward_backward']
+                ud_speed = control_cmd['up_down']
+                yaw_speed = control_cmd['yaw']
+                
+                self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
+                
+                # 🔴 Depth 진단 로깅 (필터링 전후 비교)
+                smoothed_depth = self.tracking_controller.depth_filter.smoothed_value
+                if smoothed_depth is None:
+                    smoothed_depth = target_depth
+                
+                self._log_depth_diagnostic(target_depth, smoothed_depth)
+                
+                # 🔴 제어 상태 로깅
+                self._log_control_state(smoothed_depth, control_cmd['state'], {
+                    'left_right': lr_speed,
+                    'forward_backward': fb_speed,
+                    'up_down': ud_speed,
+                    'yaw': yaw_speed
+                })
                 time.sleep(0.05)  # 20Hz 제어 루프
-                
+            
             except Exception as e:
                 self.log("ERROR", f"Tracking error: {e}")
-                if self.use_rc_for_tracking:
-                    try:
-                        self.tello.send_rc_control(0, 0, 0, 0)
-                    except:
-                        pass
+                try:
+                    self.tello.send_rc_control(0, 0, 0, 0)
+                except:
+                    pass
                 time.sleep(0.5)
         
         # 추적 종료 시 정지
         try:
             self.tello.send_rc_control(0, 0, 0, 0)
-            self.log("INFO", "🛑 Tracking stopped - drone halted")
+            self.log("INFO", "🛑 Tracking stopped")
         except:
             pass
         
         self.log("INFO", "🎯 Tracking thread stopped")
+
+    def _log_ego_speed_stats(self, frame_count):
+        """기존 ego_velocity_history를 이용해 로그 출력 (이상치 필터링)"""
+        if not self.ego_velocity_history:
+            return
+        
+        #  드론 최대 속도 임계값
+        MAX_DRONE_SPEED = 2.0  # m/s
+        
+        ego_speeds = []
+        filtered_ego_speeds = []  #  필터링된 속도
+        
+        for vel in self.ego_velocity_history:
+            if vel is not None:
+                vx, vy = vel
+                speed = np.sqrt(vx**2 + vy**2)
+                ego_speeds.append(speed)
+                
+                #  이상치 제거
+                if speed <= MAX_DRONE_SPEED:
+                    filtered_ego_speeds.append(speed)
+        
+        if not ego_speeds:
+            return
+        
+        # 원본 통계
+        current = ego_speeds[-1]
+        avg_raw = np.mean(ego_speeds)
+        
+        # 필터링된 통계
+        if filtered_ego_speeds:
+            avg_filtered = np.mean(filtered_ego_speeds)
+            std_filtered = np.std(filtered_ego_speeds)
+        else:
+            avg_filtered = 0
+            std_filtered = 0
+        
+        # 안정성 판정
+        if avg_filtered < 0.2:
+            stability = "Excellent"
+        elif avg_filtered < 0.4:
+            stability = "Good"
+        elif avg_filtered < 0.6:
+            stability = "Fair"
+        else:
+            stability = "Poor"
+        
+        print(f"\n{'='*60}")
+        print(f" Ego-speed Stats [Frame {frame_count}]")
+        print(f"{'='*60}")
+        
+        print(f"\n Filtered Data (< {MAX_DRONE_SPEED} m/s):")
+        print(f"  Average:    {avg_filtered:.3f} m/s ✓")
+        print(f"  Std Dev:    {std_filtered:.3f} m/s")
+        print(f"  Samples:    {len(filtered_ego_speeds)}")
+        print(f"  Stability:  {stability}")
+                
+        print(f"{'='*60}\n")
 
 
     def video_stream_thread(self):
@@ -428,7 +556,8 @@ class TelloWebServer:
             
         error_count = 0
         max_errors = 10
-        
+        frame_count = 0
+
         while self.is_streaming:
             try:
                 frame = frame_reader.frame
@@ -450,9 +579,9 @@ class TelloWebServer:
                 detections, depth_map, _, optical_flow_data = self.inference_engine.run(frame)
                 self.current_depth_map = depth_map
 
-                # Ego-velocity 저장
-                self.current_ego_velocity = optical_flow_data.get('ego_velocity')
-                
+                # self.update_adaptive_depth_scale(self.current_ego_velocity, self.depth_history)
+                # self.inference_engine.depth_scale = self.depth_scale
+
                 with self.lock:
                     self.current_detections = detections
                     self.current_depth_map = cv2.resize(depth_map, frame.shape[1::-1])
@@ -483,17 +612,12 @@ class TelloWebServer:
                             self.target_class = (best.get("class", "person") if isinstance(best, dict)
                                                 else getattr(best, "cls", "person"))
                             # Depth 계산
-                            x1, y1, x2, y2 = map(int, self.target_bbox)
-                            bbox_depth_map = self.current_depth_map[y1:y2, x1:x2]
-                            
-                            if bbox_depth_map.size > 0:
-                                target_depth = float(np.median(bbox_depth_map))
-                                depth_conf = float(np.var(bbox_depth_map))
-                                
-                                self.target_depth = target_depth
-                                self.target_depth_conf = depth_conf
-                                
-                                # Depth history 저장
+                            target_depth = self.inference_engine.extract_target_depth(
+                                self.current_depth_map,
+                                self.target_bbox
+                            )
+
+                            if target_depth is not None:
                                 self.depth_history.append(target_depth)
                                 if len(self.depth_history) > self.max_depth_history:
                                     self.depth_history.pop(0)
@@ -544,7 +668,9 @@ class TelloWebServer:
                     'target_class': self.target_class
                 })
                 
-                
+                self.frame_count += 1
+                # if frame_count % 30 == 0:
+                #     self._log_ego_speed_stats(frame_count)
                 # time.sleep(0.033)
                 
             except Exception as e:
@@ -668,7 +794,6 @@ class TelloWebServer:
                 self.last_takeoff_time = time.time()  # 이륙 시간 기록
                 self.log("SUCCESS", f"Takeoff successful - stabilizing for {self.takeoff_stabilization_time}s")
                 
-                self.tello.move_up(20)
                 time.sleep(self.takeoff_stabilization_time)
                 return {'success': True, 'message': 'Takeoff successful'}
                 

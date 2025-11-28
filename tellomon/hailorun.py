@@ -10,6 +10,7 @@ from common.hailo_inference import HailoInfer
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
+from optical_flow_module import OpticalFlowEgoMotion
 
 class HailoRun():
     """
@@ -47,7 +48,11 @@ class HailoRun():
         self.thief_id = 0
 
         self.optical_flow = OpticalFlowEgoMotion()
-
+        self.disp_min_ema = None
+        self.disp_max_ema = None
+        self.depth_ema_alpha = 0.1  # 평활화 강도
+        self._depth_frame_count = 0
+        self.depth_scale = 1.5
 
     def load(self):
         self.loaded = True
@@ -227,7 +232,9 @@ class HailoRun():
             'background_mask': background_mask,
             'has_flow': has_flow 
         }
-        
+
+        if depth is not None:
+            self._visualize_depth_map(depth)
         return rets, depth, boxes, optical_flow_data
     
     def _process_depth(self, depth_raw: np.ndarray) -> np.ndarray:
@@ -254,21 +261,33 @@ class HailoRun():
         disp_min = np.min(disparity)
         disp_max = np.max(disparity)
         disp_normalized = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+        # curr_min = np.min(disparity)
+        # curr_max = np.max(disparity)
         
+        # if self.disp_min_ema is None:
+        #     self.disp_min_ema = curr_min
+        #     self.disp_max_ema = curr_max
+        # else:
+        #     # EMA 업데이트
+        #     self.disp_min_ema = (0.1 * curr_min + 0.9 * self.disp_min_ema)
+        #     self.disp_max_ema = (0.1 * curr_max + 0.9 * self.disp_max_ema)
+        
+        # 나머지는 동일
+        # disp_normalized = (disparity - self.disp_min_ema) / (self.disp_max_ema - self.disp_min_ema + 1e-6)        
         # Normalized disparity → Depth
         # 높은 disparity (1에 가까움) = 가까운 거리
         # 낮은 disparity (0에 가까움) = 먼 거리
-        depth = 1.0 / (disp_normalized + 0.01)  # 0.01로 0 나누기 방지
+        depth = 1.0 / (disp_normalized * 10 + 2.0)  # 0.01로 0 나누기 방지
         
-        DEPTH_SCALE = 1.4
-        depth = depth * DEPTH_SCALE
+        DEPTH_SCALE = 1.579
+        depth = depth * DEPTH_SCALE#self.depth_scale
         
         # 유효 범위로 클리핑
         depth = np.clip(depth, 0.1, 10.0)
         
         # 디버깅 (필요시 주석 처리)
-        print(f"[DEPTH DEBUG] Processed depth: min={np.min(depth):.4f}, "
-            f"max={np.max(depth):.4f}, mean={np.mean(depth):.4f}")
+        # print(f"[DEPTH DEBUG] Processed depth: min={np.min(depth):.4f}, "
+        #     f"max={np.max(depth):.4f}, mean={np.mean(depth):.4f}")
         
         return depth
                 
@@ -318,10 +337,10 @@ class HailoRun():
         if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
             return None
         
-        # ✨ 중앙 60% 영역만 사용 (배경 제거)
+        # 중앙 80% 영역만 사용 (배경 제거)
         bbox_w = x2 - x1
         bbox_h = y2 - y1
-        center_ratio = 0.6
+        center_ratio = 0.8
         
         x1_c = int(x1 + bbox_w * (1 - center_ratio) / 2)
         y1_c = int(y1 + bbox_h * (1 - center_ratio) / 2)
@@ -333,12 +352,12 @@ class HailoRun():
             x1_c, y1_c, x2_c, y2_c = x1, y1, x2, y2
         
         # 타겟 영역 추출
-        target_depth_region = depth_map[y1_c:y2_c, x1_c:x2_c]
+        target_depth_region = depth_map[y1:y2, x1:x2]
         
         if target_depth_region.size == 0:
             return None
         
-        # ✨ 이상치 제거
+        # 이상치 제거
         depths_flat = target_depth_region.flatten()
         
         # 1. 유효 범위 필터링
@@ -347,16 +366,42 @@ class HailoRun():
         if len(valid_depths) == 0:
             return None
         
-        # 2. 중앙값 기준 ±2m 이내만 사용
+        # # 2. 중앙값 기준 ±2m 이내만 사용
         median_depth = np.median(valid_depths)
-        filtered_depths = valid_depths[np.abs(valid_depths - median_depth) < 2.0]
-        
-        if len(filtered_depths) == 0:
+        # filtered_depths = valid_depths[np.abs(valid_depths - median_depth) < 1.5]
+
+        q1 = np.percentile(valid_depths, 25)
+        q3 = np.percentile(valid_depths, 75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+
+        iqr_filtered = valid_depths[(valid_depths >= lower) & (valid_depths <= upper)]
+
+        if len(iqr_filtered) == 0:
             return median_depth
         
         # 3. 최종 중앙값 반환
-        return float(np.median(filtered_depths))
+        return float(np.median(iqr_filtered))
 
+    def _visualize_depth_map(self, depth_map: np.ndarray):
+        """Depth Map을 로컬에서 시각화 (디버깅용)"""
+        import cv2
+        import numpy as np
+        
+        depth_min = np.min(depth_map)
+        depth_max = np.max(depth_map)
+        depth_normalized = ((depth_map - depth_min) / 
+                            (depth_max - depth_min + 1e-6) * 255).astype(np.uint8)
+        
+        depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+        
+        text = f"Min: {depth_min:.2f}m | Max: {depth_max:.2f}m | Mean: {np.mean(depth_map):.2f}m"
+        cv2.putText(depth_colored, text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.imshow('Depth Map (Hailo)', depth_colored)
+        cv2.waitKey(1)
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:
     result = None
