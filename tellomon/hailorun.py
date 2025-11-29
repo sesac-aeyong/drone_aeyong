@@ -73,8 +73,8 @@ class HailoRun():
         """depth model framebuffer"""
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
-        self.vis_to_dep_ratio = (self.dm_shape[0] / self.vm_shape[0],
-                                 self.dm_shape[1] / self.vm_shape[1])
+        self.vis_to_dep_ratio = (self.dm_shape[1] / self.vm_shape[1],
+                                 self.dm_shape[0] / self.vm_shape[0])
 
     def enter_thief_mode(self, thief_id: int) -> bool:
         """
@@ -239,23 +239,27 @@ class HailoRun():
         dep_rel = 1 / (1 + np.exp(-dep_rel))
         dep_rel = 1.0 / (dep_rel * 10.0 + 0.009)
         # normalize
-        dep_rel = cv2.normalize(dep_rel, None, 0, 255, cv2.NORM_MINMAX)
+        # dep_rel = cv2.normalize(dep_rel, None, 0, 255, cv2.NORM_MINMAX)
+        dep_rel = cv2.resize(dep_rel, (self.vm_shape[0], self.vm_shape[1]), interpolation=cv2.INTER_NEAREST)
+
 
         laser_roi = frame[S.laser_roi_y1:S.laser_roi_y2, S.laser_roi_x1:S.laser_roi_x2]
         laser_roi_b = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2GRAY)
         laser_roi_b = cv2.GaussianBlur(laser_roi_b, (3, 3), 0)
         laser_roi_hsv = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2HSV)
         # h, s, v = cv2.split(laser_roi_hsv)
-
+        # cv2.imshow('laser roi', laser_roi)
         edges = cv2.Canny(laser_roi_b, S.laser_canny_lower_threshold, S.laser_canny_high_threshold)
-
+        # cv2.imshow('edges', edges)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        frame_vis = frame.copy()
+        # frame_vis = frame.copy()
+        # cv2.imshow('frame', frame_vis)
+        # cv2.waitKey(1)
         
         for cnt in contours:
             #skip big contours
-            if cv2.contourArea(cnt) > 80:
+            if cv2.contourArea(cnt) > S.laser_dot_size_threshold:
                 continue
             _m = cv2.moments(cnt)
             if _m['m00'] == 0:
@@ -275,8 +279,7 @@ class HailoRun():
             dx = np.clip(dx, 0, self.dm_shape[1] - 1)
             dy = np.clip(dy, 0, self.dm_shape[0] - 1)
 
-            cv2.circle(frame_vis, (ax, ay), 9, (0, 255, 255), 1)
-            # cv2.imshow('vis', frame_vis) imshows left for later debugging
+            # cv2.circle(frame_vis, (ax, ay), 9, (0, 255, 255), 1)
             # cv2.imshow('h', h)
             # cv2.imshow('s', s)
             # cv2.imshow('v', v)
@@ -289,20 +292,26 @@ class HailoRun():
             # cv2.imshow('laser_dotm', laser_dotm)
             laser_dotm = cv2.bitwise_and(red_mask, laser_dotm)
             # cv2.imshow('bwa', laser_dotm)
-            # cv2.waitKey(999999)
+            # cv2.circle(frame_vis, (ax, ay), 1, (0, 0, 255), -1)
+            # cv2.putText(frame_vis, f'cx:{cx_crop:.2f} cy:{cy_crop:.2f}', (ax, ay + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 1)
             if cv2.countNonZero(laser_dotm) <= 0:
                 continue
+            # print('laser contourarea:', cv2.contourArea(cnt))
 
-            laser_abs_depth = float(S.laser_rbf(cx_crop, cy_crop))
-            # _a, _b, _c = S.laser_coeffs
-            # laser_abs_depth = _a * cx_crop + _b * cy_crop + _c
+            laser_abs_depth = float(S.laser_distf(cy_crop))
+            # cv2.putText(frame_vis, f'depth: {laser_abs_depth:.1f}CM', (ax, ay + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+            # cv2.imshow('vis', frame_vis) # imshows left for later debugging
+            # cv2.waitKey(999999)
             # pick and average nearby values 
             patch = dep_rel[max(0, dy - 1):dy + 2, max(0, dx - 1):dx + 2]
             laser_rel_depth = np.mean(patch)
-            
+            # laser_rel_depth = dep_rel[dy, dx]
             self.dm_scale = laser_abs_depth / laser_rel_depth
+            # print(self.dm_scale, laser_abs_depth, laser_rel_depth)
+            # print(self.dm_scale * dep_rel[dy, dx])
             break
 
+        # print(self.dm_scale)
         if self.dm_scale:
             return dep_rel * self.dm_scale
         else:
