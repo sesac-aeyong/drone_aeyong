@@ -34,6 +34,15 @@ class TelloWebServer:
         self.frame_center = (480, 360)
         self.target_depth = None
 
+        self.obs_l = 10.0
+        self.obs_c = 10.0
+        self.obs_r = 10.0
+
+        self.cmd_fb = 0   # 전후
+        self.cmd_lr = 0   # 좌우
+        self.cmd_ud = 0   # 상하
+        self.cmd_yaw = 0  # 회전
+
         # RC 명령 설정
         self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
@@ -395,8 +404,8 @@ class TelloWebServer:
         [컨트롤러] 도둑 추적 + 유동적 회피 기동
         """
         # ---------------- 튜닝 파라미터 ----------------
-        MAINTAIN_DIST = 1.8      # 목표 유지 거리 (m)
-        OBSTACLE_WARN = 1.0      # 회피 시작 거리 (m)
+        MAINTAIN_DIST = 3.0      # 목표 유지 거리 (m)
+        OBSTACLE_WARN = 1.5      # 회피 시작 거리 (m)
         OBSTACLE_CRITICAL = 0.5  # 충돌 임박 거리 (m)
         
         # PID 게인
@@ -405,8 +414,8 @@ class TelloWebServer:
         Kp_yaw_fast = 0.9        # 타겟이 많이 벗어났을 때 회전 속도 (부스트)
         
         # 회피 기동 게인
-        AVOID_SPEED_SIDE = 30    # 옆으로 피하는 속도
-        AVOID_SPEED_UP = 20      # 위로 피하는 속도
+        AVOID_SPEED_SIDE = 15    # 옆으로 피하는 속도
+        AVOID_SPEED_UP = 0      # 위로 피하는 속도
         # ---------------------------------------------
 
         self.log("INFO", "🚀 Dynamic Tracking Started")
@@ -418,10 +427,10 @@ class TelloWebServer:
                 break
             try:
                 # 1. 기본 명령 초기화
-                cmd_lr = 0   # 좌우
-                cmd_fb = 0   # 전후
-                cmd_ud = 0   # 상하
-                cmd_yaw = 0  # 회전
+                self.cmd_fb = 0   # 전후
+                self.cmd_lr = 0   # 좌우
+                self.cmd_ud = 0   # 상하
+                self.cmd_yaw = 0  # 회전
                 
                 # 2. [추적 로직] 타겟 따라가기
                 if self.target_bbox is not None and self.target_depth is not None:
@@ -438,65 +447,65 @@ class TelloWebServer:
                     
                     # **[요청사항 반영]** 중앙에서 멀어지면 회전 속도 부스트
                     if abs(err_x) > 0.15: # 15% 이상 벗어나면
-                        cmd_yaw = int(err_x * 100 * Kp_yaw_fast * 2) # 강력하게 회전
+                        self.cmd_yaw = int(err_x * 100 * Kp_yaw_fast * 2) # 강력하게 회전
                     else:
-                        cmd_yaw = int(err_x * 100 * Kp_yaw_normal * 2)
+                        self.cmd_yaw = int(err_x * 100 * Kp_yaw_normal * 2)
 
                     # (2) 거리 제어 (전진만 허용)
-                    dist_err = self.target_depth - MAINTAIN_DIST
+                    dist_err = (self.target_depth / 100) - MAINTAIN_DIST
                     
                     if dist_err > 0.1: # 타겟이 멀리 있음 -> 전진
-                        cmd_fb = int(dist_err * Kp_dist)
+                        self.cmd_fb = min(100, int(dist_err * Kp_dist))
                     else:
-                        cmd_fb = 0 # 가까우면 멈춤 (후진 금지)
+                        self.cmd_fb = 0 # 가까우면 멈춤 (후진 금지)
+                else:
+                    if self.tello:
+                        self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.05)
+                    continue
 
 
                 # 3. [회피 로직] 명령 덮어쓰기가 아닌 '합성(Add)'
-                obs_l = self.obstacle_dists.get('left', 10.0)
-                obs_c = self.obstacle_dists.get('center', 10.0)
-                obs_r = self.obstacle_dists.get('right', 10.0)
+                self.obs_l = self.obstacle_dists.get('left', 10.0)
+                self.obs_c = self.obstacle_dists.get('center', 10.0)
+                self.obs_r = self.obstacle_dists.get('right', 10.0)
 
                 # (A) 전방(Center) 장애물
-                if obs_c < OBSTACLE_WARN:
+                if self.obs_c < OBSTACLE_WARN:
                     # 전방이 막혔으므로 전진 속도를 줄임 (충돌 방지)
-                    if obs_c < OBSTACLE_CRITICAL:
-                        cmd_fb = 0  # 너무 가까우면 전진 차단
+                    if self.obs_c < OBSTACLE_CRITICAL:
+                        self.cmd_fb = 0  # 너무 가까우면 전진 차단
                     else:
-                        cmd_fb = int(cmd_fb * 0.5) # 속도 절반으로 줄이고 슬라이딩 시도
+                        self.cmd_fb = int(self.cmd_fb * 0.5) # 속도 절반으로 줄이고 슬라이딩 시도
                     
                     # 빈 공간으로 회피 벡터 추가
-                    if obs_l > obs_r: # 왼쪽이 더 넓으면
-                        cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 이동 힘 추가
+                    if self.obs_l > self.obs_r: # 왼쪽이 더 넓으면
+                        self.cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 이동 힘 추가
                     else:
-                        cmd_lr += AVOID_SPEED_SIDE # 오른쪽 이동 힘 추가
+                        self.cmd_lr += AVOID_SPEED_SIDE # 오른쪽 이동 힘 추가
                     
                     # 아주 가까우면 상승 벡터도 추가
-                    if obs_c < OBSTACLE_CRITICAL:
-                        cmd_ud += AVOID_SPEED_UP
+                    if self.obs_c < OBSTACLE_CRITICAL:
+                        self.cmd_ud += AVOID_SPEED_UP
 
                 # (B) 왼쪽 장애물 -> 오른쪽으로 밀어내는 힘 추가
-                if obs_l < OBSTACLE_WARN:
-                    cmd_lr += AVOID_SPEED_SIDE # 오른쪽 힘 추가
+                if self.obs_l < OBSTACLE_WARN:
+                    self.cmd_lr += AVOID_SPEED_SIDE # 오른쪽 힘 추가
                 
                 # (C) 오른쪽 장애물 -> 왼쪽으로 밀어내는 힘 추가
-                if obs_r < OBSTACLE_WARN:
-                    cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 힘 추가
+                if self.obs_r < OBSTACLE_WARN:
+                    self.cmd_lr -= AVOID_SPEED_SIDE # 왼쪽 힘 추가
 
 
                 # 4. 최종 명령 클램핑
-                cmd_fb = int(np.clip(cmd_fb, 0, 60))       
-                cmd_lr = int(np.clip(cmd_lr, -40, 40))     
-                cmd_ud = int(np.clip(cmd_ud, -30, 30))     
-                cmd_yaw = int(np.clip(cmd_yaw, -100, 100)) 
+                self.cmd_fb = int(np.clip(self.cmd_fb, 0, 60))
+                self.cmd_lr = int(np.clip(self.cmd_lr, -40, 40))
+                self.cmd_ud = int(np.clip(self.cmd_ud, -30, 30))
+                self.cmd_yaw = int(np.clip(self.cmd_yaw, -100, 100))
 
                 # 5. 전송 (안전장치 포함)
                 if self.tello:
-                    self.tello.send_rc_control(cmd_lr, cmd_fb, cmd_ud, cmd_yaw)
-                
-                # 디버깅
-                # if cmd_lr != 0 or cmd_fb != 0:
-                #     print(f"CMD: LR={cmd_lr} FB={cmd_fb} YAW={cmd_yaw} | Obs C={obs_c:.1f}")
-
+                    self.tello.send_rc_control(self.cmd_lr, self.cmd_fb, self.cmd_ud, self.cmd_yaw)
                 time.sleep(0.05)
 
             except Exception as e:
@@ -581,27 +590,30 @@ class TelloWebServer:
                         if best is not None:
                             # 매칭 통과: 이 bbox만 추적 대상으로
                             self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
-                            self.target_class = (best.get("class", "person") if isinstance(best, dict)
-                                                else getattr(best, "cls", "person"))
+                            self.target_class = (best.get("class", "person") if isinstance(best, dict) else getattr(best, "cls", "person"))
                             
                             # =========================================================
                             # [추가] 타겟 중앙의 Depth 값 추출
                             # =========================================================
                             if depth_resized is not None:
-                                # bbox 좌표 정수형 변환
+                                # 1. bbox 좌표 정수형 변환
                                 x1, y1, x2, y2 = map(int, self.target_bbox)
-                                
-                                # 중앙점 계산
-                                cx = (x1 + x2) // 2
-                                cy = (y1 + y2) // 2
-                                
-                                # 인덱스 범위 초과 방지 (안전장치)
+                                # 2. 인덱스 범위 초과 방지 (Slice 범위를 이미지 크기 내로 제한)
                                 h_map, w_map = depth_resized.shape
-                                cx = max(0, min(cx, w_map - 1))
-                                cy = max(0, min(cy, h_map - 1))
+                                x1 = max(0, x1)
+                                y1 = max(0, y1)
+                                x2 = min(w_map, x2)
+                                y2 = min(h_map, y2)
                                 
-                                # 거리값 갱신 (여기가 없으면 전진을 안 함)
-                                self.target_depth = depth_resized[cy, cx]
+                                # 3. ROI(관심 영역) 추출 - BBox 내부의 깊이 정보만 가져옴
+                                roi = depth_resized[y1:y2, x1:x2]
+                                
+                                # 4. 중앙값(Median) 계산 및 갱신
+                                # ROI가 비어있지 않은 경우에만 계산 (화면 밖으로 나갔을 때 에러 방지)
+                                if roi.size > 0:
+                                    self.target_depth = np.nanmedian(roi) 
+                                    # 만약 0이나 NaN이 섞여있을 수 있다면 np.nanmedian 추천, 
+                                    # 일반적인 경우 np.median(roi) 사용
                         else:
                             # 매칭 실패: 타겟 상실 처리
                             if self.target_bbox is not None:
@@ -611,6 +623,11 @@ class TelloWebServer:
                 # 감지 결과 그리기
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_with_detections = draw_detections_on_frame(frame, detections)
+
+                # 디버깅용 출력
+                cv2.putText(frame_with_detections, f"target depth: {self.target_depth}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (50, 255, 255), 4)
+                cv2.putText(frame_with_detections, f"Obs L={self.obs_l:.1f} Obs C={self.obs_c:.1f} Obs R={self.obs_r:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (50, 255, 255), 4)
+                cv2.putText(frame_with_detections, f"CMD: FB={self.cmd_fb} LR={self.cmd_lr} UD={self.cmd_ud} YAW={self.cmd_yaw}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (50, 255, 255), 4)
                 
                 # 프레임 중심 십자선 표시
                 h, w = frame_with_detections.shape[:2]
@@ -1018,7 +1035,7 @@ class TelloWebServer:
                 except ZeroDivisionError:
                     continue
                 
-                if 0.3 < Z < 5.0: # 0.3m ~ 5m 사이 유효
+                if 0.1 < Z < 5.0: # 0.3m ~ 5m 사이 유효
                     if x1 < left_boundary:
                         temp_dists['left'].append(Z)
                     elif x1 < right_boundary:
@@ -1045,8 +1062,8 @@ class TelloWebServer:
             # 구역별 최소값(가장 위험한 장애물) 업데이트
             for key in self.obstacle_dists:
                 if temp_dists[key]:
-                    # 가장 가까운 하위 10% 평균 (보수적 감지)
-                    self.obstacle_dists[key] = np.percentile(temp_dists[key], 10)
+                    # 가장 가까운 하위 5% 평균 (보수적 감지)
+                    self.obstacle_dists[key] = np.percentile(temp_dists[key], 5)
                 else:
                     self.obstacle_dists[key] = 10.0 # 장애물 없음(안전)
 
