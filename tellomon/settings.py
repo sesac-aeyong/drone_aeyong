@@ -36,14 +36,14 @@ class Settings:
     laser_canny_high_threshold: int = 90
     laser_dot_size_threshold: int = 230
     """laser dots near(<60cm) can exceed 250"""
-    laser_roi_x1: int = 430
-    laser_roi_x2: int = 465
-    laser_roi_y1: int = 445
-    laser_roi_y2: int = 550
+    laser_roi_x1: int = 530
+    laser_roi_x2: int = 770
+    laser_roi_y1: int = 150
+    laser_roi_y2: int = 240
     laser_circularity_threshold: float = 0.7
     """1.0: perfect circle"""       
-    laser_x_pixels: np.ndarray = field(default_factory=lambda: np.array([56.49, 76.16, 83.62, 86.24, 87.77, 89.23, 89.62]))
-    # laser_y_pixels: np.ndarray = field(default_factory=lambda: np.array([17.94, 18.27, 18.36, 18.41, 18.2, 18.57, 0.0]))
+    # laser_x_pixels: np.ndarray = field(default_factory=lambda: np.array([17.94, 18.27, 18.36, 18.41, 18.2, 18.57, 0.0]))
+    laser_y_pixels: np.ndarray = field(default_factory=lambda: np.array([56.49, 76.16, 83.62, 86.24, 87.77, 89.23, 89.62]) - 25.4)
     laser_distances: np.ndarray = field(default_factory=lambda: np.array([30, 60, 120, 180, 240, 300, 360]))
     # laser_rbf: Rbf = field(init=False)
     laser_distf: interp1d = field(init=False)
@@ -89,7 +89,7 @@ class Settings:
     def __post_init__(self):
         # self.laser_rbf = Rbf(self.laser_x_pixels, self.laser_y_pixels, self.laser_distances, function='multiquadric')
         self.laser_distf = interp1d(
-            self.laser_x_pixels,
+            self.laser_y_pixels,
             self.laser_distances,
             kind='linear',
             fill_value='extrapolate'

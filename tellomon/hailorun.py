@@ -137,8 +137,8 @@ class HailoRun():
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
-        if frame.shape[0] != S.frame_height or frame.shape[1] != S.frame_width:
-            # print('[HailoRun] Skipping wrong inputs')
+        if frame.shape[0] < 500 or frame.shape[1] < 600:
+            print('[HailoRun] Skipping wrong inputs')
             return [], np.zeros((self.dm_shape[0], self.dm_shape[1], 1)), []
         # prepare and run vis and dep models
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -239,7 +239,7 @@ class HailoRun():
         dep_rel = 1.0 / (dep_rel * 10.0 + 0.009)
         # normalize
         # dep_rel = cv2.normalize(dep_rel, None, 0, 255, cv2.NORM_MINMAX)
-        dep_rel = cv2.resize(dep_rel, (self.vm_shape[0], self.vm_shape[1]), interpolation=cv2.INTER_NEAREST)
+        dep_rel = cv2.resize(dep_rel, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
 
         laser_roi = frame[S.laser_roi_y1:S.laser_roi_y2, S.laser_roi_x1:S.laser_roi_x2]
@@ -249,12 +249,12 @@ class HailoRun():
         # h, s, v = cv2.split(laser_roi_hsv)
         # cv2.imshow('laser roi', laser_roi)
         edges = cv2.Canny(laser_roi_b, S.laser_canny_lower_threshold, S.laser_canny_high_threshold)
-        # cv2.imshow('edges', edges)
+        cv2.imshow('edges', edges)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # frame_vis = frame.copy()
-        # cv2.imshow('frame', frame_vis)
-        # cv2.waitKey(1)
+        frame_vis = frame.copy()
+        cv2.imshow('frame', frame_vis)
+        cv2.waitKey(1)
         
         for cnt in contours:
             #skip big contours
@@ -274,7 +274,9 @@ class HailoRun():
             cx_crop = _m['m10'] / _m['m00']
             cy_crop = _m['m01'] / _m['m00']
             ax, ay = S.laser_roi_x1 + int(cx_crop), S.laser_roi_y1 + int(cy_crop)
-            dx, dy = int(ax * self.vis_to_dep_ratio[1]), int(ay * self.vis_to_dep_ratio[0])
+            # dx, dy = int(ax * self.vis_to_dep_ratio[1]), int(ay * self.vis_to_dep_ratio[0])
+            dx, dy = ax, ay
+            
             dx = np.clip(dx, 0, self.dm_shape[1] - 1)
             dy = np.clip(dy, 0, self.dm_shape[0] - 1)
 
@@ -291,22 +293,22 @@ class HailoRun():
             # cv2.imshow('laser_dotm', laser_dotm)
             laser_dotm = cv2.bitwise_and(red_mask, laser_dotm)
             # cv2.imshow('bwa', laser_dotm)
-            # cv2.circle(frame_vis, (ax, ay), 1, (0, 0, 255), -1)
-            # cv2.putText(frame_vis, f'cx:{cx_crop:.2f} cy:{cy_crop:.2f}', (ax, ay + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 1)
+            cv2.circle(frame_vis, (ax, ay), 1, (0, 0, 255), -1)
+            cv2.putText(frame_vis, f'cx:{cx_crop:.2f} cy:{cy_crop:.2f}', (ax, ay + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 1)
             if cv2.countNonZero(laser_dotm) <= 0:
                 continue
             # print('laser contourarea:', cv2.contourArea(cnt))
 
             laser_abs_depth = float(S.laser_distf(cy_crop))
-            # cv2.putText(frame_vis, f'depth: {laser_abs_depth:.1f}CM', (ax, ay + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
-            # cv2.imshow('vis', frame_vis) # imshows left for later debugging
-            # cv2.waitKey(999999)
+            cv2.putText(frame_vis, f'depth: {laser_abs_depth:.1f}CM', (ax, ay + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+            cv2.imshow('vis', frame_vis) # imshows left for later debugging
+            cv2.waitKey(999999)
             # pick and average nearby values 
             patch = dep_rel[max(0, dy - 1):dy + 2, max(0, dx - 1):dx + 2]
             laser_rel_depth = np.mean(patch)
             # laser_rel_depth = dep_rel[dy, dx]
             self.dm_scale = laser_abs_depth / laser_rel_depth
-            # print(self.dm_scale, laser_abs_depth, laser_rel_depth)
+            print(self.dm_scale, laser_abs_depth, laser_rel_depth)
             # print(self.dm_scale * dep_rel[dy, dx])
             break
 

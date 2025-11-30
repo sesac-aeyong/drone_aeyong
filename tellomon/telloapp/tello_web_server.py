@@ -198,16 +198,17 @@ class TelloWebServer:
         target_lost_warning_sent = False
         
         # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.80      # 회전 게인
+        gain_yaw = 2.0      # 회전 게인
         gain_lr = 0.80       # 좌우 이동 게인
         gain_ud = 0.40       # 상하 이동 게인
-        gain_fb = 200         # 전후 이동 게인
+        gain_fb = 0.25         # 전후 이동 게인
         
         # 임계값
-        yaw_threshold = 0.20    # 20% 이상 오차면 회전
+        yaw_threshold = 0.0    # 20% 이상 오차면 회전
         lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
         ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
         size_threshold = 0.025  # 크기 오차 임계값
+        dist_threshold = 30     # CM
 
         self.log("INFO", "🎯 Simple RC tracking started")
         
@@ -255,22 +256,28 @@ class TelloWebServer:
                     target_area = target_width * target_height
                     frame_area = w * h
                     target_ratio = target_area / frame_area
+                    target_dist_ideal = 200 # CM
+                    target_dist = self.current_depth_map[target_center_y, target_center_x] if self.current_depth_map is not None else target_dist_ideal # CM
                     
                     # 목표 크기
                     target_size_ideal = 0.3
                     error_size = target_size_ideal - target_ratio
-                    
+                    error_dist = target_dist - target_dist_ideal
+                    dep_vis = cv2.normalize(self.current_depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    dep_vis = cv2.applyColorMap(dep_vis, cv2.COLORMAP_JET)
+                    cv2.imshow('dep', dep_vis)
+                    cv2.waitKey(1)
                     # === 간단한 비례 제어 ===
                     
                     # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
                     if abs(error_x) > yaw_threshold:
                         # 회전
-                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -100, 100))
                         lr_speed = 0
-                    elif abs(error_x) > lr_threshold:
-                        # 좌우 이동
-                        yaw_speed = 0
-                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                    # elif abs(error_x) > lr_threshold:
+                    #     # 좌우 이동
+                    #     yaw_speed = 0
+                    #     lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
                     else:
                         # 중앙 정렬됨
                         yaw_speed = 0
@@ -278,13 +285,16 @@ class TelloWebServer:
                     
                     # 2. 상하 제어
                     if abs(error_y) > ud_threshold:
-                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
+                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -10, 10))
                     else:
                         ud_speed = 0
                     
                     # 3. 전후 제어
-                    if abs(error_size) > size_threshold:
-                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
+                    # if abs(error_size) > size_threshold:
+                    #     fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
+                    print('target dist, edist:', target_dist, error_dist)
+                    if abs(error_dist) > dist_threshold:
+                        fb_speed = int(np.clip(error_dist * gain_fb, 0, 40))
                     else:
                         fb_speed = 0
                     
@@ -308,10 +318,11 @@ class TelloWebServer:
                         self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
                         target_lost_warning_sent = True
                 
-                time.sleep(0.05)  # 20Hz 제어 루프
+                time.sleep(0.1)  # 10Hz 제어 루프
                 
             except Exception as e:
                 self.log("ERROR", f"Tracking error: {e}")
+                traceback.print_exc()
                 if self.use_rc_for_tracking:
                     try:
                         self.tello.send_rc_control(0, 0, 0, 0)
@@ -425,6 +436,7 @@ class TelloWebServer:
                 with self.lock:
                     self.current_frame = frame_with_detections
                     self.current_frame_updated = True
+                    self.current_depth_map = depth_map
                 
                 # 감지 정보를 클라이언트에 전송
                 self.socketio.emit('detections_update', {
