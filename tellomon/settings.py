@@ -20,6 +20,7 @@ class Settings:
     _emb_out_size: int = 2048 if '2048' in embed_model else 512 
     """Hmm. Perhaps there is a way to get this info"""
     depth_model: str = 'models/scdepthv3.hef'
+    pose_model: str = 'models/mspn_regnetx_800mf.hef'
 
     max_vis_detections: int = 30
     """vision model max detections"""

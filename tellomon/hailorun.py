@@ -16,8 +16,8 @@ class HailoRun():
     Hailo pipeline class.
 
     Hailo.run(frame):
-    frame -> vis_model -> emb_model -> (dets, depth, yolobox)
-          \\_ dep_model              /
+    frame -> vis_model -> emb_model -> (dets, depth)
+          \\_ dep_model(thief)        /
     """
 
     def __init__(self):
@@ -35,6 +35,7 @@ class HailoRun():
         self.vis_q = queue.Queue()
         self.dep_q = queue.Queue()
         self.emb_q = queue.Queue()
+        self.pos_q = queue.Queue()
 
         self.vis_cb = partial(_callback, output_queue = self.vis_q)
         self.dep_cb = partial(_callback, output_queue = self.dep_q)
@@ -46,10 +47,6 @@ class HailoRun():
         self.active_tracker = self.longterm_tracker
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
-        
-        S.laser_x_pixels = np.array([85, 63.35, 48.5, 42.45, 40.1, 38])
-        S.laser_y_pixels = np.array([38, 26, 17.2, 14.35, 12.9, 12])
-        S.laser_distances = np.array([30, 60, 120, 180, 240, 300])
 
 
     def load(self):
@@ -58,13 +55,16 @@ class HailoRun():
         print('vis model:', S.vis_model)
         print('dep model:', S.depth_model)
         print('emb model:', S.embed_model)
+        print('pose model:', S.pose_model)
         self.vis_m = HailoInfer(S.vis_model)
         self.dep_m = HailoInfer(S.depth_model, output_type='UINT16')
         self.emb_m = HailoInfer(S.embed_model, output_type='FLOAT32') 
+        self.pos_m = HailoInfer(S.pose_model, output_type='FLOAT32')
 
         self.vm_shape = tuple(reversed(self.vis_m.get_input_shape()[:2]))
-        self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
         self.dm_shape = tuple(reversed(self.dep_m.get_input_shape()[:2]))
+        self.em_shape = tuple(reversed(self.emb_m.get_input_shape()[:2]))
+        self.pm_shape = tuple(reversed(self.pos_m.get_input_shape()[:2]))
 
         # buffers
         self.vis_fb = np.empty((self.vm_shape[1], self.vm_shape[0], 3), dtype=np.uint8)
@@ -73,8 +73,6 @@ class HailoRun():
         """depth model framebuffer"""
         print(f'done loading hailo models, took {time.time() - ct:.1f} seconds')
 
-        self.vis_to_dep_ratio = (self.dm_shape[1] / self.vm_shape[1],
-                                 self.dm_shape[0] / self.vm_shape[0])
 
     def enter_thief_mode(self, thief_id: int) -> bool:
         """
@@ -132,20 +130,25 @@ class HailoRun():
         return scale, (left, top)
     
 
-    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray, List]:
+    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
         output is detections, depth, list of yolo boxes
         """
-        if frame.shape[0] < 500 or frame.shape[1] < 600:
-            print('[HailoRun] Skipping wrong inputs')
-            return [], np.zeros((self.dm_shape[0], self.dm_shape[1], 1)), []
+        # if frame.shape[0] < 500 or frame.shape[1] < 600:
+        #     print('[HailoRun] Skipping wrong inputs')
+        #     return [], np.zeros((self.dm_shape[0], self.dm_shape[1], 1)), []
         # prepare and run vis and dep models
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
         self.vis_m.run([self.vis_fb], self.vis_cb)
-        self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
-        self.dep_m.run([self.dep_fb], self.dep_cb)
+
+        # depth model only when thief mode is active
+        depth_ran = False
+        if self.thief_id > 0:
+            self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
+            self.dep_m.run([self.dep_fb], self.dep_cb)
+            depth_ran = True
 
         # wait for vision model to run embeddings on.
         vision = self.vis_q.get()
@@ -167,7 +170,54 @@ class HailoRun():
             emb_crops.append(crop)
 
         embeddings = [None] * num_detections
-        
+
+        # pos_ids = []
+        # pos_crops = []
+        # for i in range(num_detections):
+        #     if scores[i] < 0.5: # S.min_pos_confidence
+        #         continue
+        #     x1, y1, x2, y2 = self._safe_box(boxes[i])
+        #     if (y2 - y1) <= 0 or (x2 - x1) <= 0 or ((y2 - y1) * (x2 - x1)) < 50: #S.min_pos_cropsize:
+        #         continue
+        #     crop = cv2.resize(frame[y1:y2, x1:x2], self.pm_shape, interpolation=cv2.INTER_LINEAR)
+        #     pos_ids.append((i, x1, y1, x2 - x1, y2 - y1))
+        #     pos_crops.append(crop)
+
+        # poses = [None] * num_detections
+        # frame_vis = frame.copy()
+        # if pos_ids:
+        #     self.pos_m.run(np.stack(pos_crops, axis=0), partial(_pose_callback, output_queue = self.pos_q, info = pos_ids))
+        #     _poses = self.pos_q.get()
+
+#             for _i, (det_id, *_) in enumerate(pos_ids):
+#                 keypoints = _poses[_i]
+#                 limbs = [
+#     (0, 1), (0, 2),       # Nose → eyes
+#     (1, 3), (2, 4),       # Eyes → ears
+#     (0, 5), (0, 6),       # Nose → shoulders
+#     (5, 7), (7, 9),       # Left arm
+#     (6, 8), (8, 10),      # Right arm
+#     (5, 11), (6, 12),     # Shoulders → hips
+#     (11, 12),             # Hip line
+#     (11, 13), (13, 15),   # Left leg
+#     (12, 14), (14, 16)    # Right leg
+# ]               
+#                 conf_thresh = 60
+#                 for i, (x, y, conf) in enumerate(keypoints):
+#                     if conf > conf_thresh:
+#                         cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+#                         cv2.putText(frame_vis, str(i), (int(x)+2,int(y)+2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,255,255), 1)
+
+#                 # Draw limbs
+#                 for a, b in limbs:
+#                     if keypoints[a][2] > conf_thresh and keypoints[b][2] > conf_thresh:
+#                         pt1 = (int(keypoints[a][0]), int(keypoints[a][1]))
+#                         pt2 = (int(keypoints[b][0]), int(keypoints[b][1]))
+#                         cv2.line(frame_vis, pt1, pt2, (255, 0, 0), 2)
+
+#                 cv2.imshow('crop', frame_vis)
+#                 cv2.waitKey(1)
+                
         if emb_ids:
             self.emb_m.run(np.stack(emb_crops, axis=0), partial(_batch_callback, output_queue = self.emb_q))
             _embs = self.emb_q.get()
@@ -178,6 +228,7 @@ class HailoRun():
             np.array([[*box, score] for box, score in zip(boxes, scores)]), 
             embeddings
             )
+
         
         rets = []
         for track in targets:            
@@ -194,11 +245,21 @@ class HailoRun():
             if (self.thief_id != 0):
                 det["thief_dist"] = float(getattr(track, "thief_dist", 1.0))
                 det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
+                x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[0], x2)
+                y2 = min(frame.shape[1], y2)
+                crop = frame[y1:y2, x1:x2]
+                
+                self.pos_m.run([cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
+                                partial(_pose_callback, output_queue = self.pos_q, info = (0, x1, y1, x2 - x1, y2 - y1)))
+                det["pose"] = self.pos_q.get()
             rets.append(det)
         
-        depth = self.recover_depth(frame, self.dep_q.get())
-
-        return rets, depth, boxes
+        if self.thief_id and depth_ran:
+            return rets, cv2.resize(self.dep_q.get(), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST), []
+        return rets, np.zeros_like(frame), []
     
             
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
@@ -227,97 +288,12 @@ class HailoRun():
     def __del__(self):
         self.close()
 
-
-    def recover_depth(self, frame, dep_rel_quant) -> np.array:
-        """
-        returns depth_abs recovered from laser point
-        """
-        ### dequantize and apply hailo's post process
-        qi = self.dep_m.infer_model.outputs[0].quant_infos[0]
-        dep_rel = (dep_rel_quant.astype(np.float32) - qi.qp_zp) * qi.qp_scale
-        dep_rel = 1 / (1 + np.exp(-dep_rel))
-        dep_rel = 1.0 / (dep_rel * 10.0 + 0.009)
-        # normalize
-        # dep_rel = cv2.normalize(dep_rel, None, 0, 255, cv2.NORM_MINMAX)
-        dep_rel = cv2.resize(dep_rel, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-
-        laser_roi = frame[S.laser_roi_y1:S.laser_roi_y2, S.laser_roi_x1:S.laser_roi_x2]
-        laser_roi_b = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2GRAY)
-        laser_roi_b = cv2.GaussianBlur(laser_roi_b, (3, 3), 0)
-        laser_roi_hsv = cv2.cvtColor(laser_roi, cv2.COLOR_BGR2HSV)
-        # h, s, v = cv2.split(laser_roi_hsv)
-        # cv2.imshow('laser roi', laser_roi)
-        edges = cv2.Canny(laser_roi_b, S.laser_canny_lower_threshold, S.laser_canny_high_threshold)
-        cv2.imshow('edges', edges)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        frame_vis = frame.copy()
-        cv2.imshow('frame', frame_vis)
-        cv2.waitKey(1)
         
-        for cnt in contours:
-            #skip big contours
-            if cv2.contourArea(cnt) > S.laser_dot_size_threshold:
-                continue
-            _m = cv2.moments(cnt)
-            if _m['m00'] == 0:
-                continue
+    def _deq(self, model, data):
+        out = model.infer_model.outputs[0]
+        qi = out.quant_infos[0]
+        return (data - qi.qp_zp) * qi.qp_scale
 
-            peri = cv2.arcLength(cnt, True)
-            area = cv2.contourArea(cnt)
-            circularity = 4 * np.pi * (area / (peri * peri))
-            if circularity < S.laser_circularity_threshold:  # adjustable
-                continue
-            (_x, _y), r = cv2.minEnclosingCircle(cnt)
-
-            cx_crop = _m['m10'] / _m['m00']
-            cy_crop = _m['m01'] / _m['m00']
-            ax, ay = S.laser_roi_x1 + int(cx_crop), S.laser_roi_y1 + int(cy_crop)
-            # dx, dy = int(ax * self.vis_to_dep_ratio[1]), int(ay * self.vis_to_dep_ratio[0])
-            dx, dy = ax, ay
-            
-            dx = np.clip(dx, 0, self.dm_shape[1] - 1)
-            dy = np.clip(dy, 0, self.dm_shape[0] - 1)
-
-            # cv2.circle(frame_vis, (ax, ay), 9, (0, 255, 255), 1)
-            # cv2.imshow('h', h)
-            # cv2.imshow('s', s)
-            # cv2.imshow('v', v)
-            red_mask = cv2.inRange(laser_roi_hsv, S.red_mll, S.red_mlu)
-            red_mask |= cv2.inRange(laser_roi_hsv, S.red_mul, S.red_muu)
-            red_mask = cv2.dilate(red_mask, np.ones((3, 3), np.uint8), 1)
-            # cv2.imshow('rm', red_mask)
-            laser_dotm = np.zeros_like(laser_roi_b)
-            cv2.circle(laser_dotm, (int(cx_crop), int(cy_crop)), int(r) + 3, 255, -1)
-            # cv2.imshow('laser_dotm', laser_dotm)
-            laser_dotm = cv2.bitwise_and(red_mask, laser_dotm)
-            # cv2.imshow('bwa', laser_dotm)
-            cv2.circle(frame_vis, (ax, ay), 1, (0, 0, 255), -1)
-            cv2.putText(frame_vis, f'cx:{cx_crop:.2f} cy:{cy_crop:.2f}', (ax, ay + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 1)
-            if cv2.countNonZero(laser_dotm) <= 0:
-                continue
-            # print('laser contourarea:', cv2.contourArea(cnt))
-
-            laser_abs_depth = float(S.laser_distf(cy_crop))
-            cv2.putText(frame_vis, f'depth: {laser_abs_depth:.1f}CM', (ax, ay + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
-            cv2.imshow('vis', frame_vis) # imshows left for later debugging
-            cv2.waitKey(999999)
-            # pick and average nearby values 
-            patch = dep_rel[max(0, dy - 1):dy + 2, max(0, dx - 1):dx + 2]
-            laser_rel_depth = np.mean(patch)
-            # laser_rel_depth = dep_rel[dy, dx]
-            self.dm_scale = laser_abs_depth / laser_rel_depth
-            print(self.dm_scale, laser_abs_depth, laser_rel_depth)
-            # print(self.dm_scale * dep_rel[dy, dx])
-            break
-
-        # print(self.dm_scale)
-        if self.dm_scale:
-            return dep_rel * self.dm_scale
-        else:
-            return dep_rel
-        
 
 
 def _callback(bindings_list, output_queue, **kwargs) -> None:
@@ -343,4 +319,29 @@ def _batch_callback(bindings_list, output_queue, **kwargs) -> None:
         result.append(np.asarray(data).flatten())
 
     output_queue.put_nowait(result)
+
+
+def _pose_callback(bindings_list, output_queue, info, **kwargs) -> None:
+    """
+    pose callback, single output
+    """
+
+    for bindings in bindings_list:
+        data = bindings.output().get_buffer()
+        keypoints = []
+        _, _x, _y, _w, _h = info
+                
+        for k in range(17):
+            hm = data[:, :, k]            # single keypoint heatmap
+            y, x = np.unravel_index(np.argmax(hm), hm.shape)
+            scale_x = (_w) / hm.shape[1] / 4  # hm.shape is 64x48
+            scale_y = (_h) / hm.shape[0] / 4
+            keypoints.append((float(x * 4 * scale_x + _x), 
+                              float(y * 4 * scale_y + _y), 
+                              float(hm[y, x])))          # (x, y) in heatmap coordinates
+        
+        output_queue.put_nowait(keypoints)
+
+
+
 
