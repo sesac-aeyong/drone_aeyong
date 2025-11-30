@@ -10,7 +10,7 @@ from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
 from settings import settings as S
-
+from .control_fusion import ControlFusion, select_thief_candidate, clip_bbox_to_frame
 
 class TelloWebServer:
     def __init__(self, socketio):
@@ -58,6 +58,23 @@ class TelloWebServer:
             self.log("ERROR", f"❌ Failed to load inference engine: {e}")
             traceback.print_exc()
             self.inference_engine = None
+            
+        # === 보조 신호 토글 ===
+        self.USE_POSE       = True    # 포즈 추출
+        self.USE_FLOW       = True    # 옵티컬 플로우 보조/유실 홀드
+        self.USE_DEPTH_VIEW = True    # SCDepth 표시용(척추 주변 최빈값)
+        self.USE_OBS_BRAKE  = True    # 중앙 전방 근접 장애물 브레이크(fb=0)
+        # === 포즈 스케일 상태 ===
+        self.pose_quality = 0.0
+        self.pose_should_ref = None; self.pose_should_ema = None
+        self.pose_spine_ref  = None; self.pose_spine_ema  = None
+        # === 옵티컬 플로우 상태 ===
+        self.prev_gray = None
+        self.last_flow_vec = (0.0, 0.0)   # (vx, vy) px/frame
+        self.flow_hold_until = 0.0
+        self.flow_bbox = None
+        # === 제어 융합기 ===
+        self.fuser = ControlFusion(tracking_rc_speed=self.tracking_rc_speed)
 
 
     def log(self, level, message):
@@ -196,20 +213,7 @@ class TelloWebServer:
         """자동 추적 스레드"""
         target_lost_time = None
         target_lost_warning_sent = False
-        
-        # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.80      # 회전 게인
-        gain_lr = 0.80       # 좌우 이동 게인
-        gain_ud = 0.40       # 상하 이동 게인
-        gain_fb = 200         # 전후 이동 게인
-        
-        # 임계값
-        yaw_threshold = 0.20    # 20% 이상 오차면 회전
-        lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
-        ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
-        size_threshold = 0.025  # 크기 오차 임계값
-
-        self.log("INFO", "🎯 Simple RC tracking started")
+        self.log("INFO", "🎯 RC tracking (bbox + pose + flow) started")
         
         while self.is_tracking:
             try:
@@ -235,68 +239,29 @@ class TelloWebServer:
                         target_lost_time = None
                         target_lost_warning_sent = False
                     
-                    # 제어 명령 계산
-                    h, w = self.current_frame.shape[:2]
-                    center_x = w // 2
-                    center_y = h // 2
-                    
-                    # target_bbox is in [x1, y1, x2, y2] format
-                    x1, y1, x2, y2 = self.target_bbox
-                    target_center_x = (x1 + x2) // 2
-                    target_center_y = (y1 + y2) // 2
-                    
-                    # 오차 계산 (정규화)
-                    error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
-                    error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
-                    
-                    # 타겟 크기
-                    target_width = x2 - x1
-                    target_height = y2 - y1
-                    target_area = target_width * target_height
-                    frame_area = w * h
-                    target_ratio = target_area / frame_area
-                    
-                    # 목표 크기
-                    target_size_ideal = 0.3
-                    error_size = target_size_ideal - target_ratio
-                    
-                    # === 간단한 비례 제어 ===
-                    
-                    # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
-                    if abs(error_x) > yaw_threshold:
-                        # 회전
-                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                        lr_speed = 0
-                    elif abs(error_x) > lr_threshold:
-                        # 좌우 이동
-                        yaw_speed = 0
-                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        # 중앙 정렬됨
-                        yaw_speed = 0
-                        lr_speed = 0
-                    
-                    # 2. 상하 제어
-                    if abs(error_y) > ud_threshold:
-                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        ud_speed = 0
-                    
-                    # 3. 전후 제어
-                    if abs(error_size) > size_threshold:
-                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
-                    else:
-                        fb_speed = 0
-                    
-                    # RC 명령 전송
+
+                    # --- 포즈 dict 구성(없으면 None로 전달) ---
+                    pose_dict = None
+                    if self.USE_POSE and (self.pose_should_ref is not None or self.pose_spine_ref is not None):
+                        pose_dict = {
+                            'quality': self.pose_quality,
+                            'shoulder': {'ref': self.pose_should_ref, 'ema': self.pose_should_ema} if self.pose_should_ref else None,
+                            'spine':    {'ref': self.pose_spine_ref,  'ema': self.pose_spine_ema}  if self.pose_spine_ref  else None,
+                        }
+                    # --- 장애물 브레이크 여부(중앙 전방) ---
+                    obstacle_brake = getattr(self, "_obstacle_brake", False)
+                    # --- RC 산출 ---
+                    lr_speed, fb_speed, ud_speed, yaw_speed = self.fuser.compute_rc(
+                        self.current_frame.shape, self.target_bbox,
+                        pose_dict=pose_dict,
+                        flow_vec=(self.last_flow_vec if self.USE_FLOW else None),
+                        size_target_range=(0.40, 0.50),
+                        obstacle_brake=obstacle_brake
+                    )
                     self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
-                    
-                    # 로그 출력
-                    # if yaw_speed != 0 or lr_speed != 0 or ud_speed != 0 or fb_speed != 0:
-                        # action = f"RC[lr={lr_speed:+3d}, fb={fb_speed:+3d}, ud={ud_speed:+3d}, yaw={yaw_speed:+3d}]"
-                        # self.log("DEBUG", 
-                            # f"🎯 {action} | Err[x={error_x:+.3f}, y={error_y:+.3f}, s={error_size:+.3f}] | Size={target_ratio:.3f}")
-                
+
+
+
                 else:
                     # 타겟을 잃어버림
                     if target_lost_time is None:
@@ -374,38 +339,120 @@ class TelloWebServer:
                     
                     if self.is_tracking:
                         # 1) 도둑 모드 후보 찾기: thief_dist <= gate 인 것 중 최솟값
-                        best = None
-                        for det in detections:
-                            get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
-                            td = get("thief_dist")
-                            tg = get("thief_cos_dist")
-                            if td is None or tg is None:
-                                continue
-                            if td <= tg:
-                                if (best is None) or (td < best.get("thief_dist", 1e9)):
-                                    best = det
+                        best = select_thief_candidate(detections)
 
                         if best is not None:
                             # 매칭 통과: 이 bbox만 추적 대상으로
-                            self.target_bbox  = best["bbox"] if isinstance(best, dict) else best.bbox
-                            self.target_class = (best.get("class", "person") if isinstance(best, dict)
-                                                else getattr(best, "cls", "person"))
+                            bb = (best["bbox"] if isinstance(best, dict) else getattr(best,"bbox",None))
+                            if bb is not None:
+                                # 프레임 내부로 클리핑
+                                h, w = frame.shape[:2]
+                                bb = clip_bbox_to_frame(bb, w, h)
+                                if bb:
+                                    self.target_bbox = bb
+                                    self.target_class = (best.get("class","person") if isinstance(best,dict)
+                                                         else getattr(best,"cls","person"))
+                                    # --- 포즈 업데이트 & 기준/EMA ---
+                                    if self.USE_POSE and hasattr(self.inference_engine,'pose_on_bbox'):
+                                        try:
+                                            # frame은 BGR. pose_on_bbox가 RGB를 원하면 변환해 주세요.
+                                            pose = self.inference_engine.pose_on_bbox(frame, self.target_bbox)
+                                            # 기대: {'shoulder':px,'spine':px,'quality':0~1}
+                                            self.pose_quality = float(pose.get('quality',0.0) or 0.0)
+                                            sh = pose.get('shoulder'); sp = pose.get('spine')
+                                            # 기준 없으면 세팅
+                                            if self.pose_should_ref is None and sh:
+                                                self.pose_should_ref = float(sh); self.pose_should_ema = float(sh)
+                                            if self.pose_spine_ref  is None and sp:
+                                                self.pose_spine_ref  = float(sp); self.pose_spine_ema  = float(sp)
+                                            # EMA 업데이트
+                                            alpha = 0.25
+                                            if sh:
+                                                self.pose_should_ema = (1-alpha)*(self.pose_should_ema or sh) + alpha*float(sh)
+                                            if sp:
+                                                self.pose_spine_ema  = (1-alpha)*(self.pose_spine_ema  or sp) + alpha*float(sp)
+                                        except Exception as e:
+                                            self.log("WARNING", f"pose_on_bbox error: {e}")
+                                    # --- 옵티컬 플로우 업데이트 ---
+                                    if self.USE_FLOW:
+                                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                        if self.prev_gray is not None:
+                                            x1,y1,x2,y2 = self.target_bbox
+                                            xs = np.linspace(x1+5, x2-5, 5, dtype=np.float32)
+                                            ys = np.linspace(y1+5, y2-5, 5, dtype=np.float32)
+                                            if xs.size>0 and ys.size>0:
+                                                pts = np.array([(x,y) for y in ys for x in xs], dtype=np.float32).reshape(-1,1,2)
+                                                p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, pts, None)
+                                                if p1 is not None and st is not None:
+                                                    good = (st.squeeze()==1)
+                                                    if np.any(good):
+                                                        dx = p1[good,:,0]-pts[good,:,0]
+                                                        dy = p1[good,:,1]-pts[good,:,1]
+                                                        self.last_flow_vec = (float(np.median(dx)), float(np.median(dy)))
+                                        self.prev_gray = gray
+                                    # --- SCDepth 표시값(척추 주변 최빈값) 계산 ---
+                                    self._obstacle_brake = False
+                                    if self.USE_DEPTH_VIEW and depth_map is not None:
+                                        try:
+                                            x1,y1,x2,y2 = self.target_bbox
+                                            # 척추 주변: bbox 중앙 세로 1/3 폭을 ROI로 (가볍고 견고)
+                                            cx = (x1+x2)//2
+                                            w3 = max(2, (x2-x1)//6)  # 중앙 1/3폭 ~= 2*w3
+                                            xs1, xs2 = max(0,cx-w3), min(depth_map.shape[1]-1, cx+w3)
+                                            roi = depth_map[max(0,y1):min(depth_map.shape[0]-1,y2), xs1:xs2]
+                                            depth_mode = None
+                                            if roi.size>0:
+                                                # 32-bin 히스토그램의 최고빈(모드)값
+                                                hist, bin_edges = np.histogram(roi.flatten(), bins=32)
+                                                idx = int(hist.argmax())
+                                                depth_mode = float(0.5*(bin_edges[idx]+bin_edges[idx+1]))
+                                            # 중앙 전방 장애물 브레이크: 타깃 bbox 바깥 중앙 스트립에서 근접체크
+                                            if self.USE_OBS_BRAKE:
+                                                h, w = depth_map.shape[:2]
+                                                strip = depth_map[:, w//2 - w//16 : w//2 + w//16]  # 화면 중앙 1/8 폭
+                                                if strip.size>0:
+                                                    dmin = float(np.percentile(strip, 5))  # 아주 가까운 물체
+                                                    # 상대 스케일이므로 "너무 가까움" 기준은 경험적으로(작을수록 가까움)
+                                                    if dmin < 0.15:  # 튠 포인트
+                                                        self._obstacle_brake = True
+                                            # 웹 표시용으로 저장
+                                            self.current_depth_map = depth_map
+                                            self._last_depth_mode_spine = depth_mode
+                                        except Exception as e:
+                                            self.log("WARNING", f"depth spine-mode compute error: {e}")
                         else:
                             # 매칭 실패: 타겟 상실 처리
                             if self.target_bbox is not None:
                                 self.log("WARNING", f"⚠️ Thief not found under gate; holding position")
                             self.target_bbox = None
                 
-                # 감지 결과 그리기
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_with_detections = draw_detections_on_frame(frame, detections)
+                # 오버레이 (draw 함수 컬러 기대에 맞춰 사용)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_with_detections = draw_detections_on_frame(frame_rgb, detections)
                 
-                # 프레임 중심 십자선 표시
+                # 표시: 중앙 십자 + spine-mode depth text
                 h, w = frame_with_detections.shape[:2]
                 cx, cy = w // 2, h // 2
                 cv2.line(frame_with_detections, (cx - 30, cy), (cx + 30, cy), (255, 255, 255), 2)
                 cv2.line(frame_with_detections, (cx, cy - 30), (cx, cy + 30), (255, 255, 255), 2)
                 cv2.circle(frame_with_detections, (cx, cy), 5, (255, 255, 255), -1)
+                
+                # 텍스트: depth(spine-mode) & flow & pose quality
+                try:
+                    dmode = getattr(self, "_last_depth_mode_spine", None)
+                    txt = []
+                    if dmode is not None:
+                        txt.append(f"spine-depth(mode): {dmode:.3f}")
+                    if self.USE_FLOW and self.last_flow_vec is not None:
+                        vx, vy = self.last_flow_vec; txt.append(f"flow(vx,vy): ({vx:.1f},{vy:.1f})")
+                    if self.USE_POSE:
+                        txt.append(f"poseQ: {self.pose_quality:.2f}")
+                    if getattr(self, "_obstacle_brake", False):
+                        txt.append("BRAKE")
+                    if txt:
+                        cv2.putText(frame_with_detections, " | ".join(txt), (10,30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+                except: pass
                 
                 # 배터리 및 높이 정보 업데이트
                 try:
@@ -433,7 +480,11 @@ class TelloWebServer:
                     'height': self.height,
                     'is_tracking': self.is_tracking,
                     'target_identity_id': self.target_identity_id,
-                    'target_class': self.target_class
+                    'target_class': self.target_class,
+                    'pose_quality': self.pose_quality,
+                    'flow_vec': self.last_flow_vec,
+                    'spine_depth_mode': getattr(self, "_last_depth_mode_spine", None),
+                    'brake': getattr(self, "_obstacle_brake", False),
                 })
                 
                 
