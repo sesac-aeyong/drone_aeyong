@@ -1,7 +1,7 @@
 # control_fusion.py
 from dataclasses import dataclass
 import math
-from typing import Optional, Sequence, Tuple, Dict, Any, Iterable, Union, List
+from typing import Optional, Sequence, Tuple, Dict, Any, List
 import numpy as np
 import cv2
 
@@ -66,60 +66,81 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
         layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
-
-def overlay_pose_points(
-    frame_vis,
-    should_ema=None, spine_ema=None, alpha=0.0,
-    pose_kpts=None,
-    bbox=None
+# 9 keypoints (COCO indices)
+_FACE      = [0, 1, 2, 3, 4]     # nose, L eye, R eye, L ear, R ear
+_SHOULDER  = [5, 6]              # L/R shoulders
+_HIP       = [11, 12]            # L/R hips
+_KP9       = _FACE + _SHOULDER + _HIP
+# minimal limbs only among those 9
+_LIMBS_9 = [
+    (0, 1), (0, 2),     # nose→eyes
+    (1, 3), (2, 4),     # eyes→ears
+    (5, 6),             # shoulder line
+    (11, 12),           # hip line
+    (5, 11), (6, 12),   # shoulders→hips
+    (0, 5), (0, 6),     # nose→shoulders
+]
+def overlay_pose_points_min9(
+    img,
+    should_ema=None, spine_ema=None, alpha: float = 0.0,
+    pose_kpts=None,            # [[x,y,conf_uint8], ...] length >= 13 (COCO)
+    conf_thresh: int = 60,
+    draw_indices: bool = False,
+    draw_midpoints: bool = True
 ):
     """
-    ★★ 네가 준 코드 100% 그대로 사용 ★★
-    - keypoints = pose_kpts
-    - limbs = 네가 올린 그대로
-    - conf_thresh = 60
+    얼굴(5) + 어깨(2) + 힙(2) = 9점만 표시하고, 해당 점들만 연결합니다.
+    confidence는 0~255 정수 가정, conf_thresh 이상만 그립니다.
     """
-
     if pose_kpts is None or len(pose_kpts) < 17:
-        return frame_vis
+        return img
 
-    keypoints = pose_kpts
-    conf_thresh = 60
+    h, w = img.shape[:2]
 
-    limbs = [
-        (0, 1), (0, 2),       # Nose → eyes
-        (1, 3), (2, 4),       # Eyes → ears
-        (0, 5), (0, 6),       # Nose → shoulders
-        (5, 7), (7, 9),       # Left arm
-        (6, 8), (8, 10),      # Right arm
-        (5, 11), (6, 12),     # Shoulders → hips
-        (11, 12),             # Hip line
-        (11, 13), (13, 15),   # Left leg
-        (12, 14), (14, 16)    # Right leg
-    ]
-
-    # ---- Draw keypoints ----
-    for i, (x, y, conf) in enumerate(keypoints):
+    def _pt_ok(i):
+        if i >= len(pose_kpts): return False
+        kp = pose_kpts[i]
+        if not kp or len(kp) < 3: return False
         try:
-            if conf > conf_thresh:
-                cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-                cv2.putText(frame_vis, str(i), (int(x)+2, int(y)+2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,255,255), 1)
+            return int(kp[2]) > conf_thresh
+        except:
+            return False
+
+    def _pt_xy(i):
+        kp = pose_kpts[i]
+        x = max(0, min(w - 1, int(kp[0])))
+        y = max(0, min(h - 1, int(kp[1])))
+        return (x, y)
+
+    # points
+    for i in _KP9:
+        if _pt_ok(i):
+            x, y = _pt_xy(i)
+            cv2.circle(img, (x, y), 3, (0, 255, 0), -1)
+            if draw_indices:
+                cv2.putText(img, str(i), (x+2, y+2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1, cv2.LINE_AA)
+
+    # limbs
+    for a, b in _LIMBS_9:
+        if _pt_ok(a) and _pt_ok(b):
+            cv2.line(img, _pt_xy(a), _pt_xy(b), (255, 0, 0), 2)
+
+    # midpoints (어깨/힙 중심은 제어 시 유용)
+    if draw_midpoints:
+        try:
+            if _pt_ok(5) and _pt_ok(6):
+                sx = (_pt_xy(5)[0] + _pt_xy(6)[0]) // 2
+                sy = (_pt_xy(5)[1] + _pt_xy(6)[1]) // 2
+                cv2.circle(img, (sx, sy), 4, (255, 0, 0), -1, cv2.LINE_AA)
+            if _pt_ok(11) and _pt_ok(12):
+                hx = (_pt_xy(11)[0] + _pt_xy(12)[0]) // 2
+                hy = (_pt_xy(11)[1] + _pt_xy(12)[1]) // 2
+                cv2.circle(img, (hx, hy), 4, (0, 0, 255), -1, cv2.LINE_AA)
         except:
             pass
 
-    # ---- Draw limbs ----
-    for a, b in limbs:
-        try:
-            if keypoints[a][2] > conf_thresh and keypoints[b][2] > conf_thresh:
-                pt1 = (int(keypoints[a][0]), int(keypoints[a][1]))
-                pt2 = (int(keypoints[b][0]), int(keypoints[b][1]))
-                cv2.line(frame_vis, pt1, pt2, (255, 0, 0), 2)
-        except:
-            pass
-
-    return frame_vis
-
+    return img
 
 def overlay_flow_arrow(base_bgr: np.ndarray,
                        bbox: Optional[Tuple[int,int,int,int]],
@@ -271,21 +292,6 @@ def clip_bbox_to_frame(bb, w, h):
     y2 = max(0, min(y2, h - 1))
     return [x1, y1, x2, y2] if (x2 > x1 and y2 > y1) else None
 
-def select_thief_candidate(detections):
-    """(이전 호환) thief_dist <= thief_cos_dist 후보 중 td 최소를 선택."""
-    best, best_td = None, 1e9
-    if not detections:
-        return None
-    for det in detections:
-        get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
-        td = get("thief_dist")
-        gate = get("thief_cos_dist")
-        if td is None or gate is None:
-            continue
-        if td <= gate and td < best_td:
-            best, best_td = det, td
-    return best
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optical Flow (척추 스트립 기반)
@@ -329,9 +335,6 @@ def compute_flow_from_spine_strip(prev_gray: np.ndarray,
 # ───────────────────────────────────────────────────────────────────────────────
 # Pose 스케일 상태 업데이트(어깨/척추)
 # ───────────────────────────────────────────────────────────────────────────────
-
-from typing import Any, Dict, Optional, Sequence, Tuple, List
-import math
 
 # COCO 17 keypoint indices
 KP = {"LShoulder": 5, "RShoulder": 6, "LHip": 11, "RHip": 12}
@@ -552,18 +555,3 @@ class SearchManager:
         self.active = False
         self.until = 0.0
         self.yaw = 0
-
-__all__ = [
-    "ControlFusion",
-    "clip_bbox_to_frame",
-    "select_thief_candidate",
-    "compute_flow_from_spine_strip",
-    "update_pose_stats",
-    "spine_depth_mode_and_brake",
-    "SearchParams",
-    "SearchManager",
-    # new helpers
-    "want_depth", "want_pose", "want_flow",
-    "feature_alpha", "prepare_pose_for_rc",
-    "depth_to_vis", "overlay_blend", "overlay_pose_points", "overlay_flow_arrow",
-]
