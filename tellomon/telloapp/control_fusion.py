@@ -1,9 +1,104 @@
 # control_fusion.py
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Iterable, Union
 import numpy as np
 import cv2
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Feature gates (ON/OFF + alpha)
+# ───────────────────────────────────────────────────────────────────────────────
+def want_depth(features: Dict[str, Any]) -> bool:
+    return bool(features.get('depth', False))
+
+def want_pose(features: Dict[str, Any]) -> bool:
+    return bool(features.get('pose', False))
+
+def want_flow(features: Dict[str, Any]) -> bool:
+    return bool(features.get('flow', False))
+
+def feature_alpha(features: Dict[str, Any], default: float = 0.5) -> float:
+    try:
+        a = float(features.get('alpha', default))
+    except Exception:
+        a = default
+    return 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Pose → RC 보조 입력 준비
+# ───────────────────────────────────────────────────────────────────────────────
+def prepare_pose_for_rc(
+    use_pose: bool,
+    pose_quality: float,
+    should_ref: Optional[float],
+    should_ema: Optional[float],
+    spine_ref: Optional[float],
+    spine_ema: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if not use_pose:
+        return None
+    has_any = any(v is not None for v in (should_ref, should_ema, spine_ref, spine_ema))
+    if not has_any:
+        return None
+    return {
+        'quality': float(pose_quality),
+        'shoulder': {'ref': should_ref, 'ema': should_ema} if should_ref is not None or should_ema is not None else None,
+        'spine':    {'ref': spine_ref,  'ema': spine_ema}  if spine_ref  is not None or spine_ema  is not None else None,
+    }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Overlay helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def depth_to_vis(depth_map: np.ndarray) -> np.ndarray:
+    """2D depth → 3ch 컬러맵(BGR). 이미 3채널이면 그대로 반환."""
+    if depth_map is None:
+        return None
+    if depth_map.ndim == 2:
+        dm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return cv2.applyColorMap(dm, cv2.COLORMAP_INFERNO)  # BGR
+    return depth_map  # already 3ch
+
+def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> np.ndarray:
+    alpha = 0.0 if alpha < 0.0 else (1.0 if alpha > 1.0 else alpha)
+    if layer_bgr is None or alpha <= 0.0:
+        return base_bgr
+    if base_bgr.shape != layer_bgr.shape:
+        layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
+    return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
+
+def overlay_pose_points(base_bgr: np.ndarray,
+                        shoulder_ema: Optional[Tuple[float,float]],
+                        spine_ema: Optional[Tuple[float,float]],
+                        alpha: float = 0.5) -> np.ndarray:
+    if shoulder_ema is None and spine_ema is None:
+        return base_bgr
+    layer = np.zeros_like(base_bgr)
+    try:
+        if shoulder_ema is not None:
+            sx, sy = map(int, shoulder_ema)
+            cv2.circle(layer, (sx, sy), 6, (0, 255, 0), -1)
+        if spine_ema is not None:
+            px, py = map(int, spine_ema)
+            cv2.circle(layer, (px, py), 6, (0, 255, 255), -1)
+        return overlay_blend(base_bgr, layer, alpha)
+    except Exception:
+        return base_bgr
+
+def overlay_flow_arrow(base_bgr: np.ndarray,
+                       bbox: Optional[Tuple[int,int,int,int]],
+                       flow_vec: Optional[Tuple[float,float]],
+                       alpha: float = 0.5) -> np.ndarray:
+    if bbox is None or flow_vec is None:
+        return base_bgr
+    (x1,y1,x2,y2) = map(int, bbox)
+    cx, cy = (x1 + x2)//2, (y1 + y2)//2
+    vx, vy = flow_vec
+    layer = np.zeros_like(base_bgr)
+    tip = (int(cx + vx), int(cy + vy))
+    try:
+        cv2.arrowedLine(layer, (cx, cy), tip, (0, 200, 255), 3, tipLength=0.35)
+        return overlay_blend(base_bgr, layer, alpha)
+    except Exception:
+        return base_bgr
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Core: bbox + pose + optical-flow 융합 RC 제어기
@@ -15,7 +110,6 @@ class ControlFusion:
     - optical flow (vx, vy) 소량 피드포워드
     를 섞어 RC(lr, fb, ud, yaw)를 산출한다.
     """
-
     def __init__(
         self,
         tracking_rc_speed: int = 30,
@@ -112,24 +206,22 @@ class ControlFusion:
                 fb_from_pose = self._clip(np.median(terms), self.vmax)
 
         # depth를 쓰지 않겠다는 요구조건 → fb는 size+pose로만 구성
-        # 가중치는 0.6(size) / 0.4(pose)로 시작(튜닝 지점)
         fb = self._clip(0.6 * fb_from_size + 0.4 * fb_from_pose, self.vmax)
 
         # flow 피드포워드(소량): 화면 이동을 약간 선반영
         if flow_vec is not None:
             vx, vy = flow_vec
             yaw += self._clip(self.flow_ff_gain * vx, self.vmax)
-            lr += self._clip(self.flow_ff_gain * vx, self.vmax)   # 좌우엔 동일 상수로 시작(튜닝 지점)
-            ud += self._clip(-self.flow_ff_gain * vy, self.vmax)
+            lr  += self._clip(self.flow_ff_gain * vx, self.vmax)
+            ud  += self._clip(-self.flow_ff_gain * vy, self.vmax)
 
         if obstacle_brake:
             fb = 0
 
         return int(lr), int(fb), int(ud), int(yaw)
 
-
 # ───────────────────────────────────────────────────────────────────────────────
-# Tracking 유틸 (선택 로직 / bbox 클리핑)
+# Tracking 유틸 (선택 로직 / bbox 클리핑 / iid filter)
 # ───────────────────────────────────────────────────────────────────────────────
 def clip_bbox_to_frame(bb, w, h):
     if bb is None:
@@ -141,42 +233,45 @@ def clip_bbox_to_frame(bb, w, h):
     y2 = max(0, min(y2, h - 1))
     return [x1, y1, x2, y2] if (x2 > x1 and y2 > y1) else None
 
-
 def select_thief_candidate(detections):
-    """
-    thief_dist <= thief_cos_dist 를 만족하는 후보 중
-    td가 최소인 것 하나만 반환.
-    """
+    """(이전 호환) thief_dist <= thief_cos_dist 후보 중 td 최소를 선택."""
     best, best_td = None, 1e9
     if not detections:
         return None
-
     for det in detections:
         get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
         td = get("thief_dist")
         gate = get("thief_cos_dist")
-
         if td is None or gate is None:
             continue
         if td <= gate and td < best_td:
             best, best_td = det, td
-
     return best
 
+def pick_detection_by_iid(detections: Iterable[Union[dict, Any]], iid: Optional[int]):
+    """현재 iid와 일치하는 detection 하나를 반환 (없으면 None)."""
+    if iid is None or iid <= 0 or not detections:
+        return None
+    for d in detections:
+        if isinstance(d, dict):
+            did = d.get('identity_id', None)
+        else:
+            did = getattr(d, 'identity_id', None)
+        try:
+            did = int(did) if did is not None else None
+        except Exception:
+            did = None
+        if did == iid:
+            return d
+    return None
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optical Flow (척추 스트립 기반)
 # ───────────────────────────────────────────────────────────────────────────────
-def compute_flow_from_spine_strip(
-    prev_gray: np.ndarray,
-    gray: np.ndarray,
-    bbox: Tuple[int, int, int, int],
-    frame_shape: Tuple[int, int, int],
-) -> Optional[Tuple[float, float]]:
-    """
-    bbox 중앙 '척추 스트립'에서만 LK flow를 계산해 (vx,vy) 반환.
-    팔/경계 노이즈 억제용. 중앙 20% 폭, 5x7 격자, 20~80% 절사평균.
-    """
+def compute_flow_from_spine_strip(prev_gray: np.ndarray,
+                                  gray: np.ndarray,
+                                  bbox: Tuple[int, int, int, int],
+                                  frame_shape: Tuple[int, int, int]) -> Optional[Tuple[float, float]]:
     if prev_gray is None or gray is None or bbox is None:
         return None
     x1, y1, x2, y2 = bbox
@@ -209,59 +304,38 @@ def compute_flow_from_spine_strip(
 
     return (robust_mean(dx), robust_mean(dy))
 
-
 # ───────────────────────────────────────────────────────────────────────────────
 # Pose 스케일 상태 업데이트(어깨/척추)
 # ───────────────────────────────────────────────────────────────────────────────
-def update_pose_stats(
-    pose: Optional[Dict[str, Any]],
-    quality: float,
-    should_ref: Optional[float],
-    should_ema: Optional[float],
-    spine_ref: Optional[float],
-    spine_ema: Optional[float],
-    alpha: float = 0.25,
-):
-    """
-    포즈 품질/척추/어깨 레퍼런스 및 EMA를 업데이트하여 반환.
-    pose 예시: {'shoulder': px, 'spine': px, 'quality': 0~1}
-    """
+def update_pose_stats(pose: Optional[Dict[str, Any]],
+                      quality: float,
+                      should_ref: Optional[float],
+                      should_ema: Optional[float],
+                      spine_ref: Optional[float],
+                      spine_ema: Optional[float],
+                      alpha: float = 0.25):
     if pose is None:
         return quality, should_ref, should_ema, spine_ref, spine_ema
-
     q = float(pose.get("quality", 0.0) or 0.0)
     quality = q
-
     sh = pose.get("shoulder")
     sp = pose.get("spine")
-
     if should_ref is None and sh:
-        should_ref = float(sh)
-        should_ema = float(sh)
+        should_ref = float(sh); should_ema = float(sh)
     if spine_ref is None and sp:
-        spine_ref = float(sp)
-        spine_ema = float(sp)
-
+        spine_ref = float(sp); spine_ema = float(sp)
     if sh:
         should_ema = (1 - alpha) * (should_ema if should_ema is not None else sh) + alpha * float(sh)
     if sp:
         spine_ema = (1 - alpha) * (spine_ema if spine_ema is not None else sp) + alpha * float(sp)
-
     return quality, should_ref, should_ema, spine_ref, spine_ema
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Depth(상대) 기반 표시 & 브레이크 판단
 # ───────────────────────────────────────────────────────────────────────────────
-def spine_depth_mode_and_brake(
-    depth_map: Optional[np.ndarray],
-    bbox: Optional[Tuple[int, int, int, int]],
-    use_brake: bool = True,
-) -> Tuple[Optional[float], bool]:
-    """
-    척추 주변(중앙 1/3폭) depth 최빈값(mode)과 '중앙 전방 근접 브레이크' 플래그를 계산.
-    depth는 상대값이므로 임계는 경험적으로 조정.
-    """
+def spine_depth_mode_and_brake(depth_map: Optional[np.ndarray],
+                               bbox: Optional[Tuple[int, int, int, int]],
+                               use_brake: bool = True) -> Tuple[Optional[float], bool]:
     if depth_map is None or bbox is None:
         return None, False
     x1, y1, x2, y2 = bbox
@@ -286,35 +360,26 @@ def spine_depth_mode_and_brake(
             dmin = float(np.percentile(strip, 5))  # 아주 가까운 물체
             if dmin < 0.15:  # 튠 포인트
                 brake = True
-
     return mode, brake
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 타깃 유실 시 재획득 전략 (flow 기반 회전/좌우 스윕)
 # ───────────────────────────────────────────────────────────────────────────────
 @dataclass
 class SearchParams:
-    base_yaw: int = 22          # flow 기반 검색 yaw 속도
-    sweep_yaw: int = 18         # 좌↔우 스윕 yaw 속도
-    flow_thresh: float = 0.3    # flow vx 임계
-    flow_spin_time: float = 1.2 # flow 방향으로 도는 시간
-    sweep_time: float = 0.8     # 좌/우 한 사이클 시간
-
+    base_yaw: int = 22
+    sweep_yaw: int = 18
+    flow_thresh: float = 0.3
+    flow_spin_time: float = 1.2
+    sweep_time: float = 0.8
 
 class SearchManager:
-    """
-    타겟 유실 시 '마지막 flow 방향'으로 짧게 도는 검색.
-    flow 없으면 좌↔우 스윕. 재획득 시 reset() 호출 필요.
-    """
-
     def __init__(self, params: SearchParams = SearchParams()):
         self.p = params
         self.active = False
         self.until = 0.0
         self.yaw = 0
         self._sweep_dir = 1
-
     def start(self, flow_vx: float, now: float):
         if abs(flow_vx) > self.p.flow_thresh:
             self.yaw = self.p.base_yaw if flow_vx > 0 else -self.p.base_yaw
@@ -324,30 +389,30 @@ class SearchManager:
             self.yaw = self._sweep_dir * self.p.sweep_yaw
             self.until = now + self.p.sweep_time
         self.active = True
-
     def command(self, now: float) -> Optional[int]:
-        """활성 상태면 현재 yaw 명령을, 끝났으면 None."""
         if not self.active:
             return None
         if now < self.until:
             return self.yaw
-        # 끝
         self.active = False
         return None
-
     def reset(self):
         self.active = False
         self.until = 0.0
         self.yaw = 0
 
-
 __all__ = [
     "ControlFusion",
     "clip_bbox_to_frame",
     "select_thief_candidate",
+    "pick_detection_by_iid",
     "compute_flow_from_spine_strip",
     "update_pose_stats",
     "spine_depth_mode_and_brake",
     "SearchParams",
     "SearchManager",
+    # new helpers
+    "want_depth", "want_pose", "want_flow",
+    "feature_alpha", "prepare_pose_for_rc",
+    "depth_to_vis", "overlay_blend", "overlay_pose_points", "overlay_flow_arrow",
 ]

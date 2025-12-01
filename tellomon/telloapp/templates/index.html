@@ -6,776 +6,499 @@
     <title>Tello Control</title>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
+        * { margin:0; padding:0; box-sizing:border-box; }
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #1a1a2e;
-            color: #eee;
-            font-size: 20px;
-            overflow-x: hidden;
+            font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background:#1a1a2e; color:#eee; font-size:20px; overflow-x:hidden;
         }
-        
-        .container {
-            max-width: 100%;
-            padding: 5px;
-        }
-        
+        .container { max-width:100%; padding:5px; }
         .header {
-            background: #16213e;
-            padding: 8px 12px;
-            border-radius: 6px;
-            margin-bottom: 5px;
-            display: grid;
-            grid-template-columns: auto 1fr auto;
-            gap: 10px;
-            align-items: center;
+            background:#16213e; padding:8px 12px; border-radius:6px; margin-bottom:5px;
+            display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center;
         }
-        
-        h1 {
-            color: #00d9ff;
-            font-size: 1.1em;
-        }
-        
-        .status {
-            display: flex;
-            gap: 5px;
-            font-size: 0.75em;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-        
-        .status-item {
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-weight: bold;
-            white-space: nowrap;
-        }
-        
-        .connected { background: #10b981; color: white; }
-        .disconnected { background: #ef4444; color: white; }
-        
-        .header-controls {
-            display: flex;
-            gap: 5px;
-            align-items: center;
-        }
-        
-        .header-btn {
-            padding: 6px 12px;
-            font-size: 0.75em;
-            font-weight: bold;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            white-space: nowrap;
-        }
-        
-        .header-btn:active {
-            transform: scale(0.95);
-        }
-        
-        .header-btn:disabled {
-            opacity: 0.4;
-            cursor: not-allowed;
-        }
-        
-        .header-btn-primary { background: #667eea; color: white; }
-        .header-btn-warning { background: #f59e0b; color: white; }
-        
+        h1 { color:#00d9ff; font-size:1.1em; }
+        .status { display:flex; gap:5px; font-size:.75em; flex-wrap:wrap; justify-content:center; }
+        .status-item { padding:4px 8px; border-radius:4px; font-weight:bold; white-space:nowrap; }
+        .connected { background:#10b981; color:#fff; }
+        .disconnected { background:#ef4444; color:#fff; }
+        .header-controls { display:flex; gap:5px; align-items:center; }
+        .header-btn { padding:6px 12px; font-size:.75em; font-weight:bold; border:none; border-radius:4px; cursor:pointer; white-space:nowrap; }
+        .header-btn:active { transform:scale(.95); }
+        .header-btn:disabled { opacity:.4; cursor:not-allowed; }
+        .header-btn-primary { background:#667eea; color:#fff; }
+        .header-btn-warning { background:#f59e0b; color:#fff; }
+
         /* 비디오 영역 */
-        .video-section {
-            background: #16213e;
-            padding: 5px;
-            border-radius: 6px;
-            margin-bottom: 5px;
-        }
-        
+        .video-section { background:#16213e; padding:5px; border-radius:6px; margin-bottom:5px; }
         .video-container {
-            position: relative;
-            width: 100%;
-            background: #000;
-            border-radius: 4px;
-            overflow: hidden;
-            cursor: crosshair;
+            position:relative; width:100%; background:#000; border-radius:4px; overflow:hidden; cursor:crosshair;
         }
-        
-        #videoFeed {
-            width: 100%;
-            display: block;
-        }
-        
+        #videoFeed { width:100%; display:block; }
         .click-target {
-            position: absolute;
-            border: 3px solid #00d9ff;
-            background: rgba(0, 217, 255, 0.1);
-            pointer-events: none;
-            animation: pulse 1s infinite;
+            position:absolute; border:3px solid #00d9ff; background:rgba(0,217,255,.1); pointer-events:none; animation:pulse 1s infinite;
         }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+
+        /* ▶ 신규: 오른쪽 위 기능 토글 박스 */
+        .feature-panel {
+            position:absolute; top:10px; right:10px; z-index:10;
+            background:rgba(22,33,62,.85); backdrop-filter:blur(4px);
+            border:1px solid #0f3460; border-radius:8px; padding:8px; min-width:210px;
+            display:flex; flex-direction:column; gap:6px;
         }
-        
-        .info-text {
-            font-size: 0.7em;
-            color: #94a3b8;
-            margin: 3px 0;
-            padding: 5px;
-            background: #0f3460;
-            border-radius: 3px;
-            text-align: center;
+        .feature-title { font-size:.8em; color:#00d9ff; font-weight:bold; display:flex; justify-content:space-between; align-items:center; }
+        .feature-row { display:flex; gap:6px; }
+        .toggle {
+            flex:1; padding:8px 10px; font-size:.8em; font-weight:bold; border:none; border-radius:6px; cursor:pointer;
+            background:#0f3460; color:#cbd5e1; transition:transform .15s, background .15s, color .15s, border .15s;
+            border:1px solid transparent;
         }
-        
-        .detections-list {
-            max-height: 80px;
-            overflow-y: auto;
-            background: #0f3460;
-            border-radius: 4px;
-            padding: 5px;
-            margin-top: 3px;
-        }
-        
-        .detection-item {
-            padding: 6px;
-            margin: 2px 0;
-            background: #16213e;
-            border-radius: 3px;
-            border-left: 3px solid #667eea;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 0.8em;
-        }
-        
-        .detection-item:active {
-            transform: scale(0.95);
-        }
-        
-        .detection-item.selected {
-            border-left-color: #00d9ff;
-            background: #1a3a52;
-        }
-        
-        .detection-item.tracking {
-            border-left-color: #10b981;
-            background: #0f4229;
-        }
-        
+        .toggle:active { transform:scale(.97); }
+        .toggle.on { background:#10b981; color:#07281d; border-color:#34d399; }
+        .slider-wrap { display:grid; grid-template-columns:1fr auto; align-items:center; gap:8px; }
+        .slider-wrap input[type="range"] { width:100%; }
+        .slider-badge { font-size:.75em; color:#cbd5e1; background:#0f3460; border:1px solid #203a66; padding:2px 6px; border-radius:4px; }
+
+        .info-text { font-size:.7em; color:#94a3b8; margin:3px 0; padding:5px; background:#0f3460; border-radius:3px; text-align:center; }
+        .detections-list { max-height:80px; overflow-y:auto; background:#0f3460; border-radius:4px; padding:5px; margin-top:3px; }
+        .detection-item { padding:6px; margin:2px 0; background:#16213e; border-radius:3px; border-left:3px solid #667eea; cursor:pointer; transition:all .2s; font-size:.8em; }
+        .detection-item:active { transform:scale(.95); }
+        .detection-item.selected { border-left-color:#00d9ff; background:#1a3a52; }
+        .detection-item.tracking { border-left-color:#10b981; background:#0f4229; }
+
         /* 컨트롤 영역 */
-        .controls-section {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 5px;
-            margin-bottom: 5px;
-        }
-        
-        .panel {
-            background: #16213e;
-            padding: 8px;
-            border-radius: 6px;
-        }
-        
-        .panel h2 {
-            color: #00d9ff;
-            font-size: 0.9em;
-            margin-bottom: 6px;
-            padding-bottom: 4px;
-            border-bottom: 2px solid #0f3460;
-        }
-        
-        .btn {
-            width: 100%;
-            padding: 10px;
-            font-size: 0.85em;
-            font-weight: bold;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            transition: all 0.2s;
-            margin: 2px 0;
-        }
-        
-        .btn:active {
-            transform: scale(0.95);
-        }
-        
-        .btn:disabled {
-            opacity: 0.4;
-            cursor: not-allowed;
-        }
-        
-        .btn-primary { background: #667eea; color: white; }
-        .btn-success { background: #10b981; color: white; }
-        .btn-danger { background: #ef4444; color: white; }
-        .btn-warning { background: #f59e0b; color: white; }
-        .btn-info { background: #06b6d4; color: white; }
-        .btn-small { padding: 6px; font-size: 0.75em; }
-        
-        /* 이동 컨트롤 그리드 */
-        .movement-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 3px;
-            margin: 5px 0;
-        }
-        
-        .movement-btn {
-            padding: 15px 5px;
-            font-size: 1.2em;
-        }
-        
-        .altitude-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 3px;
-        }
-        
-        .rotation-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 3px;
-            margin-top: 5px;
-        }
-        
-        /* 추적 상태 표시 */
-        #trackingStatus {
-            padding: 6px;
-            margin: 5px 0;
-            background: #0f3460;
-            border-radius: 4px;
-            font-size: 0.75em;
-            text-align: center;
-        }
-        
-        #trackingStatus.active {
-            background: #0f4229;
-            color: #6ee7b7;
-            border: 1px solid #10b981;
-        }
-        
-        /* 로그 영역 */
-        .log-section {
-            background: #16213e;
-            padding: 8px;
-            border-radius: 6px;
-            margin-bottom: 5px;
-        }
-        
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: pointer;
-            margin-bottom: 5px;
-        }
-        
-        .log-header h2 {
-            color: #00d9ff;
-            font-size: 0.9em;
-        }
-        
-        .log-toggle {
-            color: #00d9ff;
-            font-size: 1.2em;
-        }
-        
+        .controls-section { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:5px; }
+        .panel { background:#16213e; padding:8px; border-radius:6px; }
+        .panel h2 { color:#00d9ff; font-size:.9em; margin-bottom:6px; padding-bottom:4px; border-bottom:2px solid #0f3460; }
+        .btn { width:100%; padding:10px; font-size:.85em; font-weight:bold; border:none; border-radius:5px; cursor:pointer; transition:all .2s; margin:2px 0; }
+        .btn:active { transform:scale(.95); }
+        .btn:disabled { opacity:.4; cursor:not-allowed; }
+        .btn-primary { background:#667eea; color:#fff; }
+        .btn-success { background:#10b981; color:#fff; }
+        .btn-danger { background:#ef4444; color:#fff; }
+        .btn-warning { background:#f59e0b; color:#fff; }
+        .btn-info { background:#06b6d4; color:#fff; }
+        .btn-small { padding:6px; font-size:.75em; }
+
+        .movement-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:3px; margin:5px 0; }
+        .movement-btn { padding:15px 5px; font-size:1.2em; }
+        .altitude-grid { display:grid; grid-template-columns:1fr 1fr; gap:3px; }
+        .rotation-grid { display:grid; grid-template-columns:1fr 1fr; gap:3px; margin-top:5px; }
+
+        #trackingStatus { padding:6px; margin:5px 0; background:#0f3460; border-radius:4px; font-size:.75em; text-align:center; }
+        #trackingStatus.active { background:#0f4229; color:#6ee7b7; border:1px solid #10b981; }
+
+        .log-section { background:#16213e; padding:8px; border-radius:6px; margin-bottom:5px; }
+        .log-header { display:flex; justify-content:space-between; align-items:center; cursor:pointer; margin-bottom:5px; }
+        .log-header h2 { color:#00d9ff; font-size:.9em; }
+        .log-toggle { color:#00d9ff; font-size:1.2em; }
         #logContainer {
-            overflow-y: auto;
-            background: #0f3460;
-            border-radius: 4px;
-            padding: 6px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.65em;
-            max-height: 150px;
-            transition: max-height 0.3s;
+            overflow-y:auto; background:#0f3460; border-radius:4px; padding:6px; font-family:'Courier New', monospace; font-size:.65em;
+            max-height:150px; transition:max-height .3s;
         }
-        
-        #logContainer.collapsed {
-            max-height: 0;
-            padding: 0;
-            overflow: hidden;
+        #logContainer.collapsed { max-height:0; padding:0; overflow:hidden; }
+        .log-entry { padding:3px; margin-bottom:2px; border-radius:2px; border-left:2px solid; }
+        .log-INFO { border-color:#3b82f6; color:#93c5fd; }
+        .log-SUCCESS { border-color:#10b981; color:#6ee7b7; }
+        .log-WARNING { border-color:#f59e0b; color:#fcd34d; }
+        .log-ERROR { border-color:#ef4444; color:#fca5a5; }
+        .log-DEBUG { border-color:#6b7280; color:#d1d5db; }
+        .log-timestamp { font-weight:bold; margin-right:4px; }
+
+        ::-webkit-scrollbar { width:6px; height:6px; }
+        ::-webkit-scrollbar-track { background:#0f3460; }
+        ::-webkit-scrollbar-thumb { background:#667eea; border-radius:3px; }
+
+        @media (min-width:768px) {
+            .container { padding:10px; max-width:1400px; margin:0 auto; }
+            .main-layout { display:grid; grid-template-columns:1fr 400px; gap:10px; }
+            .left-column { display:flex; flex-direction:column; gap:10px; }
+            .right-column { display:flex; flex-direction:column; gap:10px; }
+            .controls-section { display:flex; flex-direction:column; gap:10px; }
+            #logContainer { max-height:300px; }
         }
-        
-        .log-entry {
-            padding: 3px;
-            margin-bottom: 2px;
-            border-radius: 2px;
-            border-left: 2px solid;
-        }
-        
-        .log-INFO { border-color: #3b82f6; color: #93c5fd; }
-        .log-SUCCESS { border-color: #10b981; color: #6ee7b7; }
-        .log-WARNING { border-color: #f59e0b; color: #fcd34d; }
-        .log-ERROR { border-color: #ef4444; color: #fca5a5; }
-        .log-DEBUG { border-color: #6b7280; color: #d1d5db; }
-        
-        .log-timestamp {
-            font-weight: bold;
-            margin-right: 4px;
-        }
-        
-        /* 스크롤바 */
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        
-        ::-webkit-scrollbar-track {
-            background: #0f3460;
-        }
-        
-        ::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 3px;
-        }
-        
-        /* 데스크톱용 레이아웃 */
-        @media (min-width: 768px) {
-            .container {
-                padding: 10px;
-                max-width: 1400px;
-                margin: 0 auto;
-            }
-            
-            .main-layout {
-                display: grid;
-                grid-template-columns: 1fr 400px;
-                gap: 10px;
-            }
-            
-            .left-column {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-            
-            .right-column {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-            
-            .controls-section {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-            
-            #logContainer {
-                max-height: 300px;
-            }
-        }
-        
-        /* 모바일에서 헤더 조정 */
-        @media (max-width: 480px) {
-            .header {
-                grid-template-columns: 1fr;
-                gap: 5px;
-            }
-            
-            h1 {
-                text-align: center;
-            }
-            
-            .status {
-                order: 2;
-            }
-            
-            .header-controls {
-                order: 3;
-                justify-content: center;
-            }
+        @media (max-width:480px) {
+            .header { grid-template-columns:1fr; gap:5px; }
+            h1 { text-align:center; }
+            .status { order:2; }
+            .header-controls { order:3; justify-content:center; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🚁 Tello</h1>
-            <div class="status">
-                <div id="connectionStatus" class="status-item disconnected">●</div>
-                <div id="batteryStatus" class="status-item">🔋 --</div>
-                <div id="heightStatus" class="status-item">📏 --</div>
-            </div>
-            <div class="header-controls">
-                <button class="header-btn header-btn-primary" onclick="connectTello()" id="connectBtn">연결</button>
-                <button class="header-btn header-btn-warning" onclick="reconnectTello()" id="reconnectBtn" disabled>재연결</button>
-            </div>
+<div class="container">
+    <div class="header">
+        <h1>🚁 Tello</h1>
+        <div class="status">
+            <div id="connectionStatus" class="status-item disconnected">●</div>
+            <div id="batteryStatus" class="status-item">🔋 --</div>
+            <div id="heightStatus" class="status-item">📏 --</div>
         </div>
-        
-        <div class="main-layout">
-            <div class="left-column">
-                <!-- 비디오 영역 -->
-                <div class="video-section">
-                    <div class="video-container" id="videoContainer">
-                        <img id="videoFeed" src="/video_feed" alt="Video">
-                    </div>
-                    
-                    <div class="info-text">
-                        💡 객체 클릭 → 자동 추적 시작
-                    </div>
-                    
-                    <!-- 추적 상태 -->
-                    <div id="trackingStatus">추적 안 함</div>
-                    
-                    <div class="detections-list">
-                        <div id="detectionsContent" style="color: #94a3b8; text-align: center;">감지 대기중...</div>
-                    </div>
-                </div>
-                
-                <!-- 로그 -->
-                <div class="log-section">
-                    <div class="log-header" onclick="toggleLog()">
-                        <h2>📋 로그</h2>
-                        <span class="log-toggle" id="logToggle">▼</span>
-                    </div>
-                    <div id="logContainer"></div>
-                </div>
-            </div>
-            
-            <div class="right-column">
-                <!-- 컨트롤들 -->
-                <div class="controls-section">
-                    <!-- 고도 (원래 연결 자리) -->
-                    <div class="panel">
-                        <h2>고도</h2>
-                        <div class="altitude-grid">
-                            <button class="btn btn-info" onclick="sendCommand('up')" id="upBtn" disabled>⬆ 상승</button>
-                            <button class="btn btn-info" onclick="sendCommand('down')" id="downBtn" disabled>⬇ 하강</button>
+        <div class="header-controls">
+            <button class="header-btn header-btn-primary" onclick="connectTello()" id="connectBtn">연결</button>
+            <button class="header-btn header-btn-warning" onclick="reconnectTello()" id="reconnectBtn" disabled>재연결</button>
+        </div>
+    </div>
+
+    <div class="main-layout">
+        <div class="left-column">
+            <!-- 비디오 영역 -->
+            <div class="video-section">
+                <div class="video-container" id="videoContainer">
+                    <img id="videoFeed" src="/video_feed" alt="Video">
+
+                    <!-- ▶ 신규: 오른쪽 위 기능 토글/투명도 -->
+                    <div class="feature-panel" id="featurePanel">
+                        <div class="feature-title">
+                            <span>시각화/연산 토글</span>
+                            <span id="featureSyncDot" title="서버 동기화 상태">●</span>
+                        </div>
+                        <div class="feature-row">
+                            <button id="btnPose" class="toggle" onclick="toggleFeature('pose')">Pose</button>
+                            <button id="btnDepth" class="toggle" onclick="toggleFeature('depth')">Depth</button>
+                            <button id="btnFlow" class="toggle" onclick="toggleFeature('flow')">Flow</button>
+                        </div>
+                        <div class="slider-wrap">
+                            <input id="alphaSlider" type="range" min="0" max="100" step="5" value="50" oninput="updateAlpha(this.value)">
+                            <span class="slider-badge" id="alphaBadge">투명도 50%</span>
+                        </div>
+                        <div style="font-size:.7em; color:#94a3b8;">
+                            OFF 시 서버 연산 완전 중지 · ON 시에만 계산/오버레이 (Depth/Flow/Pose)
                         </div>
                     </div>
-                    
-                    <!-- 비행 -->
-                    <div class="panel">
-                        <h2>비행</h2>
-                        <button class="btn btn-success" onclick="sendCommand('takeoff')" id="takeoffBtn" disabled>이륙 ✈️</button>
-                        <button class="btn btn-danger" onclick="sendCommand('land')" id="landBtn" disabled>착륙 🛬</button>
-                        <button class="btn btn-danger btn-small" onclick="sendCommand('emergency')" id="emergencyBtn" disabled>긴급!</button>
-                    </div>
-                </div>
-                
-                <!-- 조종 -->
-                <div class="panel">
-                    <h2>조종</h2>
-                    
-                    <!-- 이동 -->
-                    <div class="movement-grid">
-                        <div></div>
-                        <button class="btn btn-info movement-btn" onclick="sendCommand('forward')" id="forwardBtn" disabled>↑</button>
-                        <div></div>
-                        <button class="btn btn-info movement-btn" onclick="sendCommand('left')" id="leftBtn" disabled>←</button>
-                        <div></div>
-                        <button class="btn btn-info movement-btn" onclick="sendCommand('right')" id="rightBtn" disabled>→</button>
-                        <div></div>
-                        <button class="btn btn-info movement-btn" onclick="sendCommand('back')" id="backBtn" disabled>↓</button>
-                        <div></div>
-                    </div>
-                    
-                    <!-- 회전 -->
-                    <div class="rotation-grid">
-                        <button class="btn btn-info btn-small" onclick="sendCommand('ccw')" id="ccwBtn" disabled>↺ 좌회전</button>
-                        <button class="btn btn-info btn-small" onclick="sendCommand('cw')" id="cwBtn" disabled>↻ 우회전</button>
-                    </div>
-                </div>
-                
-                <!-- 추적 중지 버튼 -->
-                <div class="panel">
-                    <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display: none;">🛑 추적 중지</button>
                 </div>
 
-                <!-- 도둑 ID 수동 지정 + 서버 종료 -->
-                <div class="panel">
-                    <h2>도둑 ID 수동 지정 & 종료</h2>
-                    <div style="display:grid; grid-template-columns: 1fr auto; gap:6px; margin-bottom:6px;">
-                        <input id="manualId" type="number" min="1" placeholder="identity_id 입력" style="width:100%; padding:6px;">
-                        <button class="btn btn-primary btn-small" onclick="manualSetThief()">지정&추적</button>
-                    </div>
-                    <button class="btn btn-danger" onclick="shutdownServer()">✔️ 서버 종료 (CTRL+C)</button>
+                <div class="info-text">💡 객체 클릭 → 자동 추적 시작</div>
+
+                <!-- 추적 상태 -->
+                <div id="trackingStatus">추적 안 함</div>
+
+                <div class="detections-list">
+                    <div id="detectionsContent" style="color:#94a3b8; text-align:center;">감지 대기중...</div>
                 </div>
+            </div>
+
+            <!-- 로그 -->
+            <div class="log-section">
+                <div class="log-header" onclick="toggleLog()">
+                    <h2>📋 로그</h2>
+                    <span class="log-toggle" id="logToggle">▼</span>
+                </div>
+                <div id="logContainer"></div>
+            </div>
+        </div>
+
+        <div class="right-column">
+            <div class="controls-section">
+                <div class="panel">
+                    <h2>고도</h2>
+                    <div class="altitude-grid">
+                        <button class="btn btn-info" onclick="sendCommand('up')" id="upBtn" disabled>⬆ 상승</button>
+                        <button class="btn btn-info" onclick="sendCommand('down')" id="downBtn" disabled>⬇ 하강</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h2>비행</h2>
+                    <button class="btn btn-success" onclick="sendCommand('takeoff')" id="takeoffBtn" disabled>이륙 ✈️</button>
+                    <button class="btn btn-danger" onclick="sendCommand('land')" id="landBtn" disabled>착륙 🛬</button>
+                    <button class="btn btn-danger btn-small" onclick="sendCommand('emergency')" id="emergencyBtn" disabled>긴급!</button>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>조종</h2>
+                <div class="movement-grid">
+                    <div></div>
+                    <button class="btn btn-info movement-btn" onclick="sendCommand('forward')" id="forwardBtn" disabled>↑</button>
+                    <div></div>
+                    <button class="btn btn-info movement-btn" onclick="sendCommand('left')" id="leftBtn" disabled>←</button>
+                    <div></div>
+                    <button class="btn btn-info movement-btn" onclick="sendCommand('right')" id="rightBtn" disabled>→</button>
+                    <div></div>
+                    <button class="btn btn-info movement-btn" onclick="sendCommand('back')" id="backBtn" disabled>↓</button>
+                    <div></div>
+                </div>
+                <div class="rotation-grid">
+                    <button class="btn btn-info btn-small" onclick="sendCommand('ccw')" id="ccwBtn" disabled>↺ 좌회전</button>
+                    <button class="btn btn-info btn-small" onclick="sendCommand('cw')" id="cwBtn" disabled>↻ 우회전</button>
+                </div>
+            </div>
+
+            <div class="panel">
+                <button class="btn btn-danger" onclick="stopTracking()" id="stopTrackingBtn" style="display:none;">🛑 추적 중지</button>
+            </div>
+
+            <div class="panel">
+                <h2>도둑 ID 수동 지정 & 종료</h2>
+                <div style="display:grid; grid-template-columns:1fr auto; gap:6px; margin-bottom:6px;">
+                    <input id="manualId" type="number" min="1" placeholder="identity_id 입력" style="width:100%; padding:6px;">
+                    <button class="btn btn-primary btn-small" onclick="manualSetThief()">지정&추적</button>
+                </div>
+                <button class="btn btn-danger" onclick="shutdownServer()">✔️ 서버 종료 (CTRL+C)</button>
             </div>
         </div>
     </div>
-    
-    <script>
-    // --- Socket.IO ---
-    const socket = io({ transports: ['websocket', 'polling'] });
+</div>
 
-    // --- UI state ---
-    let selectedTarget = null;
-    let isTracking = false;
-    let currentDetections = [];
-    let logCollapsed = false;
+<script>
+/* ---------------- Socket.IO ---------------- */
+const socket = io({ transports: ['websocket','polling'] });
 
-    const videoFeed = document.getElementById('videoFeed');
+/* ---------------- UI state ---------------- */
+let selectedTarget = null;
+let isTracking = false;
+let currentDetections = [];
+let logCollapsed = false;
 
-    // ---------- 유틸 ----------
-    function toIntOrNull(v) {
-        // null/undefined/'null'/'undefined'/NaN → null, 그 외 정수
-        if (v === null || v === undefined) return null;
-        if (v === 'null' || v === 'undefined') return null;
-        const n = Number(v);
-        return Number.isFinite(n) ? Math.trunc(n) : null;
-    }
+/* ▶ 신규: 기능 토글 상태 (클라이언트 캐시) */
+let features = { depth:false, pose:false, flow:false, alpha:0.5 };
 
-    function addLog(level, message, timestamp) {
-        const logContainer = document.getElementById('logContainer');
-        const logEntry = document.createElement('div');
-        logEntry.className = `log-entry log-${level}`;
-        const ts = timestamp || new Date().toTimeString().split(' ')[0];
-        logEntry.innerHTML = `<span class="log-timestamp">[${ts}]</span>${message}`;
-        logContainer.appendChild(logEntry);
-        logContainer.scrollTop = logContainer.scrollHeight;
-        while (logContainer.children.length > 50) {
-        logContainer.removeChild(logContainer.firstChild);
-        }
-    }
+const videoFeed = document.getElementById('videoFeed');
+const btnPose = document.getElementById('btnPose');
+const btnDepth = document.getElementById('btnDepth');
+const btnFlow = document.getElementById('btnFlow');
+const alphaSlider = document.getElementById('alphaSlider');
+const alphaBadge = document.getElementById('alphaBadge');
+const syncDot = document.getElementById('featureSyncDot');
 
-    function toggleLog() {
-        const logContainer = document.getElementById('logContainer');
-        const toggle = document.getElementById('logToggle');
-        logCollapsed = !logCollapsed;
-        if (logCollapsed) {
-        logContainer.classList.add('collapsed');
-        toggle.textContent = '▶';
-        } else {
-        logContainer.classList.remove('collapsed');
-        toggle.textContent = '▼';
-        }
-    }
+/* ---------------- 유틸 ---------------- */
+function toIntOrNull(v) {
+    if (v === null || v === undefined) return null;
+    if (v === 'null' || v === 'undefined') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+function addLog(level, message, timestamp) {
+    const logContainer = document.getElementById('logContainer');
+    const logEntry = document.createElement('div');
+    logEntry.className = `log-entry log-${level}`;
+    const ts = timestamp || new Date().toTimeString().split(' ')[0];
+    logEntry.innerHTML = `<span class="log-timestamp">[${ts}]</span>${message}`;
+    logContainer.appendChild(logEntry);
+    logContainer.scrollTop = logContainer.scrollHeight;
+    while (logContainer.children.length > 50) logContainer.removeChild(logContainer.firstChild);
+}
+function toggleLog() {
+    const logContainer = document.getElementById('logContainer');
+    const toggle = document.getElementById('logToggle');
+    logCollapsed = !logCollapsed;
+    if (logCollapsed) { logContainer.classList.add('collapsed'); toggle.textContent = '▶'; }
+    else { logContainer.classList.remove('collapsed'); toggle.textContent = '▼'; }
+}
+function setSyncState(ok) {
+    syncDot.style.color = ok ? '#10b981' : '#ef4444';
+    syncDot.title = ok ? '서버와 동기화됨' : '서버 미동기화';
+}
 
-    // ---------- 비디오 클릭(객체 선택) ----------
-    document.getElementById('videoContainer').addEventListener('click', function (e) {
-        if (!currentDetections || currentDetections.length === 0) return;
+/* ---------------- 신규: 토글 UI/송신 ---------------- */
+function applyFeatureButtons() {
+    btnPose.classList.toggle('on', features.pose);
+    btnDepth.classList.toggle('on', features.depth);
+    btnFlow.classList.toggle('on', features.flow);
+    alphaSlider.value = Math.round(features.alpha * 100);
+    alphaBadge.textContent = `투명도 ${Math.round(features.alpha * 100)}%`;
+}
+function emitFeatures() {
+    setSyncState(false);
+    socket.emit('set_features', {
+        depth: !!features.depth,
+        pose:  !!features.pose,
+        flow:  !!features.flow,
+        alpha: Number(features.alpha) || 0.5,
+    });
+}
+function toggleFeature(key) {
+    features[key] = !features[key];
+    applyFeatureButtons();
+    emitFeatures();
+}
+function updateAlpha(val) {
+    const v = Math.max(0, Math.min(100, Number(val)));
+    features.alpha = v / 100.0;
+    alphaBadge.textContent = `투명도 ${v}%`;
+    emitFeatures();
+}
 
-        const rect = videoFeed.getBoundingClientRect();
-        // naturalWidth/Height가 0인 초기 프레임 방어
-        const nw = videoFeed.naturalWidth || rect.width;
-        const nh = videoFeed.naturalHeight || rect.height;
-
-        const scaleX = nw / rect.width;
-        const scaleY = nh / rect.height;
-
-        const clickX = (e.clientX - rect.left) * scaleX;
-        const clickY = (e.clientY - rect.top) * scaleY;
-
-        for (let det of currentDetections) {
-        const [x1, y1, x2, y2] = det.bbox;
+/* ---------------- 비디오 클릭(객체 선택) ---------------- */
+document.getElementById('videoContainer').addEventListener('click', function (e) {
+    if (!currentDetections || currentDetections.length === 0) return;
+    const rect = videoFeed.getBoundingClientRect();
+    const nw = videoFeed.naturalWidth || rect.width;
+    const nh = videoFeed.naturalHeight || rect.height;
+    const scaleX = nw / rect.width;
+    const scaleY = nh / rect.height;
+    const clickX = (e.clientX - rect.left) * scaleX;
+    const clickY = (e.clientY - rect.top) * scaleY;
+    for (let det of currentDetections) {
+        const [x1,y1,x2,y2] = det.bbox;
         if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
+            const iid = toIntOrNull(det.identity_id);
+            if (iid === null || iid <= 0) {
+                addLog('WARNING','ID가 없는(??) 객체는 선택할 수 없습니다. 갤러리 2장 확정 후 시도하세요.');
+                return;
+            }
             selectTargetAndStartTracking(det);
             highlightClickedTarget(det, rect, scaleX, scaleY);
             break;
         }
-        }
-    });
-
-    function highlightClickedTarget(det, rect, scaleX, scaleY) {
-        const [x1, y1, x2, y2] = det.bbox;
-        const displayX = x1 / scaleX;
-        const displayY = y1 / scaleY;
-        const displayW = (x2 - x1) / scaleX;
-        const displayH = (y2 - y1) / scaleY;
-
-        const overlay = document.createElement('div');
-        overlay.className = 'click-target';
-        overlay.style.position = 'absolute';
-        overlay.style.left = displayX + 'px';
-        overlay.style.top = displayY + 'px';
-        overlay.style.width = displayW + 'px';
-        overlay.style.height = displayH + 'px';
-        document.getElementById('videoContainer').appendChild(overlay);
-        setTimeout(() => overlay.remove(), 1000);
     }
+});
+function highlightClickedTarget(det, rect, scaleX, scaleY) {
+    const [x1,y1,x2,y2] = det.bbox;
+    const displayX = x1 / scaleX;
+    const displayY = y1 / scaleY;
+    const displayW = (x2 - x1) / scaleX;
+    const displayH = (y2 - y1) / scaleY;
+    const overlay = document.createElement('div');
+    overlay.className = 'click-target';
+    overlay.style.left = displayX + 'px';
+    overlay.style.top = displayY + 'px';
+    overlay.style.width = displayW + 'px';
+    overlay.style.height = displayH + 'px';
+    document.getElementById('videoContainer').appendChild(overlay);
+    setTimeout(() => overlay.remove(), 1000);
+}
 
-    // ---------- 소켓 수신 ----------
-    socket.on('connect', () => {
-        addLog('SUCCESS', '서버 연결');
-        // 연결 후 현재 Tello 상태 요청
-        socket.emit('get_tello_status');
-    });
+/* ---------------- 소켓 수신 ---------------- */
+socket.on('connect', () => {
+    addLog('SUCCESS', '서버 연결');
+    socket.emit('get_tello_status');
+    /* ▶ 서버에 현재 기능 상태 요청(있으면) */
+    socket.emit('get_features'); // 서버가 없으면 무시됨
+});
 
-    socket.on('log_message', (data) => addLog(data.level, data.message, data.timestamp));
+socket.on('log_message', (data) => addLog(data.level, data.message, data.timestamp));
 
-    socket.on('tello_status', (data) => {
-        const statusEl = document.getElementById('connectionStatus');
-        if (data.connected) {
+socket.on('tello_status', (data) => {
+    const statusEl = document.getElementById('connectionStatus');
+    if (data.connected) {
         statusEl.textContent = '● ON';
         statusEl.className = 'status-item connected';
         document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
         enableControls(true);
-        // 재연결 버튼 활성화
-        const r = document.getElementById('reconnectBtn');
-        if (r) r.disabled = false;
+        const r = document.getElementById('reconnectBtn'); if (r) r.disabled = false;
         addLog('SUCCESS', `연결! 배터리 ${data.battery}%`);
-        } else {
+    } else {
         statusEl.textContent = '● OFF';
         statusEl.className = 'status-item disconnected';
         enableControls(false);
         addLog('ERROR', '연결 실패');
-        }
-    });
+    }
+});
 
-    socket.on('detections_update', (data) => {
-        currentDetections = data?.detections || [];
-        document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
-        document.getElementById('heightStatus').textContent = `📏 ${data.height}cm`;
-        updateDetectionsList(currentDetections);
-        // 서버가 보낸 is_tracking은 참고만, 최종 표시는 tracking_status에서 통일
-        if (typeof data.is_tracking === 'boolean') {
-        updateTrackingStatus(data.is_tracking);
-        }
-    });
+/* ▶ 서버가 브로드캐스트해주는 기능 상태 수신 */
+socket.on('feature_status', (data) => {
+    try {
+        features.depth = !!data.depth;
+        features.pose  = !!data.pose;
+        features.flow  = !!data.flow;
+        if (typeof data.alpha === 'number') features.alpha = Math.max(0, Math.min(1, data.alpha));
+        applyFeatureButtons();
+        setSyncState(true);
+        addLog('INFO', `토글 상태 동기화 → depth:${features.depth} pose:${features.pose} flow:${features.flow} alpha:${(features.alpha*100)|0}%`);
+    } catch(e) { /* noop */ }
+});
 
-    socket.on('stream_error', (data) => addLog('ERROR', data.message));
-
-    socket.on('command_response', (data) => {
-        addLog(data.success ? 'SUCCESS' : 'ERROR', data.message);
-    });
-
-    // ✅ 서버의 추적 상태 방송 수신 (버튼 표시의 기준)
-    socket.on('tracking_status', (data) => {
-        if (data.is_tracking) {
-        addLog('SUCCESS', `서버 추적 ON: ID ${data.target_identity_id ?? 'bbox-lock'}`);
+socket.on('detections_update', (data) => {
+    currentDetections = data?.detections || [];
+    document.getElementById('batteryStatus').textContent = `🔋 ${data.battery}%`;
+    document.getElementById('heightStatus').textContent = `📏 ${data.height}cm`;
+    updateDetectionsList(currentDetections);
+    if (typeof data.is_tracking === 'boolean') updateTrackingStatus(data.is_tracking);
+});
+socket.on('stream_error', (data) => addLog('ERROR', data.message));
+socket.on('command_response', (data) => addLog(data.success ? 'SUCCESS' : 'ERROR', data.message));
+socket.on('tracking_status', (data) => {
+    if (data.is_tracking) {
+        addLog('SUCCESS', `서버 추적 ON: ID ${data.target_identity_id}`);
         isTracking = true;
-        } else {
+    } else {
         addLog('WARNING', data.message || '서버 추적 OFF/실패');
         isTracking = false;
-        }
-        updateTrackingStatus(isTracking);
-    });
-
-    // ---------- 소켓 송신 ----------
-    function connectTello() {
-        addLog('INFO', 'Tello 연결중...');
-        socket.emit('connect_tello');
-        document.getElementById('connectBtn').disabled = true;
     }
+    updateTrackingStatus(isTracking);
+});
 
-    function reconnectTello() {
-        addLog('INFO', 'Tello 재연결중...');
-        socket.emit('reconnect_tello');
+/* ---------------- 소켓 송신 ---------------- */
+function connectTello() {
+    addLog('INFO', 'Tello 연결중...'); socket.emit('connect_tello'); document.getElementById('connectBtn').disabled = true;
+}
+function reconnectTello() { addLog('INFO', 'Tello 재연결중...'); socket.emit('reconnect_tello'); }
+function sendCommand(command) { socket.emit('send_command', { command }); }
+function shutdownServer() { addLog('WARNING', '서버 종료 요청…'); socket.emit('shutdown_server'); }
+
+/* ---------------- 리스트 렌더 ---------------- */
+function updateDetectionsList(detections) {
+    const container = document.getElementById('detectionsContent');
+    if (!detections || detections.length === 0) {
+        container.innerHTML = '<span style="color:#94a3b8;">감지 대기중...</span>'; return;
     }
-
-    function sendCommand(command) {
-        socket.emit('send_command', { command });
-    }
-
-    function shutdownServer() {
-        addLog('WARNING', '서버 종료 요청…');
-        socket.emit('shutdown_server');
-    }
-
-    // ---------- 리스트 렌더 ----------
-    function updateDetectionsList(detections) {
-        const container = document.getElementById('detectionsContent');
-        if (!detections || detections.length === 0) {
-        container.innerHTML = '<span style="color: #94a3b8;">감지 대기중...</span>';
-        return;
-        }
-
-        container.innerHTML = '';
-        detections.forEach((det) => {
+    container.innerHTML = '';
+    detections.forEach((det) => {
         const item = document.createElement('div');
         item.className = 'detection-item';
-
         const iid = toIntOrNull(det.identity_id);
         const same = !!selectedTarget && selectedTarget.identity_id === iid;
-
         if (isTracking && same) item.className += ' tracking';
         else if (same) item.className += ' selected';
-
         const label = (iid === null) ? '??' : iid;
-        item.innerHTML = `
-            <strong>ID ${label}</strong>: ${det.class}
-            <span style="opacity:0.7;">${(det.confidence * 100).toFixed(0)}%</span>
-        `;
-
-        // ✅ ??도 클릭 허용: bbox-lock로 시작 → 갤러리 확정 시 ID로 승격
-        item.onclick = () => selectTargetAndStartTracking(det);
-        if (iid === null) {
-            item.style.opacity = 0.85;
-            item.title = '임시 bbox로 추적 시작. 갤러리 확정 후 ID로 승격됩니다.';
-        }
-
-        container.appendChild(item);
-        });
-    }
-
-    // ---------- 선택 + 추적 시작 ----------
-    function selectTargetAndStartTracking(detection) {
-        const iid = toIntOrNull(detection.identity_id);
-
-        selectedTarget = { ...detection, identity_id: iid }; // 타입 정규화
-        addLog('INFO', `타겟: ID ${iid ?? '??'} (${detection.class})`);
-
-        // 서버에 타겟 설정 (bbox 포함)
-        socket.emit('set_target', {
-        target_identity_id: iid, // null이면 서버에서 bbox 폴백
-        class: detection.class,
-        bbox: detection.bbox,
-        });
-
-        // ⚠️ 로컬에서 isTracking=true를 올리지 않고, 서버의 tracking_status를 기다림
-        socket.emit('start_tracking');
-
-        // 하이라이트 즉시 갱신
-        updateDetectionsList(currentDetections);
-    }
-
-    // ---------- 상태/버튼 ----------
-    function updateTrackingStatus(tracking) {
-        isTracking = !!tracking;
-        const statusEl = document.getElementById('trackingStatus');
-        const stopBtn = document.getElementById('stopTrackingBtn');
-
-        if (isTracking && selectedTarget) {
-        statusEl.textContent = `🎯 추적중: ID ${selectedTarget.identity_id ?? '??'} (${selectedTarget.class})`;
-        statusEl.className = 'active';
-        stopBtn.style.display = 'block';
+        item.innerHTML = `<strong>ID ${label}</strong>: ${det.class} <span style="opacity:.7;">${(det.confidence * 100).toFixed(0)}%</span>`;
+        if (iid === null || iid <= 0) { 
+            item.style.opacity = .55;
+            item.style.cursor = 'not-allowed';
+            item.title = 'ID(??) 항목은 선택 불가 — 갤러리 2장 저장 후 ID가 부여되어야 합니다.';
         } else {
-        statusEl.textContent = '추적 안 함';
-        statusEl.className = '';
-        stopBtn.style.display = 'none';
+            item.onclick = () => selectTargetAndStartTracking(det);
         }
-    }
+        container.appendChild(item);
+    });
+}
 
-    function stopTracking() {
-        addLog('INFO', '추적 중지');
-        socket.emit('stop_tracking');
-        // 최종 OFF 반영은 tracking_status 수신으로 통일
-    }
-
-    function manualSetThief() {
-        const v = toIntOrNull(document.getElementById('manualId').value);
-        if (v === null || v <= 0) {
-        addLog('WARNING', '유효한 identity_id를 입력하세요.');
+/* ---------------- 선택 + 추적 시작 ---------------- */
+function selectTargetAndStartTracking(detection) {
+    const iid = toIntOrNull(detection.identity_id);
+    if (iid === null || iid <= 0) {
+        addLog('WARNING','ID가 없는(??) 객체는 선택할 수 없습니다.');
         return;
-        }
-        selectedTarget = { identity_id: v, class: 'person', bbox: null };
-        socket.emit('set_target', { target_identity_id: v, class: 'person', bbox: null });
-        socket.emit('start_tracking');
     }
+    selectedTarget = { ...detection, identity_id: iid };
+    addLog('INFO', `타겟: ID ${iid ?? '??'} (${detection.class})`);
+    socket.emit('set_target', { target_identity_id: iid, class: detection.class, bbox: detection.bbox });
+    socket.emit('start_tracking');
+    updateDetectionsList(currentDetections);
+}
 
-    function enableControls(enabled) {
-        const buttons = [
-        'reconnectBtn', 'takeoffBtn', 'landBtn', 'emergencyBtn',
-        'forwardBtn', 'backBtn', 'leftBtn', 'rightBtn',
-        'upBtn', 'downBtn', 'cwBtn', 'ccwBtn'
-        ];
-        buttons.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.disabled = !enabled;
-        });
+/* ---------------- 상태/버튼 ---------------- */
+function updateTrackingStatus(tracking) {
+    isTracking = !!tracking;
+    const statusEl = document.getElementById('trackingStatus');
+    const stopBtn = document.getElementById('stopTrackingBtn');
+    if (isTracking && selectedTarget) {
+        statusEl.textContent = `🎯 추적중: ID ${selectedTarget.identity_id ?? '??'} (${selectedTarget.class})`;
+        statusEl.className = 'active'; stopBtn.style.display = 'block';
+    } else {
+        statusEl.textContent = '추적 안 함'; statusEl.className = ''; stopBtn.style.display = 'none';
     }
+}
+function stopTracking() { addLog('INFO', '추적 중지'); socket.emit('stop_tracking'); }
+function manualSetThief() {
+    const v = toIntOrNull(document.getElementById('manualId').value);
+    if (v === null || v <= 0) { addLog('WARNING','유효한 identity_id를 입력하세요.'); return; }
+    selectedTarget = { identity_id:v, class:'person', bbox:null };
+    socket.emit('set_target', { target_identity_id:v, class:'person', bbox:null });
+    socket.emit('start_tracking');
+}
+function enableControls(enabled) {
+    ['reconnectBtn','takeoffBtn','landBtn','emergencyBtn','forwardBtn','backBtn','leftBtn','rightBtn','upBtn','downBtn','cwBtn','ccwBtn']
+        .forEach(id => { const el = document.getElementById(id); if (el) el.disabled = !enabled; });
+}
 
-    // ---------- 부팅 로그 ----------
-    window.onload = () => {
-        addLog('INFO', '시스템 준비');
-    };
-    </script>
+/* ---------------- 부팅 로그 ---------------- */
+window.onload = () => {
+    addLog('INFO', '시스템 준비');
+    applyFeatureButtons(); // 초기 UI 반영
+};
+</script>
 </body>
 </html>
