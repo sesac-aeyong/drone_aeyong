@@ -15,6 +15,8 @@ class Settings:
     Tellomon default settings. Please modify config.json 
     """
     """Hailo"""
+    video_fps = 15
+    """FPS to prcess frames at"""
     vis_model: str = 'models/yolov11s.hef'
     embed_model: str = 'models/repvgg_a0_person_reid_2048.hef'
     _emb_out_size: int = 2048 if '2048' in embed_model else 512 

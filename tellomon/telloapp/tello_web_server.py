@@ -348,11 +348,24 @@ class TelloWebServer:
             
         error_count = 0
         max_errors = 10
-        
+        # skip = False
+        fps = S.video_fps
+        dt = 1 / fps
+        next_t = time.time()
+
+
         while self.is_streaming:
             try:
+                now = time.time()
+
+                if now < next_t:
+                    time.sleep(0.003)  
+                    continue
+
+                next_t += dt
+
                 frame = frame_reader.frame
-                
+
                 if frame is None:
                     error_count += 1
                     if error_count >= max_errors:
