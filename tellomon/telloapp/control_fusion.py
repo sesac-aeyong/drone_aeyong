@@ -66,84 +66,75 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
         layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
- 
-# COCO 17 Keypoint skeleton pairs (왼→오 대칭)
-COCO_EDGES = [
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),     # 어깨-팔
-    (11, 12), (5, 11), (6, 12),                  # 골반/몸통
-    (11, 13), (13, 15), (12, 14), (14, 16),      # 다리
-    (0, 5), (0, 6)                                # 코-어깨
-]
 
-def _norm_conf_uint8(c_raw: float, scale: float) -> float:
-    # 정수 confidence(0~255 가정) → 0~1
-    if c_raw is None: return 0.0
-    c = float(c_raw) / max(1.0, min(scale, 255.0))
-    return 1.0 if c > 1.0 else (0.0 if c < 0.0 else c)
+_LIMBS = [
+    (0, 1), (0, 2),       # Nose → eyes
+    (1, 3), (2, 4),       # Eyes → ears
+    (0, 5), (0, 6),       # Nose → shoulders
+    (5, 7), (7, 9),       # Left arm
+    (6, 8), (8, 10),      # Right arm
+    (5, 11), (6, 12),     # Shoulders → hips
+    (11, 12),             # Hip line
+    (11, 13), (13, 15),   # Left leg
+    (12, 14), (14, 16)    # Right leg
+]
 
 def overlay_pose_points(
     img,
-    should_ema, spine_ema, alpha,
-    pose_kpts=None,              # [[x,y,c_uint8], ...] (len=17)
-    conf_scale: float = 200.0,   # 관측 상한 추정치(~200) → 0~1 정규화 분모
-    conf_thr_norm: float = 0.05, # 그릴 최소 confidence(정규화 이후 기준)
-    draw_skeleton: bool = True,
-    draw_points: bool = True,
-    draw_midpoints: bool = True  # 기존 2포인트(어깨/엉덩이 중점)도 표시할지
+    should_ema=None, spine_ema=None, alpha: float = 0.0,
+    pose_kpts=None,            # [[x,y,conf_uint8], ...] length=17
+    bbox=None,                 # (호출 시그니처 호환용, 사용 안 함)
+    conf_thresh: int = 60,     # 당신이 쓰던 기준
+    draw_indices: bool = True  # 인덱스 숫자도 표시할지
 ):
+    """
+    당신이 '됐었다'고 한 그 방식 그대로 17포인트와 연결선만 그립니다.
+    - 좌표는 프레임 픽셀 좌표라고 가정 (이미 점 찍으면 맞다고 하셨음)
+    - confidence는 uint8/정수(0~255) 가정, conf_thresh(기본 60)보다 클 때만 사용
+    """
     if pose_kpts is None or len(pose_kpts) < 17:
         return img
 
     h, w = img.shape[:2]
-    pts = []
-    confs = []
+    # 1) 포인트 찍기
     for i, kp in enumerate(pose_kpts):
-        if not kp or len(kp) < 3: 
-            pts.append(None); confs.append(0.0); continue
-        x, y, c_raw = kp
-        c = _norm_conf_uint8(c_raw, conf_scale)
-        if c < conf_thr_norm:
-            pts.append(None); confs.append(c); continue
-        x = int(max(0, min(w-1, float(x))))
-        y = int(max(0, min(h-1, float(y))))
-        pts.append((x, y)); confs.append(c)
+        if not kp or len(kp) < 3:
+            continue
+        x, y, conf = kp[0], kp[1], kp[2]
+        try:
+            if int(conf) <= conf_thresh:
+                continue
+        except Exception:
+            continue
 
-    # 1) 스켈레톤
-    if draw_skeleton:
-        for a, b in COCO_EDGES:
-            pa, pb = pts[a], pts[b]
-            if pa is not None and pb is not None:
-                cv2.line(img, pa, pb, (0, 255, 0), 2, cv2.LINE_AA)
+        xi = int(max(0, min(w - 1, int(x))))
+        yi = int(max(0, min(h - 1, int(y))))
 
-    # 2) 포인트
-    if draw_points:
-        for p in pts:
-            if p is not None:
-                cv2.circle(img, p, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, (xi, yi), 3, (0, 255, 0), -1)
+        if draw_indices:
+            cv2.putText(img, str(i), (xi + 2, yi + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
-    # 3) 기존 2포인트(어깨중점/엉덩이중점)도 유지하고 싶으면
-    if draw_midpoints:
-        LSh, RSh, LHp, RHp = pts[5], pts[6], pts[11], pts[12]
-        def mid(p, q):
-            return (int((p[0]+q[0]) * 0.5), int((p[1]+q[1]) * 0.5))
-        if LSh and RSh:
-            shoulder_mid = mid(LSh, RSh)
-            cv2.circle(img, shoulder_mid, 4, (255, 0, 0), -1, cv2.LINE_AA)  # 파랑
-        if LHp and RHp:
-            hip_mid = mid(LHp, RHp)
-            cv2.circle(img, hip_mid, 4, (0, 0, 255), -1, cv2.LINE_AA)      # 빨강
+    # 2) 연결선 그리기
+    for a, b in _LIMBS:
+        if a >= len(pose_kpts) or b >= len(pose_kpts):
+            continue
+        kpa = pose_kpts[a]
+        kpb = pose_kpts[b]
+        if (not kpa or len(kpa) < 3 or not kpb or len(kpb) < 3):
+            continue
+        try:
+            if int(kpa[2]) <= conf_thresh or int(kpb[2]) <= conf_thresh:
+                continue
+        except Exception:
+            continue
 
-    # 4) 품질/스케일 텍스트(선택)
-    try:
-        if alpha > 0:
-            txt = []
-            if should_ema is not None: txt.append(f"shEMA:{should_ema:.1f}")
-            if spine_ema  is not None: txt.append(f"spEMA:{spine_ema:.1f}")
-            if txt:
-                cv2.putText(img, " ".join(txt), (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2, cv2.LINE_AA)
-    except:
-        pass
+        x1 = int(max(0, min(w - 1, int(kpa[0]))))
+        y1 = int(max(0, min(h - 1, int(kpa[1]))))
+        x2 = int(max(0, min(w - 1, int(kpb[0]))))
+        y2 = int(max(0, min(h - 1, int(kpb[1]))))
+
+        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
     return img
 
