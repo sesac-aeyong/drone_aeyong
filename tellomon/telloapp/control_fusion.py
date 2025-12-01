@@ -1,6 +1,6 @@
 # control_fusion.py
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, Iterable, Union
+from typing import Optional, Tuple, Dict, Any, Iterable, Union, List
 import numpy as np
 import cv2
 
@@ -54,7 +54,7 @@ def depth_to_vis(depth_map: np.ndarray) -> np.ndarray:
         return None
     if depth_map.ndim == 2:
         dm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        return cv2.applyColorMap(dm, cv2.COLORMAP_INFERNO)  # BGR
+        return cv2.applyColorMap(dm, cv2.COLORMAP_TURBO)  # BGR
     return depth_map  # already 3ch
 
 def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> np.ndarray:
@@ -65,23 +65,80 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
         layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
-def overlay_pose_points(base_bgr: np.ndarray,
-                        shoulder_ema: Optional[Tuple[float,float]],
-                        spine_ema: Optional[Tuple[float,float]],
-                        alpha: float = 0.5) -> np.ndarray:
-    if shoulder_ema is None and spine_ema is None:
-        return base_bgr
+def overlay_pose_points(
+    base_bgr: np.ndarray,
+    shoulder_ema: Optional[Tuple[float, float]],
+    spine_ema: Optional[Tuple[float, float]],
+    alpha: float = 0.5,
+    pose_kpts: Optional[List[Tuple[float, float, float]]] = None,
+    conf_thresh: float = 60.0,
+    draw_skeleton: bool = False,
+) -> np.ndarray:
+    """
+    - EMA 좌표(shoulder_ema, spine_ema)가 있으면 그것을 우선 표시.
+    - EMA가 없더라도 pose_kpts(17x[x,y,conf])가 오면
+      * 어깨 중앙점 = (L-shoulder(5), R-shoulder(6))의 중점
+      * 척추 기준점 = (L-hip(11), R-hip(12))의 중점
+      을 계산해 표시.
+    - BGR 입력/출력, 알파 블렌딩은 addWeighted.
+    """
+    h, w = base_bgr.shape[:2]
     layer = np.zeros_like(base_bgr)
+
+    # 1) EMA 우선
+    drew_any = False
     try:
         if shoulder_ema is not None:
             sx, sy = map(int, shoulder_ema)
-            cv2.circle(layer, (sx, sy), 6, (0, 255, 0), -1)
+            if 0 <= sx < w and 0 <= sy < h:
+                cv2.circle(layer, (sx, sy), 6, (0, 255, 0), -1)       # shoulder: green
+                drew_any = True
         if spine_ema is not None:
             px, py = map(int, spine_ema)
-            cv2.circle(layer, (px, py), 6, (0, 255, 255), -1)
-        return overlay_blend(base_bgr, layer, alpha)
+            if 0 <= px < w and 0 <= py < h:
+                cv2.circle(layer, (px, py), 6, (0, 255, 255), -1)     # spine: yellow
+                drew_any = True
     except Exception:
-        return base_bgr
+        pass
+
+    # 2) EMA가 없거나 일부만 있을 때 → 키포인트로 보완
+    if not drew_any and pose_kpts is not None and len(pose_kpts) >= 13:
+        try:
+            def ok(i): return pose_kpts[i][2] >= conf_thresh
+            # COCO index: 5=L-shoulder, 6=R-shoulder, 11=L-hip, 12=R-hip
+            shoulder_pt = None
+            spine_pt = None
+
+            if ok(5) and ok(6):
+                shoulder_pt = (int(0.5 * (pose_kpts[5][0] + pose_kpts[6][0])),
+                               int(0.5 * (pose_kpts[5][1] + pose_kpts[6][1])))
+                cv2.circle(layer, shoulder_pt, 6, (0, 255, 0), -1)
+
+            if ok(11) and ok(12):
+                spine_pt = (int(0.5 * (pose_kpts[11][0] + pose_kpts[12][0])),
+                            int(0.5 * (pose_kpts[11][1] + pose_kpts[12][1])))
+                cv2.circle(layer, spine_pt, 6, (0, 255, 255), -1)
+
+            drew_any = (shoulder_pt is not None) or (spine_pt is not None)
+
+            # 옵션: 간단 스켈레톤
+            if draw_skeleton:
+                limbs = [
+                    (5, 6), (5, 7), (7, 9), (6, 8), (8,10),  # 어깨/팔
+                    (5,11), (6,12), (11,12)                 # 몸통/엉덩이
+                ]
+                for a, b in limbs:
+                    if a < len(pose_kpts) and b < len(pose_kpts) and ok(a) and ok(b):
+                        pa = (int(pose_kpts[a][0]), int(pose_kpts[a][1]))
+                        pb = (int(pose_kpts[b][0]), int(pose_kpts[b][1]))
+                        cv2.line(layer, pa, pb, (255, 0, 0), 2)
+        except Exception:
+            pass
+
+    # 3) 알파 합성
+    if drew_any and 0.0 <= alpha <= 1.0:
+        return cv2.addWeighted(base_bgr, 1.0 - alpha, layer, alpha, 0)
+    return base_bgr
 
 def overlay_flow_arrow(base_bgr: np.ndarray,
                        bbox: Optional[Tuple[int,int,int,int]],

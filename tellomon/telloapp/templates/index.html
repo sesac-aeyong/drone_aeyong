@@ -40,6 +40,13 @@
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
 
         /* ▶ 신규: 오른쪽 위 기능 토글 박스 */
+        .hidden { display: none !important; }
+        /* 접힘 상태에서 바디 숨김 */
+        .feature-panel.collapsed .fp-body { display: none; }
+        /* 헤더/체브론(삼각형) 회전 */
+        .fp-header { display:flex; align-items:center; justify-content:space-between; cursor:pointer; user-select:none; }
+        #fpChevron { transition: transform .15s ease; transform: rotate(90deg); }
+        .feature-panel.collapsed #fpChevron { transform: rotate(0deg); }
         .feature-panel {
             position:absolute; top:10px; right:10px; z-index:10;
             background:rgba(22,33,62,.85); backdrop-filter:blur(4px);
@@ -122,6 +129,8 @@
             h1 { text-align:center; }
             .status { order:2; }
             .header-controls { order:3; justify-content:center; }
+            .video-container { padding-top: 44px; } /* 헤더 여백 조금 */
+            .feature-panel { position: static; margin: 6px 0 0 0; }
         }
     </style>
 </head>
@@ -147,24 +156,32 @@
                 <div class="video-container" id="videoContainer">
                     <img id="videoFeed" src="/video_feed" alt="Video">
 
-                    <!-- ▶ 신규: 오른쪽 위 기능 토글/투명도 -->
-                    <div class="feature-panel" id="featurePanel">
+                    <!-- ▶ 신규: 오른쪽 위 기능 토글/투명도 (도둑모드에서만 표시) -->
+                    <div class="feature-panel hidden collapsed" id="featurePanel">
+                    <!-- 헤더(클릭→접기/펼치기) -->
+                    <div class="fp-header" id="fpHeader">
                         <div class="feature-title">
-                            <span>시각화/연산 토글</span>
-                            <span id="featureSyncDot" title="서버 동기화 상태">●</span>
+                        <span>시각화/연산 토글</span>
+                        <span id="featureSyncDot" title="서버 동기화 상태">●</span>
                         </div>
+                        <span id="fpChevron">▸</span>
+                    </div>
+
+                    <!-- 바디(접힘 시 숨김) -->
+                    <div class="fp-body">
                         <div class="feature-row">
-                            <button id="btnPose" class="toggle" onclick="toggleFeature('pose')">Pose</button>
-                            <button id="btnDepth" class="toggle" onclick="toggleFeature('depth')">Depth</button>
-                            <button id="btnFlow" class="toggle" onclick="toggleFeature('flow')">Flow</button>
+                        <button id="btnPose"  class="toggle" onclick="toggleFeature('pose')">Pose</button>
+                        <button id="btnDepth" class="toggle" onclick="toggleFeature('depth')">Depth</button>
+                        <button id="btnFlow"  class="toggle" onclick="toggleFeature('flow')">Flow</button>
                         </div>
                         <div class="slider-wrap">
-                            <input id="alphaSlider" type="range" min="0" max="100" step="5" value="50" oninput="updateAlpha(this.value)">
-                            <span class="slider-badge" id="alphaBadge">투명도 50%</span>
+                        <input id="alphaSlider" type="range" min="0" max="100" step="5" value="50" oninput="updateAlpha(this.value)">
+                        <span class="slider-badge" id="alphaBadge">투명도 50%</span>
                         </div>
                         <div style="font-size:.7em; color:#94a3b8;">
-                            OFF 시 서버 연산 완전 중지 · ON 시에만 계산/오버레이 (Depth/Flow/Pose)
+                        OFF 시 서버 연산 완전 중지 · ON 시에만 계산/오버레이 (Depth/Flow/Pose)
                         </div>
+                    </div>
                     </div>
                 </div>
 
@@ -261,6 +278,9 @@ const btnFlow = document.getElementById('btnFlow');
 const alphaSlider = document.getElementById('alphaSlider');
 const alphaBadge = document.getElementById('alphaBadge');
 const syncDot = document.getElementById('featureSyncDot');
+const featurePanel = document.getElementById('featurePanel');
+const fpHeader = document.getElementById('fpHeader');
+const fpChevron = document.getElementById('fpChevron');
 
 /* ---------------- 유틸 ---------------- */
 function toIntOrNull(v) {
@@ -290,6 +310,9 @@ function setSyncState(ok) {
     syncDot.style.color = ok ? '#10b981' : '#ef4444';
     syncDot.title = ok ? '서버와 동기화됨' : '서버 미동기화';
 }
+function updateChevron() {
+  fpChevron.textContent = featurePanel.classList.contains('collapsed') ? '▸' : '▾';
+}
 
 /* ---------------- 신규: 토글 UI/송신 ---------------- */
 function applyFeatureButtons() {
@@ -308,6 +331,11 @@ function emitFeatures() {
         alpha: Number(features.alpha) || 0.5,
     });
 }
+function debounce(fn, delay=80){
+  let t; return (...args)=>{ clearTimeout(t); t = setTimeout(()=>fn(...args), delay); };
+}
+const emitFeaturesDebounced = debounce(emitFeatures, 80);
+
 function toggleFeature(key) {
     features[key] = !features[key];
     applyFeatureButtons();
@@ -317,9 +345,13 @@ function updateAlpha(val) {
     const v = Math.max(0, Math.min(100, Number(val)));
     features.alpha = v / 100.0;
     alphaBadge.textContent = `투명도 ${v}%`;
-    emitFeatures();
+    emitFeaturesDebounced();   // ← 디바운스 사용
 }
-
+/* ---------------- 접기/펼치기 ---------------- */
+fpHeader.addEventListener('click', () => {
+  featurePanel.classList.toggle('collapsed');
+  updateChevron();
+});
 /* ---------------- 비디오 클릭(객체 선택) ---------------- */
 document.getElementById('videoContainer').addEventListener('click', function (e) {
     if (!currentDetections || currentDetections.length === 0) return;
@@ -418,6 +450,17 @@ socket.on('tracking_status', (data) => {
         isTracking = false;
     }
     updateTrackingStatus(isTracking);
+    // ▼▼ 추가: 도둑모드(추적 ON & iid 존재)일 때만 패널 보이기
+    const thiefMode = Boolean(data.is_tracking && data.target_identity_id);
+    if (thiefMode) featurePanel.classList.remove('hidden');
+    else featurePanel.classList.add('hidden');
+});
+socket.on('disconnect', () => {
+  featurePanel.classList.add('hidden');
+});
+
+socket.on('connect_error', () => {
+  featurePanel.classList.add('hidden');
 });
 
 /* ---------------- 소켓 송신 ---------------- */
@@ -481,7 +524,11 @@ function updateTrackingStatus(tracking) {
         statusEl.textContent = '추적 안 함'; statusEl.className = ''; stopBtn.style.display = 'none';
     }
 }
-function stopTracking() { addLog('INFO', '추적 중지'); socket.emit('stop_tracking'); }
+function stopTracking() { 
+    addLog('INFO', '추적 중지'); 
+    socket.emit('stop_tracking'); 
+    featurePanel.classList.add('hidden');
+}
 function manualSetThief() {
     const v = toIntOrNull(document.getElementById('manualId').value);
     if (v === null || v <= 0) { addLog('WARNING','유효한 identity_id를 입력하세요.'); return; }
@@ -498,6 +545,8 @@ function enableControls(enabled) {
 window.onload = () => {
     addLog('INFO', '시스템 준비');
     applyFeatureButtons(); // 초기 UI 반영
+    featurePanel.classList.add('collapsed'); // 처음엔 접힘
+    updateChevron();
 };
 </script>
 </body>

@@ -146,7 +146,12 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
             _broadcast_features(ts)
             return
 
-        ts.features.update({'depth': depth, 'pose': pose, 'flow': flow, 'alpha': alpha})
+        # race 방지
+        try:
+            with ts.lock:
+                ts.features.update({'depth': depth, 'pose': pose, 'flow': flow, 'alpha': alpha})
+        except AttributeError:
+            ts.features.update({'depth': depth, 'pose': pose, 'flow': flow, 'alpha': alpha})
 
         # 사용자에게 즉시 반영됨을 알림
         _broadcast_features(ts)
@@ -181,10 +186,15 @@ def create_routes(socketio, get_tello_server, disconnect_wifi):
             return
 
         # 서버 상태에 저장
-        ts.target_identity_id = target_identity_id
-        ts.target_class = target_class
-        ts.target_bbox  = target_bbox
-
+        try:
+            with ts.lock:
+                ts.target_identity_id = target_identity_id
+                ts.target_class = target_class
+                ts.target_bbox  = target_bbox
+        except AttributeError:
+            ts.target_identity_id = target_identity_id
+            ts.target_class = target_class
+            ts.target_bbox  = target_bbox
         try:
             ts.log("INFO", f"🎯 Target set → iid={target_identity_id}, class={target_class}, bbox={target_bbox}")
         except Exception:

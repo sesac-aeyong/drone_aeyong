@@ -6,12 +6,13 @@ from typing import List, Tuple
 import numpy as np
 import cv2
 
+from contextlib import suppress
 from common.hailo_inference import HailoInfer
 from tracker.tracker_botsort import BoTSORT, LongTermBoTSORT, ThiefTracker
 from settings import settings as S
 from yolo_tools import extract_detections
 
-class HailoRun():
+class HailoRun:
     """
     Hailo pipeline class.
 
@@ -20,17 +21,19 @@ class HailoRun():
           \\_ dep_model(thief)        /
     """
 
-    def __init__(self):
+    def __init__(self, feature_state_getter=None):
         print('hailo init')
         self.loaded = False
         self.vis_m = None
         self.dep_m = None
         self.emb_m = None
+        self.pos_m = None
 
         self.vm_shape = None
         self.em_shape = None
         self.dm_shape = None
         self.dm_scale = None
+        self.pm_shape = None
 
         self.vis_q = queue.Queue()
         self.dep_q = queue.Queue()
@@ -48,6 +51,8 @@ class HailoRun():
         self._thief_tracker = None  # created when entering thief mode
         self.thief_id = 0
 
+        # 외부(서버) 상태를 읽어오는 콜백: {"pose":bool,"depth":bool,"flow":bool,"alpha":float}
+        self._feature_state_getter = feature_state_getter or (lambda: {"pose": False, "depth": False, "flow": False, "alpha": 0.5})
 
     def load(self):
         self.loaded = True
@@ -130,30 +135,44 @@ class HailoRun():
         return scale, (left, top)
     
 
-    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray]:
+    def run(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray, list]:
         """
         frame is expected to be BGR format and in (S.frame_height, S.frame_width)
-        output is detections, depth, list of yolo boxes
+        returns: (detections, depth_map_or_None, extra)
         """
         # if frame.shape[0] < 500 or frame.shape[1] < 600:
         #     print('[HailoRun] Skipping wrong inputs')
         #     return [], np.zeros((self.dm_shape[0], self.dm_shape[1], 1)), []
         # prepare and run vis and dep models
+        if not self.loaded:
+            return [], None, []  # 미로딩 안전가드
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.letterbox_buffer(frame, self.vis_fb)
         self.vis_m.run([self.vis_fb], self.vis_cb)
 
-        # depth model only when thief mode is active
+        # depth: 토글 + thief 모드일 때만
+        # ---- 프론트 토글 상태 적용 ----
+        feats = self._feature_state_getter()
+        want_pose  = bool(feats.get("pose", False)) and (self.thief_id > 0)
+        want_depth = bool(feats.get("depth", False)) and (self.thief_id > 0)
+        want_flow  = bool(feats.get("flow", False))  and (self.thief_id > 0)  # (플로우 모델 없으면 앞으로 확장)
+        alpha      = float(feats.get("alpha", 0.5))
+        alpha = 0.0 if alpha < 0 else 1.0 if alpha > 1 else alpha
+
+        # depth: ON + 도둑모드일 때만 실행
         depth_ran = False
-        if self.thief_id > 0:
+        if want_depth:
             self.dep_fb[...] = cv2.resize(frame, self.dm_shape, interpolation=cv2.INTER_LINEAR)
             self.dep_m.run([self.dep_fb], self.dep_cb)
             depth_ran = True
 
         # wait for vision model to run embeddings on.
-        vision = self.vis_q.get()
+        with suppress(queue.Empty):
+            vision = self.vis_q.get(timeout=1.0)
+        # 실패 시 빈 리턴
+        if 'vision' not in locals() or vision is None:
+            return [], None, []
         del vision[1:] # 0 is person, remove all other classes.
-        # Perhaps add knife or some weapon types?
 
         boxes, scores, _, num_detections = extract_detections(frame, vision)
 
@@ -245,21 +264,31 @@ class HailoRun():
             if (self.thief_id != 0):
                 det["thief_dist"] = float(getattr(track, "thief_dist", 1.0))
                 det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
-                x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
-                x1 = max(0, x1)
-                y1 = max(0, y1)
-                x2 = min(frame.shape[0], x2)
-                y2 = min(frame.shape[1], y2)
-                crop = frame[y1:y2, x1:x2]
                 
-                self.pos_m.run([cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
-                                partial(_pose_callback, output_queue = self.pos_q, info = (0, x1, y1, x2 - x1, y2 - y1)))
-                det["pose"] = self.pos_q.get()
+                # pose는 토글 ON일 때만, '도둑' 1명 ROI만
+                if want_pose and (iid == self.thief_id):
+                    x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
+                    x1 = max(0, x1); y1 = max(0, y1)
+                    x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+                    if (x2 > x1 and y2 > y1):
+                        crop = frame[y1:y2, x1:x2]
+                        self.pos_m.run(
+                            [cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
+                            partial(_pose_callback, output_queue=self.pos_q, info=(0, x1, y1, x2 - x1, y2 - y1))
+                        )
+                        with suppress(queue.Empty):
+                            det["pose"] = self.pos_q.get(timeout=1.0)
             rets.append(det)
         
-        if self.thief_id and depth_ran:
-            return rets, cv2.resize(self.dep_q.get(), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST), []
-        return rets, np.zeros_like(frame), []
+        # depth 결과 반환(없으면 None)
+        if depth_ran:
+            with suppress(queue.Empty):
+                dep = self.dep_q.get(timeout=1.0)
+            if 'dep' not in locals() or dep is None:
+                return rets, None, []
+            dep = cv2.resize(dep, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            return rets, dep, [{"alpha": alpha, "pose_on": want_pose, "depth_on": want_depth, "flow_on": want_flow}]
+        return rets, None, [{"alpha": alpha, "pose_on": want_pose, "depth_on": want_depth, "flow_on": want_flow}]
     
             
     def _safe_box(self, box: list) -> tuple[int, int, int, int]:
@@ -281,9 +310,14 @@ class HailoRun():
     
     
     def close(self):
-        self.vis_m.close()
-        self.dep_m.close()
-        self.emb_m.close()
+        with suppress(Exception):
+            if self.vis_m: self.vis_m.close()
+        with suppress(Exception):
+            if self.dep_m: self.dep_m.close()
+        with suppress(Exception):
+            if self.emb_m: self.emb_m.close()
+        with suppress(Exception):
+            if self.pos_m: self.pos_m.close()
 
     def __del__(self):
         self.close()
@@ -334,11 +368,11 @@ def _pose_callback(bindings_list, output_queue, info, **kwargs) -> None:
         for k in range(17):
             hm = data[:, :, k]            # single keypoint heatmap
             y, x = np.unravel_index(np.argmax(hm), hm.shape)
-            scale_x = (_w) / hm.shape[1] / 4  # hm.shape is 64x48
-            scale_y = (_h) / hm.shape[0] / 4
-            keypoints.append((float(x * 4 * scale_x + _x), 
-                              float(y * 4 * scale_y + _y), 
-                              float(hm[y, x])))          # (x, y) in heatmap coordinates
+            sx = _w / float(hm.shape[1])  # hm.shape is 64x48
+            sy = _h / float(hm.shape[0])
+            keypoints.append((float(x * sx + _x),
+                              float(y * sy + _y),
+                              float(hm[y, x])))      # (x, y) in heatmap coordinates
         
         output_queue.put_nowait(keypoints)
 
