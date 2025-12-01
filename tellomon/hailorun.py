@@ -251,10 +251,10 @@ class HailoRun():
                 x2 = min(frame.shape[0], x2)
                 y2 = min(frame.shape[1], y2)
                 crop = frame[y1:y2, x1:x2]
-                
-                self.pos_m.run([cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
-                                partial(_pose_callback, output_queue = self.pos_q, info = (0, x1, y1, x2 - x1, y2 - y1)))
-                det["pose"] = self.pos_q.get()
+                if crop.size > 0:
+                    self.pos_m.run([cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
+                                    partial(_pose_callback, output_queue = self.pos_q, info = (0, x1, y1, x2 - x1, y2 - y1)))
+                    det["pose"] = self.pos_q.get()
             rets.append(det)
         
         if self.thief_id and depth_ran:
