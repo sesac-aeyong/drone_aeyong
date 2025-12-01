@@ -602,7 +602,7 @@ class TelloWebServer:
         if frame is None:
             return None
         try:
-            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            ok, buf = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not ok:
                 with self.lock:
                     self.current_frame_updated = True
