@@ -66,86 +66,60 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
         layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
- 
-# COCO 17 Keypoint skeleton pairs (왼→오 대칭)
-COCO_EDGES = [
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),     # 어깨-팔
-    (11, 12), (5, 11), (6, 12),                  # 골반/몸통
-    (11, 13), (13, 15), (12, 14), (14, 16),      # 다리
-    (0, 5), (0, 6)                                # 코-어깨
-]
-
-def _norm_conf_uint8(c_raw: float, scale: float) -> float:
-    # 정수 confidence(0~255 가정) → 0~1
-    if c_raw is None: return 0.0
-    c = float(c_raw) / max(1.0, min(scale, 255.0))
-    return 1.0 if c > 1.0 else (0.0 if c < 0.0 else c)
 
 def overlay_pose_points(
-    img,
-    should_ema, spine_ema, alpha,
-    pose_kpts=None,              # [[x,y,c_uint8], ...] (len=17)
-    conf_scale: float = 200.0,   # 관측 상한 추정치(~200) → 0~1 정규화 분모
-    conf_thr_norm: float = 0.05, # 그릴 최소 confidence(정규화 이후 기준)
-    draw_skeleton: bool = True,
-    draw_points: bool = True,
-    draw_midpoints: bool = True  # 기존 2포인트(어깨/엉덩이 중점)도 표시할지
+    frame_vis,
+    should_ema=None, spine_ema=None, alpha=0.0,
+    pose_kpts=None,
+    bbox=None
 ):
+    """
+    ★★ 네가 준 코드 100% 그대로 사용 ★★
+    - keypoints = pose_kpts
+    - limbs = 네가 올린 그대로
+    - conf_thresh = 60
+    """
+
     if pose_kpts is None or len(pose_kpts) < 17:
-        return img
+        return frame_vis
 
-    h, w = img.shape[:2]
-    pts = []
-    confs = []
-    for i, kp in enumerate(pose_kpts):
-        if not kp or len(kp) < 3: 
-            pts.append(None); confs.append(0.0); continue
-        x, y, c_raw = kp
-        c = _norm_conf_uint8(c_raw, conf_scale)
-        if c < conf_thr_norm:
-            pts.append(None); confs.append(c); continue
-        x = int(max(0, min(w-1, float(x))))
-        y = int(max(0, min(h-1, float(y))))
-        pts.append((x, y)); confs.append(c)
+    keypoints = pose_kpts
+    conf_thresh = 60
 
-    # 1) 스켈레톤
-    if draw_skeleton:
-        for a, b in COCO_EDGES:
-            pa, pb = pts[a], pts[b]
-            if pa is not None and pb is not None:
-                cv2.line(img, pa, pb, (0, 255, 0), 2, cv2.LINE_AA)
+    limbs = [
+        (0, 1), (0, 2),       # Nose → eyes
+        (1, 3), (2, 4),       # Eyes → ears
+        (0, 5), (0, 6),       # Nose → shoulders
+        (5, 7), (7, 9),       # Left arm
+        (6, 8), (8, 10),      # Right arm
+        (5, 11), (6, 12),     # Shoulders → hips
+        (11, 12),             # Hip line
+        (11, 13), (13, 15),   # Left leg
+        (12, 14), (14, 16)    # Right leg
+    ]
 
-    # 2) 포인트
-    if draw_points:
-        for p in pts:
-            if p is not None:
-                cv2.circle(img, p, 3, (0, 255, 255), -1, cv2.LINE_AA)
+    # ---- Draw keypoints ----
+    for i, (x, y, conf) in enumerate(keypoints):
+        try:
+            if conf > conf_thresh:
+                cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+                cv2.putText(frame_vis, str(i), (int(x)+2, int(y)+2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,255,255), 1)
+        except:
+            pass
 
-    # 3) 기존 2포인트(어깨중점/엉덩이중점)도 유지하고 싶으면
-    if draw_midpoints:
-        LSh, RSh, LHp, RHp = pts[5], pts[6], pts[11], pts[12]
-        def mid(p, q):
-            return (int((p[0]+q[0]) * 0.5), int((p[1]+q[1]) * 0.5))
-        if LSh and RSh:
-            shoulder_mid = mid(LSh, RSh)
-            cv2.circle(img, shoulder_mid, 4, (255, 0, 0), -1, cv2.LINE_AA)  # 파랑
-        if LHp and RHp:
-            hip_mid = mid(LHp, RHp)
-            cv2.circle(img, hip_mid, 4, (0, 0, 255), -1, cv2.LINE_AA)      # 빨강
+    # ---- Draw limbs ----
+    for a, b in limbs:
+        try:
+            if keypoints[a][2] > conf_thresh and keypoints[b][2] > conf_thresh:
+                pt1 = (int(keypoints[a][0]), int(keypoints[a][1]))
+                pt2 = (int(keypoints[b][0]), int(keypoints[b][1]))
+                cv2.line(frame_vis, pt1, pt2, (255, 0, 0), 2)
+        except:
+            pass
 
-    # 4) 품질/스케일 텍스트(선택)
-    try:
-        if alpha > 0:
-            txt = []
-            if should_ema is not None: txt.append(f"shEMA:{should_ema:.1f}")
-            if spine_ema  is not None: txt.append(f"spEMA:{spine_ema:.1f}")
-            if txt:
-                cv2.putText(img, " ".join(txt), (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2, cv2.LINE_AA)
-    except:
-        pass
+    return frame_vis
 
-    return img
 
 def overlay_flow_arrow(base_bgr: np.ndarray,
                        bbox: Optional[Tuple[int,int,int,int]],
