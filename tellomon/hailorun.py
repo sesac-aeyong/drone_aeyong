@@ -272,12 +272,22 @@ class HailoRun:
                     x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
                     if (x2 > x1 and y2 > y1):
                         crop = frame[y1:y2, x1:x2]
-                        self.pos_m.run(
-                            [cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
-                            partial(_pose_callback, output_queue=self.pos_q, info=(0, x1, y1, x2 - x1, y2 - y1))
-                        )
-                        with suppress(queue.Empty):
-                            det["pose"] = self.pos_q.get(timeout=1.0)
+                        if crop.size > 0:
+                            # 1) 이전 잔여 결과 제거(스테일 방지)
+                            while not self.pos_q.empty():
+                                try: self.pos_q.get_nowait()
+                                except queue.Empty: break
+
+                            # 2) 실행
+                            self.pos_m.run(
+                                [cv2.resize(crop, self.pm_shape, interpolation=cv2.INTER_LINEAR)],
+                                partial(_pose_callback, output_queue=self.pos_q, info=(0, x1, y1, x2 - x1, y2 - y1))
+                            )
+                            # 3) 결과 수신(짧은 타임아웃). 실패 시 None으로 명시.
+                            try:
+                                det["pose"] = self.pos_q.get(timeout=0.3)
+                            except queue.Empty:
+                                det["pose"] = None
             rets.append(det)
         
         # depth 결과 반환(없으면 None)
