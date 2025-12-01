@@ -583,7 +583,7 @@ class TelloWebServer:
                     self.cmd_ud = 0
 
                 if self.tello:
-                    self.tello.send_rc_control(0, 0, self.cmd_ud, self.cmd_yaw)
+                    self.tello.send_rc_control(0, self.cmd_fb, self.cmd_ud, self.cmd_yaw)
 
                 time.sleep(0.1)
 
