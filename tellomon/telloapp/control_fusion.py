@@ -305,22 +305,6 @@ def select_thief_candidate(detections):
             best, best_td = det, td
     return best
 
-def pick_detection_by_iid(detections: Iterable[Union[dict, Any]], iid: Optional[int]):
-    """현재 iid와 일치하는 detection 하나를 반환 (없으면 None)."""
-    if iid is None or iid <= 0 or not detections:
-        return None
-    for d in detections:
-        if isinstance(d, dict):
-            did = d.get('identity_id', None)
-        else:
-            did = getattr(d, 'identity_id', None)
-        try:
-            did = int(did) if did is not None else None
-        except Exception:
-            did = None
-        if did == iid:
-            return d
-    return None
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optical Flow (척추 스트립 기반)
@@ -462,7 +446,6 @@ __all__ = [
     "ControlFusion",
     "clip_bbox_to_frame",
     "select_thief_candidate",
-    "pick_detection_by_iid",
     "compute_flow_from_spine_strip",
     "update_pose_stats",
     "spine_depth_mode_and_brake",
