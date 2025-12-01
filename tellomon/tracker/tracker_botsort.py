@@ -521,19 +521,7 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
                     active_identity_ids.add(new_id)
                 else:
                     track.identity_id = None
-            
-            # # 디버그용
-            # gid = track.identity_id
-            # info = self.gallery.get(gid, {"gal_embs": []})
-            # gal_emb_list = info.get("gal_embs", [])
-            # min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if (gal_emb_list and last_emb is not None) else 1.0
-            # print(
-            #     f"[LT-FRAME] track_id={track.track_id:3d} "
-            #     f"identity_id={(gid if gid is not None else -1):3d} "
-            #     f"conf={track.score:.2f} "
-            #     f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
-            #     f"min_cos_dist={min_cos_dist:.3f}"
-            # )
+
 
         # 4) 메모리 관리 – 이번 프레임에 쓰이지 않은 오래된 identity 일부 제거 (선택)
         if len(self.gallery) > self.max_memory:
@@ -882,16 +870,6 @@ class ThiefTracker:
             # 실제로 어느 갤러리 벡터가 사용됐는지 카운트
             if last_emb is not None:
                 self._register_gallery_match(last_emb)
-
-            # 디버그 로그
-            # print(
-            #     f"[THIEF] track_id={t.track_id:3d} "
-            #     f"conf={t.score:.2f} "
-            #     f"kf_life={t.kf_life:2d} "
-            #     f"match_frames={t.match_frames:2d} "
-            #     f"cos_dist={cos_dist:.3f} "
-            #     f"gal_size={len(self.thief_embs)}/{self.max_memory}"
-            # )
 
         # ==============================
         # 최종 반환

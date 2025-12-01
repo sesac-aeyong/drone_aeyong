@@ -562,7 +562,7 @@ class TelloWebServer:
                     self.cmd_fb = 0
 
                 # ---------------------------
-                # C. 명령 전송
+                # C. fb, yaw clipping
                 # ---------------------------
                 self.cmd_fb = int(np.clip(self.cmd_fb, 0, 100))
                 self.cmd_yaw = int(np.clip(self.cmd_yaw, -100, 100))
@@ -581,17 +581,6 @@ class TelloWebServer:
                         self.cmd_ud = -20
                 else:
                     self.cmd_ud = 0
-
-                # # ---------------------------
-                # # D. recover original height
-                # # ---------------------------
-
-                # if hasattr(self, 'descend_start_height'):
-                #     self.cmd_ud = 20
-                #     if self.tello.get_distance_tof() >= self.descend_start_height:
-                #         del self.descend_start_height
-                # else:
-                #     self.cmd_ud = 0
 
                 if self.tello:
                     self.tello.send_rc_control(0, 0, self.cmd_ud, self.cmd_yaw)
