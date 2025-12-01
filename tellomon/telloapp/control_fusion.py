@@ -25,7 +25,7 @@ def feature_alpha(features: Dict[str, Any], default: float = 0.5) -> float:
     return 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Pose → RC 보조 입력 준비
+# Pose → RC 보조 입력 준비 (센터/골반폭 포함)
 # ───────────────────────────────────────────────────────────────────────────────
 def prepare_pose_for_rc(
     use_pose: bool,
@@ -34,6 +34,10 @@ def prepare_pose_for_rc(
     should_ema: Optional[float],
     spine_ref: Optional[float],
     spine_ema: Optional[float],
+    *,
+    hip_mid: Optional[Tuple[float, float]] = None,
+    shoulder_mid: Optional[Tuple[float, float]] = None,
+    pelvis_ema: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
     if not use_pose:
         return None
@@ -44,6 +48,8 @@ def prepare_pose_for_rc(
         'quality': float(pose_quality),
         'shoulder': {'ref': should_ref, 'ema': should_ema} if should_ref is not None or should_ema is not None else None,
         'spine':    {'ref': spine_ref,  'ema': spine_ema}  if spine_ref  is not None or spine_ema  is not None else None,
+        'centers':  {'hip_mid': hip_mid, 'shoulder_mid': shoulder_mid} if (hip_mid is not None or shoulder_mid is not None) else None,
+        'pelvis':   {'ema': pelvis_ema} if pelvis_ema is not None else None,
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -128,17 +134,14 @@ def overlay_pose_points_min9(
 
     # midpoints (어깨/힙 중심은 제어 시 유용)
     if draw_midpoints:
-        try:
-            if _pt_ok(5) and _pt_ok(6):
-                sx = (_pt_xy(5)[0] + _pt_xy(6)[0]) // 2
-                sy = (_pt_xy(5)[1] + _pt_xy(6)[1]) // 2
-                cv2.circle(img, (sx, sy), 4, (255, 0, 0), -1, cv2.LINE_AA)
-            if _pt_ok(11) and _pt_ok(12):
-                hx = (_pt_xy(11)[0] + _pt_xy(12)[0]) // 2
-                hy = (_pt_xy(11)[1] + _pt_xy(12)[1]) // 2
-                cv2.circle(img, (hx, hy), 4, (0, 0, 255), -1, cv2.LINE_AA)
-        except:
-            pass
+        if _pt_ok(5) and _pt_ok(6):
+            sx = (_pt_xy(5)[0] + _pt_xy(6)[0]) // 2
+            sy = (_pt_xy(5)[1] + _pt_xy(6)[1]) // 2
+            cv2.circle(img, (sx, sy), 4, (255, 0, 0), -1, cv2.LINE_AA)
+        if _pt_ok(11) and _pt_ok(12):
+            hx = (_pt_xy(11)[0] + _pt_xy(12)[0]) // 2
+            hy = (_pt_xy(11)[1] + _pt_xy(12)[1]) // 2
+            cv2.circle(img, (hx, hy), 4, (0, 0, 255), -1, cv2.LINE_AA)
 
     return img
 
@@ -217,14 +220,40 @@ class ControlFusion:
         flow_vec: Optional[Tuple[float, float]] = None,  # (vx, vy) in px/frame
         size_target_range: Tuple[float, float] = (0.20, 0.30),
         obstacle_brake: bool = False,
-    ):
+        *,
+        desired_spine_pct: float = 0.28,   # 화면 높이 대비 목표 척추 길이 비율
+        desired_pelvis_pct: float = 0.18,  # 화면 너비 대비 목표 골반 폭 비율
+        pose_center_mode: str = "hip-shoulder-mid"  # "hip", "shoulder", "hip-shoulder-mid"
+     ):
         """
         returns (lr, fb, ud, yaw)
-        - size_target_range: (low, high) → 중앙값을 목표로 deadband 적용
-        - obstacle_brake: True면 fb=0 강제(가까운 장애물 감지 시)
         """
         h, w = frame_shape[:2]
-        err_x, err_y = self._center_error(bbox, w, h)
+        # ── 1) 센터링 기준: pose가 있으면 골반/어깨 중점 사용
+        use_pose_center = False
+        tx, ty = None, None
+        if pose_dict and float(pose_dict.get("quality", 0.0)) >= self.pose_qmin:
+            centers = pose_dict.get('centers') if isinstance(pose_dict, dict) else None
+            if centers:
+                hip_mid = centers.get('hip_mid')
+                sh_mid  = centers.get('shoulder_mid')
+                if pose_center_mode == "hip" and hip_mid is not None:
+                    tx, ty = int(hip_mid[0]), int(hip_mid[1]); use_pose_center = True
+                elif pose_center_mode == "shoulder" and sh_mid is not None:
+                    tx, ty = int(sh_mid[0]), int(sh_mid[1]);   use_pose_center = True
+                elif pose_center_mode == "hip-shoulder-mid" and hip_mid and sh_mid:
+                    tx = int(0.5*(hip_mid[0]+sh_mid[0]))
+                    ty = int(0.5*(hip_mid[1]+sh_mid[1]));     use_pose_center = True
+                elif pose_center_mode == "hip-shoulder-mid" and (hip_mid is not None) and (sh_mid is not None):
+                    tx = int(0.5*(hip_mid[0] + sh_mid[0])); ty = int(0.5*(hip_mid[1] + sh_mid[1])); use_pose_center = True
+
+        if use_pose_center:
+            cx, cy = w//2, h//2
+            err_x = (tx - cx) / max(1, w)
+            err_y = (ty - cy) / max(1, h)
+        else:
+            err_x, err_y = self._center_error(bbox, w, h)
+        
         ratio = self._area_ratio(bbox, w, h)
         target = 0.5 * (size_target_range[0] + size_target_range[1])
         err_size = target - ratio
@@ -250,7 +279,7 @@ class ControlFusion:
         if abs(err_size) > self.t_size:
             fb_from_size = self._clip(err_size * self.g_fb, self.vmax)
 
-        fb_from_pose = 0
+        fb_from_pose_log = 0
         if pose_dict is not None and float(pose_dict.get("quality", 1.0)) >= self.pose_qmin:
             terms = []
             for k in ("shoulder", "spine"):
@@ -262,17 +291,41 @@ class ControlFusion:
                     # 현재가 커지면(가까워짐) log(ema/ref)>0 → 뒤로
                     terms.append(np.log(ema / ref) * self.pose_gain)
             if terms:
-                fb_from_pose = self._clip(np.median(terms), self.vmax)
+                fb_from_pose_log = self._clip(np.median(terms), self.vmax)
 
-        # depth를 쓰지 않겠다는 요구조건 → fb는 size+pose로만 구성
-        fb = self._clip(0.6 * fb_from_size + 0.4 * fb_from_pose, self.vmax)
+        # ── 추가: 목표 퍼센트(척추/골반) 기반 fb
+        fb_from_pose_pct = 0
+        if pose_dict is not None and float(pose_dict.get("quality", 0.0)) >= self.pose_qmin:
+            # spine: 화면 높이 기준 퍼센트
+            sp = pose_dict.get('spine') if isinstance(pose_dict, dict) else None
+            sp_ema = sp.get('ema') if sp else None
+            if sp_ema is not None:
+                sp_pct = float(sp_ema) / max(1, h)
+                err_sp = (desired_spine_pct - sp_pct)  # (+) 크면 앞으로
+                fb_from_pose_pct += self._clip(err_sp * self.g_fb, self.vmax)
+            # pelvis: 화면 너비 기준 퍼센트
+            pv = pose_dict.get('pelvis') if isinstance(pose_dict, dict) else None
+            pv_ema = pv.get('ema') if pv else None
+            if pv_ema is not None:
+                pv_pct = float(pv_ema) / max(1, w)
+                err_pv = (desired_pelvis_pct - pv_pct)
+                fb_from_pose_pct += self._clip(0.7 * err_pv * self.g_fb, self.vmax)  # 영향은 약간 작게
 
-        # flow 피드포워드(소량): 화면 이동을 약간 선반영
+        # 최종 fb 혼합(기존 유지 + 새 규칙 가중치 추가)
+        fb = self._clip(0.35*fb_from_size + 0.25*fb_from_pose_log + 0.40*fb_from_pose_pct, self.vmax)
+
+        # flow 피드포워드(소량) + 크기 기반 스케일업
         if flow_vec is not None:
             vx, vy = flow_vec
             yaw += self._clip(self.flow_ff_gain * vx, self.vmax)
             lr  += self._clip(self.flow_ff_gain * vx, self.vmax)
             ud  += self._clip(-self.flow_ff_gain * vy, self.vmax)
+            mag = float((vx*vx + vy*vy) ** 0.5)          # px/frame
+            scale = 1.0 + min(mag / 15.0, 0.5)           # 최대 +50%
+            yaw = self._clip(yaw * scale, self.vmax)
+            lr  = self._clip(lr  * scale, self.vmax)
+            ud  = self._clip(ud  * scale, self.vmax)
+            fb  = self._clip(fb  * scale, self.vmax)
 
         if obstacle_brake:
             fb = 0
@@ -291,7 +344,6 @@ def clip_bbox_to_frame(bb, w, h):
     x2 = max(0, min(x2, w - 1))
     y2 = max(0, min(y2, h - 1))
     return [x1, y1, x2, y2] if (x2 > x1 and y2 > y1) else None
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optical Flow (척추 스트립 기반)
@@ -331,6 +383,32 @@ def compute_flow_from_spine_strip(prev_gray: np.ndarray,
         return float(np.mean(v)) if v.size > 0 else float(np.median(v))
 
     return (robust_mean(dx), robust_mean(dy))
+
+def compute_global_flow(prev_gray, gray, stride: int = 64):
+    if prev_gray is None or gray is None:
+        return None
+    h, w = gray.shape[:2]
+    xs = np.arange(stride//2, w, stride, dtype=np.float32)
+    ys = np.arange(stride//2, h, stride, dtype=np.float32)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    pts = np.array([(x, y) for y in ys for x in xs], dtype=np.float32).reshape(-1,1,2)
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None)
+    if p1 is None or st is None:
+        return None
+    good = st.squeeze() == 1
+    if not np.any(good):
+        return None
+    dx = (p1[good, :, 0] - pts[good, :, 0]).flatten()
+    dy = (p1[good, :, 1] - pts[good, :, 1]).flatten()
+    # 강건 평균(중앙 20~80%만)
+    p20x, p80x = np.percentile(dx, [20, 80])
+    p20y, p80y = np.percentile(dy, [20, 80])
+    dx = dx[(dx>=p20x) & (dx<=p80x)]
+    dy = dy[(dy>=p20y) & (dy<=p80y)]
+    if dx.size == 0 or dy.size == 0:
+        return None
+    return (float(dx.mean()), float(dy.mean()))
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Pose 스케일 상태 업데이트(어깨/척추)
@@ -460,30 +538,6 @@ def update_pose_stats(pose: Optional[Any],
         spine_ema = (1.0 - alpha) * base + alpha * float(sp)
 
     return quality, should_ref, should_ema, spine_ref, spine_ema
-
-
-# def update_pose_stats(pose: Optional[Dict[str, Any]],
-#                       quality: float,
-#                       should_ref: Optional[float],
-#                       should_ema: Optional[float],
-#                       spine_ref: Optional[float],
-#                       spine_ema: Optional[float],
-#                       alpha: float = 0.25):
-#     if pose is None:
-#         return quality, should_ref, should_ema, spine_ref, spine_ema
-#     q = float(pose.get("quality", 0.0) or 0.0)
-#     quality = q
-#     sh = pose.get("shoulder")
-#     sp = pose.get("spine")
-#     if should_ref is None and sh:
-#         should_ref = float(sh); should_ema = float(sh)
-#     if spine_ref is None and sp:
-#         spine_ref = float(sp); spine_ema = float(sp)
-#     if sh:
-#         should_ema = (1 - alpha) * (should_ema if should_ema is not None else sh) + alpha * float(sh)
-#     if sp:
-#         spine_ema = (1 - alpha) * (spine_ema if spine_ema is not None else sp) + alpha * float(sp)
-#     return quality, should_ref, should_ema, spine_ref, spine_ema
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Depth(상대) 기반 표시 & 브레이크 판단

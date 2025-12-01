@@ -4,7 +4,7 @@ import cv2
 from djitellopy import Tello
 import threading
 import time
-import datetime
+from datetime import datetime
 import queue
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
@@ -82,6 +82,11 @@ class TelloWebServer:
         self._obstacle_brake = False
         self._last_depth_mode_spine = None
 
+        # 포즈 중심/스케일(EMA) 공유 상태
+        self._hip_mid = None
+        self._sh_mid = None
+        self._pelvis_ema = None
+
         # 제어 융합기 & 유실 검색 매니저
         self.fuser = ControlFusion(tracking_rc_speed=self.tracking_rc_speed)
         self.search = SearchManager(params=SearchParams())
@@ -91,6 +96,7 @@ class TelloWebServer:
                          'alpha': 0.5,}
         self._miss_cnt = 0
         self._miss_hold = 3  # 연속 3프레임 미스 시에만 해제
+        
     # 프론트 토글 getter (스레드 안전)
     def get_feature_state(self):
         with self.lock:
@@ -100,7 +106,7 @@ class TelloWebServer:
     # 로깅
     # ──────────────────────────────────────────────────────────────────────
     def log(self, level, message):
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = {'timestamp': timestamp,'level': level,'message': message}
         if level == "ERROR":
             print(f"[{timestamp}] ❌ {message}")
@@ -128,8 +134,6 @@ class TelloWebServer:
                     self.socketio.emit('log_message', log_entry)
                 except queue.Empty:
                     continue
-                except Exception as e:
-                    print(f"Log broadcast error: {e}")
         self.log_thread = threading.Thread(target=broadcast_logs, daemon=True)
         self.log_thread.start()
 
@@ -137,71 +141,58 @@ class TelloWebServer:
     # 연결
     # ──────────────────────────────────────────────────────────────────────
     def connect_tello(self):
-        try:
-            self.log("INFO", "🔍 Checking Tello WiFi connection...")
-            if not connect_to_tello_wifi():
-                self.log("ERROR", "Failed to connect to Tello WiFi")
-                return False
-
-            self.log("SUCCESS", "Tello WiFi connected")
-
-            if self.tello:
-                try:
-                    self.log("INFO", "Cleaning up old connection...")
-                    self.is_streaming = False
-                    if hasattr(self.tello, 'background_frame_read') and self.tello.background_frame_read:
-                        try: self.tello.background_frame_read.stop()
-                        except: pass
-                    self.tello.streamoff()
-                    self.tello.end()
-                except Exception as e:
-                    self.log("WARNING", f"Cleanup error (ignored): {e}")
-                finally:
-                    self.tello = None
-
-            self.log("INFO", "Creating new Tello connection...")
-            self.tello = Tello()
-
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    self.log("INFO", f"Connection attempt {attempt + 1}/{max_retries}...")
-                    self.tello.connect()
-                    break
-                except Exception as e:
-                    self.log("WARNING", f"Attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                    else:
-                        raise
-
-            self.battery = self.tello.get_battery()
-            self.log("SUCCESS", f"Tello connected. Battery: {self.battery}%")
-
-            if self.battery < 20:
-                self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
-
-            self.log("INFO", "Starting video stream...")
-            if self.tello.stream_on:
-                try:
-                    self.tello.streamoff()
-                    self.log('INFO', 'Waiting for video stream to end...')
-                except:
-                    pass
-
-            self.tello.streamon()
-            self.log('INFO', 'Waiting for tello video stream to start...')
-
-            self.log("SUCCESS", "🎥 Stream started successfully")
-            self.is_connected = True
-            return True
-
-        except Exception as e:
-            self.log("ERROR", f"Connection error: {e}")
-            traceback.print_exc()
-            self.is_connected = False
-            self.tello = None
+        self.log("INFO", "🔍 Checking Tello WiFi connection...")
+        if not connect_to_tello_wifi():
+            self.log("ERROR", "Failed to connect to Tello WiFi")
             return False
+
+        self.log("SUCCESS", "Tello WiFi connected")
+
+        # 이전 연결 정리(에러는 조용히 무시)
+        if self.tello:
+            self.log("INFO", "Cleaning up old connection...")
+            self.is_streaming = False
+            try:
+                fr = getattr(self.tello, 'background_frame_read', None)
+                if fr: fr.stop()
+                self.tello.streamoff()
+                self.tello.end()
+            except Exception:
+                pass
+            self.tello = None
+
+        self.log("INFO", "Creating new Tello connection...")
+        self.tello = Tello()
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.log("INFO", f"Connection attempt {attempt + 1}/{max_retries}...")
+                self.tello.connect()
+                break
+            except Exception as e:
+                self.log("WARNING", f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    self.is_connected = False
+                    self.tello = None
+                    return False
+
+        self.battery = self.tello.get_battery()
+        self.log("SUCCESS", f"Tello connected. Battery: {self.battery}%")
+
+        if self.battery < 20:
+            self.log("WARNING", f"⚠️ Low battery: {self.battery}%")
+
+        self.log("INFO", "Starting video stream...")
+        try: self.tello.streamoff()
+        except Exception: pass
+        self.tello.streamon()
+
+        self.log("SUCCESS", "🎥 Stream started successfully")
+        self.is_connected = True
+        return True
 
     # ──────────────────────────────────────────────────────────────────────
     # 추적 쓰레드(제어만 담당)
@@ -240,27 +231,37 @@ class TelloWebServer:
                         target_lost_warning_sent = False
                         self.search.reset()
 
-                    # ▶ 포즈: 토글 ON 이고 ref/ema가 있을 때만 제어에 반영
+                    # ▶ 포즈센터/골반폭: video_thread에서 계산한 최신값 사용
+                    with self.lock:
+                        hip_mid = self._hip_mid
+                        sh_mid  = self._sh_mid
+                        pelvis_ema = self._pelvis_ema
+
+                    # ▶ 포즈: ref/ema가 있을 때만 보조 반영
                     pose_dict = prepare_pose_for_rc(
                         self.USE_POSE and use_pose,
                         self.pose_quality,
                         self.pose_should_ref, self.pose_should_ema,
-                        self.pose_spine_ref,  self.pose_spine_ema
+                        self.pose_spine_ref,  self.pose_spine_ema,
+                        hip_mid=hip_mid, shoulder_mid=sh_mid, pelvis_ema=pelvis_ema
                     )
                     
-                    # ▶ 깊이 브레이크: 토글 ON일 때만 반영
-                    obstacle_brake = (
-                        getattr(self, "_obstacle_brake", False)
-                        if (self.USE_OBS_BRAKE and use_depth)
-                        else False
-                    )
+                    # ▶ 깊이 브레이크
+                    with self.lock:
+                        obstacle_brake = (
+                            self._obstacle_brake
+                            if (self.USE_OBS_BRAKE and use_depth) else False
+                        )
 
                     lr, fb, ud, yaw = self.fuser.compute_rc(
                         self.current_frame.shape, self.target_bbox,
                         pose_dict=pose_dict,
                         flow_vec=(self.last_flow_vec if (self.USE_FLOW and use_flow) else None),
                         size_target_range=(0.20, 0.30),
-                        obstacle_brake=obstacle_brake
+                        obstacle_brake=obstacle_brake,
+                        desired_spine_pct=0.28,       # 화면 높이 대비 28%
+                        desired_pelvis_pct=0.18,      # 화면 너비 대비 18%
+                        pose_center_mode="hip-shoulder-mid",
                     )
                     self.tello.send_rc_control(lr, fb, ud, yaw)
 
@@ -271,10 +272,7 @@ class TelloWebServer:
                         target_lost_time = now
                         self.tello.send_rc_control(0, 0, 0, 0)
                         # flow 방향 기반 검색 시작
-                        try:
-                            self.search.start(self.last_flow_vec[0] if self.last_flow_vec else 0.0, now)
-                        except Exception:
-                            self.search.start(0.0, now)
+                        self.search.start(self.last_flow_vec[0] if self.last_flow_vec else 0.0, now)
 
                     # 경고
                     if not target_lost_warning_sent and (now - target_lost_time) > 3:
@@ -294,16 +292,12 @@ class TelloWebServer:
             except Exception as e:
                 self.log("ERROR", f"Tracking error: {e}")
                 if self.use_rc_for_tracking:
-                    try: self.tello.send_rc_control(0, 0, 0, 0)
-                    except: pass
+                    self.tello.send_rc_control(0, 0, 0, 0)
                 time.sleep(0.5)
 
         # 종료 시 정지
-        try:
-            self.tello.send_rc_control(0, 0, 0, 0)
-            self.log("INFO", "🛑 Tracking stopped - drone halted")
-        except:
-            pass
+        self.tello.send_rc_control(0, 0, 0, 0)
+        self.log("INFO", "🛑 Tracking stopped - drone halted")
         self.log("INFO", "🎯 Tracking thread stopped")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -311,16 +305,9 @@ class TelloWebServer:
     # ──────────────────────────────────────────────────────────────────────
     def video_stream_thread(self):
         print("📹 Starting video stream thread...")
-        try:
-            time.sleep(3)
-            frame_reader = self.tello.get_frame_read()
-            print("✅ Frame reader initialized")
-        except Exception as e:
-            print(f"❌ Failed to initialize frame reader: {e}")
-            traceback.print_exc()
-            self.is_streaming = False
-            self.socketio.emit('stream_error', {'message': 'Failed to start video stream. Please reconnect.'})
-            return
+        time.sleep(3)
+        frame_reader = self.tello.get_frame_read()
+        print("✅ Frame reader initialized")
 
         error_count = 0
         max_errors = 10
@@ -347,7 +334,7 @@ class TelloWebServer:
 
                 # ── 추론 (Thief 모드 전제: 0개 또는 1개)
                 detections, depth_map, extra = self.inference_engine.run(frame)
-                alpha_from_engine = (extra[0].get("alpha") if isinstance(extra, list) and extra else None)
+                alpha_from_engine = extra[0].get("alpha") if (isinstance(extra, list) and extra and isinstance(extra[0], dict)) else None
 
                 # if self.is_tracking:
                 #     self.log("DEBUG", f"[THIEF] detections_len={len(detections)} (expected 0 or 1)")
@@ -373,6 +360,39 @@ class TelloWebServer:
                     if target_bbox is not None:
                         h, w = frame.shape[:2]
                         target_bbox = clip_bbox_to_frame(target_bbox, w, h)
+
+                # ── 포즈 중심(힙/어깨) + 골반폭(EMA) 계산/저장
+                if self.USE_POSE and use_pose and (pose_obj is not None):
+                    def _ok(kp, thr=60):
+                        return kp and len(kp) >= 3 and int(kp[2]) >= thr
+                    hip_mid = None; sh_mid = None; pelvis_len = None
+                    try:
+                        lhip = pose_obj[11]; rhip = pose_obj[12]
+                        lsh  = pose_obj[5];  rsh  = pose_obj[6]
+                        if _ok(lhip) and _ok(rhip):
+                            hip_mid = (
+                                0.5*(float(lhip[0])+float(rhip[0])),
+                                0.5*(float(lhip[1])+float(rhip[1]))
+                            )
+                            dx = float(lhip[0]) - float(rhip[0])
+                            dy = float(lhip[1]) - float(rhip[1])
+                            pelvis_len = (dx*dx + dy*dy) ** 0.5
+                        if _ok(lsh) and _ok(rsh):
+                            sh_mid = (
+                                0.5*(float(lsh[0])+float(rsh[0])),
+                                0.5*(float(lsh[1])+float(rsh[1]))
+                            )
+                    except:
+                        pass
+                    if pelvis_len is not None:
+                        prev = self._pelvis_ema if (self._pelvis_ema is not None) else pelvis_len
+                        pelvis_ema = 0.75*prev + 0.25*pelvis_len
+                    else:
+                        pelvis_ema = self._pelvis_ema
+                    with self.lock:
+                        self._hip_mid = hip_mid
+                        self._sh_mid = sh_mid
+                        self._pelvis_ema = pelvis_ema
 
                 # ── 상태 저장(최소 락)
                 with self.lock:
@@ -425,13 +445,9 @@ class TelloWebServer:
                 depth_mode_local = None
                 obstacle_brake_local = False
                 if self.USE_DEPTH_VIEW and use_depth and (self.target_bbox is not None) and (depth_map is not None):
-                    try:
-                        depth_mode_local, obstacle_brake_local = spine_depth_mode_and_brake(
-                            depth_map, tuple(self.target_bbox), use_brake=self.USE_OBS_BRAKE
-                        )
-                    except Exception as e:
-                        self.log("WARNING", f"Depth compute error: {e}")
-                        traceback.print_exc()
+                    depth_mode_local, obstacle_brake_local = spine_depth_mode_and_brake(
+                        depth_map, tuple(self.target_bbox), use_brake=self.USE_OBS_BRAKE
+                    )
 
                 with self.lock:
                     if self.USE_DEPTH_VIEW and use_depth and (self.target_bbox is not None) and (depth_map is not None):
@@ -448,13 +464,8 @@ class TelloWebServer:
                 frame_with_detections = draw_detections_on_frame(frame, detections)
 
                 if use_depth and depth_map is not None and alpha > 0:
-                    try:
-                        depth_vis_bgr = depth_to_vis(depth_map)
-                        frame_with_detections = cv2.addWeighted(frame_with_detections, 1.0 - alpha, depth_vis_bgr, alpha, 0)
-                        self.log("DEBUG", f"overlay depth alpha={alpha:.2f}, dm={depth_map.shape}")
-                    except Exception as e:
-                        self.log("WARNING", f"Depth overlay error: {e}")
-                        traceback.print_exc()
+                    depth_vis_bgr = depth_to_vis(depth_map)
+                    frame_with_detections = cv2.addWeighted(frame_with_detections, 1.0 - alpha, depth_vis_bgr, alpha, 0)
 
                 if use_pose and (self.target_bbox is not None):
                     frame_with_detections = overlay_pose_points_min9(
@@ -599,18 +610,12 @@ class TelloWebServer:
                 self.current_frame_updated = False
         if frame is None:
             return None
-        try:
-            ok, buf = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ok:
-                with self.lock:
-                    self.current_frame_updated = True
-                return None
-            return buf.tobytes()
-        except Exception as e:
+        ok, buf = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
             with self.lock:
                 self.current_frame_updated = True
-            self.log("ERROR", f"JPEG encode failed: {e}")
             return None
+        return buf.tobytes()
 
     def execute_command(self, command):
         if not self.is_connected or not self.tello:
@@ -696,10 +701,7 @@ class TelloWebServer:
         self._obstacle_brake = False
         self._last_depth_mode_spine = None
 
-        try:
-            if self.tello:
-                self.tello.send_rc_control(0, 0, 0, 0)
-        except Exception:
-            pass
+        if self.tello:
+            self.tello.send_rc_control(0, 0, 0, 0)
 
         self.log("INFO", "Stopped tracking and returned to normal mode.")
