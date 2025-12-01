@@ -1,6 +1,7 @@
 # control_fusion.py
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, Iterable, Union, List
+import math
+from typing import Optional, Sequence, Tuple, Dict, Any, Iterable, Union, List
 import numpy as np
 import cv2
 
@@ -348,28 +349,158 @@ def compute_flow_from_spine_strip(prev_gray: np.ndarray,
 # ───────────────────────────────────────────────────────────────────────────────
 # Pose 스케일 상태 업데이트(어깨/척추)
 # ───────────────────────────────────────────────────────────────────────────────
-def update_pose_stats(pose: Optional[Dict[str, Any]],
+
+from typing import Any, Dict, Optional, Sequence, Tuple, List
+import math
+
+# COCO 17 keypoint indices
+KP = {"LShoulder": 5, "RShoulder": 6, "LHip": 11, "RHip": 12}
+
+def _dist(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+def _mid(p1: Tuple[float, float], p2: Tuple[float, float]) -> Tuple[float, float]:
+    return (0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1]))
+
+def _p95(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    vs = sorted(values)
+    idx = int(0.95 * (len(vs) - 1))
+    return float(vs[idx])
+
+def _estimate_conf_scale_uint8(confs: List[float],
+                               default_target: float = 200.0,
+                               upper_bound: float = 255.0) -> float:
+    """
+    uint8(0~255) 가정. 관측값의 p95와 경험적 상한(≈200)을 결합해 스케일 결정.
+    scale = clamp(max(default_target, p95), 1.0, 255.0)
+    """
+    if not confs:
+        return default_target
+    p95 = _p95(confs)
+    scale = max(default_target, p95)
+    scale = min(scale, upper_bound)
+    return max(1.0, scale)
+
+def _pose_list_to_metrics(pose_list: Sequence[Sequence[float]],
+                          conf_thr_norm: float = 0.05) -> Tuple[float, Optional[float], Optional[float]]:
+    """
+    Returns:
+      quality: 정규화된 c의 평균 (없으면 0.0)
+      shoulder: 좌/우 어깨 거리 (없으면 None)
+      spine: 어깨중점 ↔ 엉덩이중점 거리 (없으면 None)
+    """
+    # 1) 스케일 추정 (uint8 0~255, 경험상 200 근처)
+    raw_confs: List[float] = []
+    for kp in pose_list:
+        if kp and len(kp) >= 3 and kp[2] is not None:
+            raw_confs.append(float(kp[2]))
+    scale = _estimate_conf_scale_uint8(raw_confs, default_target=200.0, upper_bound=255.0)
+
+    # 2) 정규화된 confidence 수집 (0~1, 상한 1.0)
+    confs_norm: List[float] = []
+    for kp in pose_list:
+        if kp and len(kp) >= 3 and kp[2] is not None:
+            c_norm = min(float(kp[2]) / scale, 1.0)
+            confs_norm.append(c_norm)
+    quality = float(sum(confs_norm) / len(confs_norm)) if confs_norm else 0.0
+
+    # 3) 좌표 가져오기 (정규화 임계 적용)
+    def _get_kp(idx: int) -> Optional[Tuple[float, float, float]]:
+        try:
+            x, y, c_raw = pose_list[idx]
+            if c_raw is None:
+                return None
+            c_norm = min(float(c_raw) / scale, 1.0)
+            if c_norm >= conf_thr_norm:
+                return float(x), float(y), c_norm
+        except Exception:
+            pass
+        return None
+
+    lsh = _get_kp(KP["LShoulder"])
+    rsh = _get_kp(KP["RShoulder"])
+    lhip = _get_kp(KP["LHip"])
+    rhip = _get_kp(KP["RHip"])
+
+    shoulder = None
+    spine = None
+    shoulder_mid = None
+
+    if lsh and rsh:
+        shoulder = _dist((lsh[0], lsh[1]), (rsh[0], rsh[1]))
+        shoulder_mid = _mid((lsh[0], lsh[1]), (rsh[0], rsh[1]))
+
+    if shoulder_mid and lhip and rhip:
+        hip_mid = _mid((lhip[0], lhip[1]), (rhip[0], rhip[1]))
+        spine = _dist(shoulder_mid, hip_mid)
+
+    return quality, shoulder, spine
+
+def update_pose_stats(pose: Optional[Any],
                       quality: float,
                       should_ref: Optional[float],
                       should_ema: Optional[float],
                       spine_ref: Optional[float],
                       spine_ema: Optional[float],
                       alpha: float = 0.25):
+    """
+    pose: dict(기존) 또는 [[x,y,c_uint8], ...] (COCO 17)
+    uint8 confidence는 내부에서 0~1 정규화하여 사용.
+    """
     if pose is None:
         return quality, should_ref, should_ema, spine_ref, spine_ema
-    q = float(pose.get("quality", 0.0) or 0.0)
-    quality = q
-    sh = pose.get("shoulder")
-    sp = pose.get("spine")
-    if should_ref is None and sh:
+
+    if isinstance(pose, dict):
+        q = float(pose.get("quality", 0.0) or 0.0)
+        sh = pose.get("shoulder"); sh = float(sh) if sh is not None else None
+        sp = pose.get("spine");    sp = float(sp) if sp is not None else None
+    else:
+        try:
+            q, sh, sp = _pose_list_to_metrics(pose, conf_thr_norm=0.05)
+        except Exception:
+            q, sh, sp = 0.0, None, None
+
+    quality = float(q)
+
+    if should_ref is None and sh is not None:
         should_ref = float(sh); should_ema = float(sh)
-    if spine_ref is None and sp:
-        spine_ref = float(sp); spine_ema = float(sp)
-    if sh:
-        should_ema = (1 - alpha) * (should_ema if should_ema is not None else sh) + alpha * float(sh)
-    if sp:
-        spine_ema = (1 - alpha) * (spine_ema if spine_ema is not None else sp) + alpha * float(sp)
+    if spine_ref is None and sp is not None:
+        spine_ref = float(sp);   spine_ema = float(sp)
+
+    if sh is not None:
+        base = should_ema if should_ema is not None else float(sh)
+        should_ema = (1.0 - alpha) * base + alpha * float(sh)
+    if sp is not None:
+        base = spine_ema if spine_ema is not None else float(sp)
+        spine_ema = (1.0 - alpha) * base + alpha * float(sp)
+
     return quality, should_ref, should_ema, spine_ref, spine_ema
+
+
+# def update_pose_stats(pose: Optional[Dict[str, Any]],
+#                       quality: float,
+#                       should_ref: Optional[float],
+#                       should_ema: Optional[float],
+#                       spine_ref: Optional[float],
+#                       spine_ema: Optional[float],
+#                       alpha: float = 0.25):
+#     if pose is None:
+#         return quality, should_ref, should_ema, spine_ref, spine_ema
+#     q = float(pose.get("quality", 0.0) or 0.0)
+#     quality = q
+#     sh = pose.get("shoulder")
+#     sp = pose.get("spine")
+#     if should_ref is None and sh:
+#         should_ref = float(sh); should_ema = float(sh)
+#     if spine_ref is None and sp:
+#         spine_ref = float(sp); spine_ema = float(sp)
+#     if sh:
+#         should_ema = (1 - alpha) * (should_ema if should_ema is not None else sh) + alpha * float(sh)
+#     if sp:
+#         spine_ema = (1 - alpha) * (spine_ema if spine_ema is not None else sp) + alpha * float(sp)
+#     return quality, should_ref, should_ema, spine_ref, spine_ema
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Depth(상대) 기반 표시 & 브레이크 판단

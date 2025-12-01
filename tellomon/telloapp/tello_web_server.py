@@ -410,6 +410,7 @@ class TelloWebServer:
                         )
                     except Exception as e:
                         self.log("DEBUG", f"[POSE] update error: {e}")
+                        traceback.print_exc()
 
                 # ── Optical Flow (토글 ON + bbox 존재 시에만)
                 if self.USE_FLOW and use_flow and (self.target_bbox is not None):
@@ -436,6 +437,7 @@ class TelloWebServer:
                         )
                     except Exception as e:
                         self.log("WARNING", f"Depth compute error: {e}")
+                        traceback.print_exc()
 
                 with self.lock:
                     if self.USE_DEPTH_VIEW and use_depth and (self.target_bbox is not None) and (depth_map is not None):
@@ -458,6 +460,7 @@ class TelloWebServer:
                         self.log("DEBUG", f"overlay depth alpha={alpha:.2f}, dm={depth_map.shape}")
                     except Exception as e:
                         self.log("WARNING", f"Depth overlay error: {e}")
+                        traceback.print_exc()
 
                 if use_pose and (self.target_bbox is not None):
                     frame_with_detections = overlay_pose_points(
