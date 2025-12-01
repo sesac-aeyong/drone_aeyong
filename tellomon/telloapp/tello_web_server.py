@@ -364,15 +364,18 @@ class TelloWebServer:
 
                     if self.is_tracking:
                         # 1) 도둑 후보 선택: ▶ 현재 target_identity_id와 동일한 iid만 허용
-                        try:
-                            want_iid = int(self.target_identity_id) if self.target_identity_id is not None else None
-                        except Exception:
-                            want_iid = None
-                        best = pick_detection_by_iid(detections, want_iid)
+                        # try:
+                        #     want_iid = int(self.target_identity_id) if self.target_identity_id is not None else None
+                        # except Exception:
+                        #     want_iid = None
+                        # best = pick_detection_by_iid(detections, want_iid)
+                        if len(detections) != 0:
+                            best = detections[0]
                         
                         if best is not None:
                             bb = (best["bbox"] if isinstance(best, dict) else getattr(best, "bbox", None))
                             if bb is not None:
+                                self.log("DEBUG", f"[POSE] keys in best: {list(best.keys())}")
                                 h, w = frame.shape[:2]
                                 bb = clip_bbox_to_frame(bb, w, h)
                                 if bb:
@@ -391,7 +394,23 @@ class TelloWebServer:
                                          self.pose_spine_ref,  self.pose_spine_ema,
                                          alpha=0.25
                                      )
+                                    try:
+                                        if pose is None:
+                                            self.log("DEBUG", "[POSE] pose=None (no keypoints returned)")
+                                        else:
+                                            # 타입/길이 확인
+                                            self.log("DEBUG", f"[POSE] type={type(pose)}, len={len(pose)}")
 
+                                            # 첫 3개 keypoint만 출력 (전체는 너무 길 수 있어서)
+                                            preview = pose[:3] if isinstance(pose, (list, tuple)) else pose
+                                            self.log("DEBUG", f"[POSE] preview={preview}")
+
+                                            # 좌표/Confidence 형태인지 점검
+                                            if isinstance(pose, (list, tuple)):
+                                                sample = pose[0]
+                                                self.log("DEBUG", f"[POSE] sample type={type(sample)}, value={sample}")
+                                    except Exception as e:
+                                        self.log("DEBUG", f"[POSE] Debug logging error: {e}")
                                     # 3) 플로우 업데이트(척추 스트립 기반)
                                     do_flow = bool(self.USE_FLOW and use_flow and (self.target_bbox is not None))
                                     prev_gray_local = self.prev_gray
@@ -428,7 +447,6 @@ class TelloWebServer:
                                     do_depth = bool(self.USE_DEPTH_VIEW and use_depth and (depth_map is not None) and (self.target_bbox is not None))
                                     bbox_depth_local = tuple(self.target_bbox) if self.target_bbox is not None else None
                                     depth_map_local = depth_map
-
                         else:
                             # 매칭 실패 → 타깃 해제(트래킹 쓰레드가 검색)
                             if self.target_bbox is not None:
@@ -462,10 +480,11 @@ class TelloWebServer:
                         self.current_depth_map = None
                         
                 # Depth overlay
-                if use_depth and depth_map is not None and alpha > 1:
+                if use_depth and depth_map is not None and alpha > 0:
                     try:
                         depth_vis_bgr = depth_to_vis(depth_map)
                         frame_with_detections = cv2.addWeighted(frame_with_detections, 1.0 - alpha, depth_vis_bgr, alpha, 0)
+                        self.log("DEBUG", f"overlay depth alpha={alpha:.2f}, dm={None if depth_map is None else depth_map.shape}")
                     except Exception as e:
                         self.log("WARNING", f"Depth overlay error: {e}")
 

@@ -51,7 +51,7 @@ def connect_to_tello_wifi():
     """Tello WiFi에 자동으로 연결"""
     ssid = get_current_ssid()
     print('Current SSID:', ssid)
-    if ssid and ssid.startswith('TELLO-'):
+    if ssid and ssid.startswith('TELLO-5F'):
         return True
     
     print('Looking for Tello WiFi...')
@@ -59,7 +59,7 @@ def connect_to_tello_wifi():
         refresh_wifi_list()
         networks = set(list_wifi_networks())
         for ssid in networks:
-            if ssid.startswith('TELLO-'):
+            if ssid.startswith('TELLO-5F'):
                 print(f'Connecting to {ssid}...')
                 if connect_to_wifi(ssid):
                     print(f'✅ Connected to {ssid}')

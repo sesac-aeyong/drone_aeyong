@@ -264,9 +264,9 @@ class HailoRun:
             if (self.thief_id != 0):
                 det["thief_dist"] = float(getattr(track, "thief_dist", 1.0))
                 det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
-                
+                print("want pose is {want_pose}")
                 # pose는 토글 ON일 때만, '도둑' 1명 ROI만
-                if want_pose and (iid == self.thief_id):
+                if want_pose:
                     x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
                     x1 = max(0, x1); y1 = max(0, y1)
                     x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
@@ -285,7 +285,7 @@ class HailoRun:
                             )
                             # 3) 결과 수신(짧은 타임아웃). 실패 시 None으로 명시.
                             try:
-                                det["pose"] = self.pos_q.get(timeout=0.3)
+                                det["pose"] = self.pos_q.get(timeout=1.0)
                             except queue.Empty:
                                 det["pose"] = None
             rets.append(det)
@@ -385,7 +385,4 @@ def _pose_callback(bindings_list, output_queue, info, **kwargs) -> None:
                               float(hm[y, x])))      # (x, y) in heatmap coordinates
         
         output_queue.put_nowait(keypoints)
-
-
-
 
