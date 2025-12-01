@@ -66,80 +66,86 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
         layer_bgr = cv2.resize(layer_bgr, (base_bgr.shape[1], base_bgr.shape[0]))
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
-def overlay_pose_points(
-    base_bgr: np.ndarray,
-    shoulder_ema: Optional[Tuple[float, float]],
-    spine_ema: Optional[Tuple[float, float]],
-    alpha: float = 0.5,
-    pose_kpts: Optional[List[Tuple[float, float, float]]] = None,
-    conf_thresh: float = 60.0,
-    draw_skeleton: bool = False,
-) -> np.ndarray:
-    """
-    - EMA 좌표(shoulder_ema, spine_ema)가 있으면 그것을 우선 표시.
-    - EMA가 없더라도 pose_kpts(17x[x,y,conf])가 오면
-      * 어깨 중앙점 = (L-shoulder(5), R-shoulder(6))의 중점
-      * 척추 기준점 = (L-hip(11), R-hip(12))의 중점
-      을 계산해 표시.
-    - BGR 입력/출력, 알파 블렌딩은 addWeighted.
-    """
-    h, w = base_bgr.shape[:2]
-    layer = np.zeros_like(base_bgr)
+ 
+# COCO 17 Keypoint skeleton pairs (왼→오 대칭)
+COCO_EDGES = [
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),     # 어깨-팔
+    (11, 12), (5, 11), (6, 12),                  # 골반/몸통
+    (11, 13), (13, 15), (12, 14), (14, 16),      # 다리
+    (0, 5), (0, 6)                                # 코-어깨
+]
 
-    # 1) EMA 우선
-    drew_any = False
+def _norm_conf_uint8(c_raw: float, scale: float) -> float:
+    # 정수 confidence(0~255 가정) → 0~1
+    if c_raw is None: return 0.0
+    c = float(c_raw) / max(1.0, min(scale, 255.0))
+    return 1.0 if c > 1.0 else (0.0 if c < 0.0 else c)
+
+def overlay_pose_points(
+    img,
+    should_ema, spine_ema, alpha,
+    pose_kpts=None,              # [[x,y,c_uint8], ...] (len=17)
+    conf_scale: float = 200.0,   # 관측 상한 추정치(~200) → 0~1 정규화 분모
+    conf_thr_norm: float = 0.05, # 그릴 최소 confidence(정규화 이후 기준)
+    draw_skeleton: bool = True,
+    draw_points: bool = True,
+    draw_midpoints: bool = True  # 기존 2포인트(어깨/엉덩이 중점)도 표시할지
+):
+    if pose_kpts is None or len(pose_kpts) < 17:
+        return img
+
+    h, w = img.shape[:2]
+    pts = []
+    confs = []
+    for i, kp in enumerate(pose_kpts):
+        if not kp or len(kp) < 3: 
+            pts.append(None); confs.append(0.0); continue
+        x, y, c_raw = kp
+        c = _norm_conf_uint8(c_raw, conf_scale)
+        if c < conf_thr_norm:
+            pts.append(None); confs.append(c); continue
+        x = int(max(0, min(w-1, float(x))))
+        y = int(max(0, min(h-1, float(y))))
+        pts.append((x, y)); confs.append(c)
+
+    # 1) 스켈레톤
+    if draw_skeleton:
+        for a, b in COCO_EDGES:
+            pa, pb = pts[a], pts[b]
+            if pa is not None and pb is not None:
+                cv2.line(img, pa, pb, (0, 255, 0), 2, cv2.LINE_AA)
+
+    # 2) 포인트
+    if draw_points:
+        for p in pts:
+            if p is not None:
+                cv2.circle(img, p, 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+    # 3) 기존 2포인트(어깨중점/엉덩이중점)도 유지하고 싶으면
+    if draw_midpoints:
+        LSh, RSh, LHp, RHp = pts[5], pts[6], pts[11], pts[12]
+        def mid(p, q):
+            return (int((p[0]+q[0]) * 0.5), int((p[1]+q[1]) * 0.5))
+        if LSh and RSh:
+            shoulder_mid = mid(LSh, RSh)
+            cv2.circle(img, shoulder_mid, 4, (255, 0, 0), -1, cv2.LINE_AA)  # 파랑
+        if LHp and RHp:
+            hip_mid = mid(LHp, RHp)
+            cv2.circle(img, hip_mid, 4, (0, 0, 255), -1, cv2.LINE_AA)      # 빨강
+
+    # 4) 품질/스케일 텍스트(선택)
     try:
-        if shoulder_ema is not None:
-            sx, sy = map(int, shoulder_ema)
-            if 0 <= sx < w and 0 <= sy < h:
-                cv2.circle(layer, (sx, sy), 6, (0, 255, 0), -1)       # shoulder: green
-                drew_any = True
-        if spine_ema is not None:
-            px, py = map(int, spine_ema)
-            if 0 <= px < w and 0 <= py < h:
-                cv2.circle(layer, (px, py), 6, (0, 255, 255), -1)     # spine: yellow
-                drew_any = True
-    except Exception:
+        if alpha > 0:
+            txt = []
+            if should_ema is not None: txt.append(f"shEMA:{should_ema:.1f}")
+            if spine_ema  is not None: txt.append(f"spEMA:{spine_ema:.1f}")
+            if txt:
+                cv2.putText(img, " ".join(txt), (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2, cv2.LINE_AA)
+    except:
         pass
 
-    # 2) EMA가 없거나 일부만 있을 때 → 키포인트로 보완
-    if not drew_any and pose_kpts is not None and len(pose_kpts) >= 13:
-        try:
-            def ok(i): return pose_kpts[i][2] >= conf_thresh
-            # COCO index: 5=L-shoulder, 6=R-shoulder, 11=L-hip, 12=R-hip
-            shoulder_pt = None
-            spine_pt = None
-
-            if ok(5) and ok(6):
-                shoulder_pt = (int(0.5 * (pose_kpts[5][0] + pose_kpts[6][0])),
-                               int(0.5 * (pose_kpts[5][1] + pose_kpts[6][1])))
-                cv2.circle(layer, shoulder_pt, 6, (0, 255, 0), -1)
-
-            if ok(11) and ok(12):
-                spine_pt = (int(0.5 * (pose_kpts[11][0] + pose_kpts[12][0])),
-                            int(0.5 * (pose_kpts[11][1] + pose_kpts[12][1])))
-                cv2.circle(layer, spine_pt, 6, (0, 255, 255), -1)
-
-            drew_any = (shoulder_pt is not None) or (spine_pt is not None)
-
-            # 옵션: 간단 스켈레톤
-            if draw_skeleton:
-                limbs = [
-                    (5, 6), (5, 7), (7, 9), (6, 8), (8,10),  # 어깨/팔
-                    (5,11), (6,12), (11,12)                 # 몸통/엉덩이
-                ]
-                for a, b in limbs:
-                    if a < len(pose_kpts) and b < len(pose_kpts) and ok(a) and ok(b):
-                        pa = (int(pose_kpts[a][0]), int(pose_kpts[a][1]))
-                        pb = (int(pose_kpts[b][0]), int(pose_kpts[b][1]))
-                        cv2.line(layer, pa, pb, (255, 0, 0), 2)
-        except Exception:
-            pass
-
-    # 3) 알파 합성
-    if drew_any and 0.0 <= alpha <= 1.0:
-        return cv2.addWeighted(base_bgr, 1.0 - alpha, layer, alpha, 0)
-    return base_bgr
+    return img
 
 def overlay_flow_arrow(base_bgr: np.ndarray,
                        bbox: Optional[Tuple[int,int,int,int]],

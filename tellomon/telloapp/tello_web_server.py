@@ -355,8 +355,8 @@ class TelloWebServer:
                 detections, depth_map, extra = self.inference_engine.run(frame)
                 alpha_from_engine = (extra[0].get("alpha") if isinstance(extra, list) and extra else None)
 
-                if self.is_tracking:
-                    self.log("DEBUG", f"[THIEF] detections_len={len(detections)} (expected 0 or 1)")
+                # if self.is_tracking:
+                #     self.log("DEBUG", f"[THIEF] detections_len={len(detections)} (expected 0 or 1)")
 
                 det = (detections[0] if (self.is_tracking and len(detections) == 1) else None)
 
