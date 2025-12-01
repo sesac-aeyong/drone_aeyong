@@ -4,12 +4,11 @@ import cv2
 from djitellopy import Tello
 import threading
 import time
-import numpy as np
+import datetime
 import queue
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
-from settings import settings as S
 
 # 제어/유틸 전부 모듈에서 가져오기
 from .control_fusion import (
@@ -17,7 +16,7 @@ from .control_fusion import (
     compute_flow_from_spine_strip, update_pose_stats,
     spine_depth_mode_and_brake, SearchManager, SearchParams,
     want_depth, want_pose, want_flow, feature_alpha, prepare_pose_for_rc,
-    depth_to_vis, overlay_pose_points, overlay_flow_arrow
+    depth_to_vis, overlay_flow_arrow, overlay_pose_points_min9
 )
 
 
@@ -38,18 +37,14 @@ class TelloWebServer:
         self.battery = 0
         self.height = 0
         self.lock = threading.Lock()
-        self.frame_center = (480, 360)
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
         self.takeoff_stabilization_time = 3.0
 
         # RC 설정
-        self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
-        self.rc_speed = 40
         self.tracking_rc_speed = 30
-        self.rc_command_duration = 0.4
 
         # 웹 로그
         self.log_queue = queue.Queue(maxsize=100)
@@ -105,7 +100,6 @@ class TelloWebServer:
     # 로깅
     # ──────────────────────────────────────────────────────────────────────
     def log(self, level, message):
-        import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         log_entry = {'timestamp': timestamp,'level': level,'message': message}
         if level == "ERROR":
@@ -463,10 +457,13 @@ class TelloWebServer:
                         traceback.print_exc()
 
                 if use_pose and (self.target_bbox is not None):
-                    frame_with_detections = overlay_pose_points(
+                    frame_with_detections = overlay_pose_points_min9(
                         frame_with_detections,
                         self.pose_should_ema, self.pose_spine_ema, alpha,
-                        pose_kpts=(pose_obj if (self.target_bbox is not None) else None)
+                        pose_kpts=(pose_obj if (self.target_bbox is not None) else None),
+                        conf_thresh=60,
+                        draw_indices=False,     # 필요하면 True
+                        draw_midpoints=True
                     )
 
                 if use_flow and (self.target_bbox is not None) and (self.last_flow_vec is not None):
@@ -558,9 +555,7 @@ class TelloWebServer:
         if self.is_tracking:
             self.log("WARNING", "Already tracking. Ignoring start request.")
             return True
-
         iid = None if self.target_identity_id is None else int(self.target_identity_id)
-        bbox = self.target_bbox
 
         if iid is not None and iid > 0:
             if self.inference_engine.enter_thief_mode(iid):
