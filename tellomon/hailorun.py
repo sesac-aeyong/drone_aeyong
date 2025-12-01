@@ -264,7 +264,7 @@ class HailoRun:
             if (self.thief_id != 0):
                 det["thief_dist"] = float(getattr(track, "thief_dist", 1.0))
                 det["thief_cos_dist"] = float(getattr(self.active_tracker, "thief_cos_dist", getattr(S, "thief_cos_dist", 0.3)))
-                print("want pose is {want_pose}")
+                
                 # pose는 토글 ON일 때만, '도둑' 1명 ROI만
                 if want_pose:
                     x1, y1, x2, y2 = map(int, track.last_bbox_tlbr)
