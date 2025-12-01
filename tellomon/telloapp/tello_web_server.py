@@ -25,11 +25,23 @@ class TelloWebServer:
         self.target_class = None
         self.target_identity_id = None
         self.target_bbox = None  # Store in [x1, y1, x2, y2] format
+        self.target_body_bbox = None
         self.is_tracking = False
         self.battery = 0
         self.height = 0
         self.lock = threading.Lock()
         self.frame_center = (480, 360)
+        self.target_lost_time = None
+        self.yaw_started = False
+
+        self.target_bbox = None
+        self.last_seen_cx = None        # 마지막 타겟 x, 좌우 사라짐 판단
+        self.last_seen_cy = None        # 마지막 타겟 y, 아래로 사라짐 판단
+
+        self.cmd_fb = 0   # 전후
+        self.cmd_lr = 0   # 좌우 (사용 안함)
+        self.cmd_ud = 0   # 상하 (사용 안함)
+        self.cmd_yaw = 0  # 회전
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
@@ -192,141 +204,398 @@ class TelloWebServer:
             return False
     
     
-    def tracking_thread(self):
-        """자동 추적 스레드"""
-        target_lost_time = None
-        target_lost_warning_sent = False
-        
-        # 제어 게인 (단순 비례 제어)
-        gain_yaw = 0.80      # 회전 게인
-        gain_lr = 0.80       # 좌우 이동 게인
-        gain_ud = 0.40       # 상하 이동 게인
-        gain_fb = 200         # 전후 이동 게인
-        
-        # 임계값
-        yaw_threshold = 0.20    # 20% 이상 오차면 회전
-        lr_threshold = 0.05     # 8% 이상 오차면 좌우 이동
-        ud_threshold = 0.05     # 8% 이상 오차면 상하 이동
-        size_threshold = 0.025  # 크기 오차 임계값
+    def get_body_bbox(self, pose, visible_parts):
+        """
+        visible_parts에 True로 표시된 torso 부위만 사용하여 body bbox 계산.
+        confidence 재확인 필요 없음 (이미 visible_parts에서 필터링됨)
+        """
 
-        self.log("INFO", "🎯 Simple RC tracking started")
-        
-        while self.is_tracking:
-            try:
-                # 이륙 후 안정화 시간 체크
-                if self.last_takeoff_time is not None:
-                    time_since_takeoff = time.time() - self.last_takeoff_time
-                    if time_since_takeoff < self.takeoff_stabilization_time:
-                        remaining = self.takeoff_stabilization_time - time_since_takeoff
-                        if int(remaining * 10) % 10 == 0:  # 0.1초마다 로그
-                            self.log("INFO", f"⏳ Stabilizing... {remaining:.1f}s remaining")
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        # 안정화 완료
-                        if self.last_takeoff_time is not None:
-                            self.log("SUCCESS", "✅ Stabilization complete - starting tracking")
-                            self.last_takeoff_time = None  # 한 번만 로그 출력
+        if pose is None or visible_parts is None:
+            return None
 
-                if self.target_bbox and self.current_frame is not None:
-                    # 타겟 재발견 시 경고 리셋
-                    if target_lost_time is not None:
-                        self.log("SUCCESS", "🎯 Target re-acquired!")
-                        target_lost_time = None
-                        target_lost_warning_sent = False
-                    
-                    # 제어 명령 계산
-                    h, w = self.current_frame.shape[:2]
-                    center_x = w // 2
-                    center_y = h // 2
-                    
-                    # target_bbox is in [x1, y1, x2, y2] format
-                    x1, y1, x2, y2 = self.target_bbox
-                    target_center_x = (x1 + x2) // 2
-                    target_center_y = (y1 + y2) // 2
-                    
-                    # 오차 계산 (정규화)
-                    error_x = (target_center_x - center_x) / w  # -0.5 ~ 0.5
-                    error_y = (target_center_y - center_y) / h  # -0.5 ~ 0.5
-                    
-                    # 타겟 크기
-                    target_width = x2 - x1
-                    target_height = y2 - y1
-                    target_area = target_width * target_height
-                    frame_area = w * h
-                    target_ratio = target_area / frame_area
-                    
-                    # 목표 크기
-                    target_size_ideal = 0.3
-                    error_size = target_size_ideal - target_ratio
-                    
-                    # === 간단한 비례 제어 ===
-                    
-                    # 1. 좌우 제어: 큰 오차는 회전, 작은 오차는 평행이동
-                    if abs(error_x) > yaw_threshold:
-                        # 회전
-                        yaw_speed = int(np.clip(error_x * gain_yaw * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                        lr_speed = 0
-                    elif abs(error_x) > lr_threshold:
-                        # 좌우 이동
-                        yaw_speed = 0
-                        lr_speed = int(np.clip(error_x * gain_lr * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        # 중앙 정렬됨
-                        yaw_speed = 0
-                        lr_speed = 0
-                    
-                    # 2. 상하 제어
-                    if abs(error_y) > ud_threshold:
-                        ud_speed = int(np.clip(-error_y * gain_ud * 100, -self.tracking_rc_speed, self.tracking_rc_speed))
-                    else:
-                        ud_speed = 0
-                    
-                    # 3. 전후 제어
-                    if abs(error_size) > size_threshold:
-                        fb_speed = int(np.clip(error_size * gain_fb, 0, self.tracking_rc_speed))
-                    else:
-                        fb_speed = 0
-                    
-                    # RC 명령 전송
-                    self.tello.send_rc_control(lr_speed, fb_speed, ud_speed, yaw_speed)
-                    
-                    # 로그 출력
-                    # if yaw_speed != 0 or lr_speed != 0 or ud_speed != 0 or fb_speed != 0:
-                        # action = f"RC[lr={lr_speed:+3d}, fb={fb_speed:+3d}, ud={ud_speed:+3d}, yaw={yaw_speed:+3d}]"
-                        # self.log("DEBUG", 
-                            # f"🎯 {action} | Err[x={error_x:+.3f}, y={error_y:+.3f}, s={error_size:+.3f}] | Size={target_ratio:.3f}")
-                
+        # 안전성: visible_parts가 dict인지 보장
+        if not isinstance(visible_parts, dict):
+            return None
+
+        xs, ys = [], []
+
+        # head keypoints
+        if visible_parts.get("head", False):
+            for i in [0, 1, 2, 3, 4]:
+                if i >= len(pose):
+                    continue
+                x, y, _ = pose[i]
+                xs.append(x)
+                ys.append(y)
+
+        # shoulder keypoints
+        if visible_parts.get("shoulder", False):
+            for i in [5, 6]:
+                if i >= len(pose):
+                    continue
+                x, y, _ = pose[i]
+                xs.append(x)
+                ys.append(y)
+
+        # hip keypoints
+        if visible_parts.get("hip", False):
+            for i in [11, 12]:
+                if i >= len(pose):
+                    continue
+                x, y, _ = pose[i]
+                xs.append(x)
+                ys.append(y)
+
+        if len(xs) < 2 or len(ys) < 2:
+            return None
+
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+
+        # 폭이 지나치게 좁을 때 보정
+        h = y2 - y1
+        w = x2 - x1
+
+        if w < h * 0.3:
+            cx = (x1 + x2) / 2
+            expand = h * 0.15
+            x1 = cx - expand
+            x2 = cx + expand
+
+        return [int(x1), int(y1), int(x2), int(y2)]
+
+
+    def get_target_detection(self, detections):
+        """
+        기존 thief_dist 기반 타겟 선정 로직을 그대로 사용해서,
+        target_det 반환하는 함수로 분리
+        """
+        target_det = None
+
+        if not detections:
+            return None
+
+        for det in detections:
+            get = det.get if isinstance(det, dict) else (lambda k, d=None: getattr(det, k, d))
+
+            td = get("thief_dist")
+            tg = get("thief_cos_dist")
+
+            if td is None or tg is None:
+                continue
+            
+            if td <= tg:
+                if target_det is None:
+                    target_det = det
                 else:
-                    # 타겟을 잃어버림
-                    if target_lost_time is None:
-                        target_lost_time = time.time()
+                    get_curr = target_det.get if isinstance(target_det, dict) else (lambda k, d=None: getattr(target_det, k, d))
+                    curr_td = get_curr("thief_dist", 9999999)
+                    if td < curr_td:
+                        target_det = det
+
+        return target_det
+        
+    def get_target_area_by_pose(self, visible_parts):
+        """
+        visible_parts (dict) 기반으로 목표 면적 반환.
+        NOTE: 이 함수는 detections/pose를 직접 참조하지 않음.
+        """
+        # 기본값
+        BASE = 26460
+
+        # 안전성: visible_parts 없으면 default
+        if visible_parts is None or not isinstance(visible_parts, dict):
+            return None
+
+        if not any(visible_parts.values()):
+            return None
+
+        # 튜닝 테이블 (head, shoulder, hip)
+        TARGET_AREA = {
+            (True, True, True):  int(BASE * 1.0),  # head + shoulder + hip
+            (True, True, False): int(BASE * 0.3),
+            (True, False, False): int(BASE * 0.06),
+
+            (False, True, True): int(BASE * 0.7),
+            (False, True, False): None,
+
+            (False, False, True): None,  # hip only
+        }
+
+        key = (visible_parts.get("head", False),
+            visible_parts.get("shoulder", False),
+            visible_parts.get("hip", False))
+
+        return TARGET_AREA.get(key, None)
+    
+    def get_visible_torso_parts(self, pose, th=25):
+        """
+        Torso 관련된 keypoints만 confidence 기반으로 visible 여부 반환
+        항상 dict 반환: {"head":bool, "shoulder":bool, "hip":bool}
+        """
+        # 기본 False 딕셔너리
+        visible = {"head": False, "shoulder": False, "hip": False}
+
+        if pose is None:
+            return visible
+
+        # 안전: pose 길이 확인 (pose는 list/iterable of [x,y,c])
+        L = len(pose)
+
+        # Head 영역 (0~4)
+        head_idxs = [i for i in [0, 1, 2, 3, 4] if i < L]
+        if head_idxs and any(pose[i][2] > th for i in head_idxs):
+            visible["head"] = True
+
+        # Shoulder (5,6)
+        sh_idxs = [i for i in [5, 6] if i < L]
+        if sh_idxs and any(pose[i][2] > th for i in sh_idxs):
+            visible["shoulder"] = True
+
+        # Hip (11,12)
+        hip_idxs = [i for i in [11, 12] if i < L]
+        if hip_idxs and any(pose[i][2] > th for i in hip_idxs):
+            visible["hip"] = True
+
+        return visible
+
+
+    def tracking_thread(self):
+        """
+        [Torso Pose 기반] 사람 몸통 크기를 기준으로 거리 유지 & Yaw 정렬
+        - 팔/다리 동작에 영향받지 않음
+        """
+        self.log("INFO", "🚀 Tracking Started (Torso-Pose Area Mode)")
+
+        Kp_yaw_normal = 0.6
+        Kp_yaw_fast = 1.2
+        Kp_area = 0.005   # 전진 게인(면적 오차 기반)
+
+        while self.is_tracking:
+            if self.tello is None:
+                self.log("WARNING", "🛑 Tello instance is None. Stopping tracking thread.")
+                break
+
+            try:
+                with self.lock:
+                    detections = self.current_detections
+                    frame = self.current_frame
+
+                if detections is None or frame is None:
+                    if self.tello:
                         self.tello.send_rc_control(0, 0, 0, 0)
-                    
-                    # 3초 이상 타겟을 못 찾으면 경고
-                    if not target_lost_warning_sent and (time.time() - target_lost_time) > 3:
-                        self.log("WARNING", f"⚠️ Target lost for 3 seconds (ID: {self.target_identity_id})")
-                        target_lost_warning_sent = True
+                    time.sleep(0.1)
+                    continue
+
+                if not detections:
+                    # 타겟을 마지막으로 본 중앙 위치 기반으로 사라진 방향 판단
+                    lost_direction_x = None
+                    lost_direction_y = None
+
+                    if self.last_seen_cx is not None:
+                        norm = self.last_seen_cx
+                        if norm < 0.25:
+                            lost_direction_x = "left"
+                        elif norm > 0.75:
+                            lost_direction_x = "right"
+                        else:
+                            lost_direction_x = "center"   # 중앙에서 사라짐 = 장애물 뒤?
+                    else:
+                        lost_direction_x = "unknown"
+
+                    if self.last_seen_cy is not None:
+                        if self.last_seen_cy > 0.75:
+                            lost_direction_y = "down"
+                        else:
+                            lost_direction_y = "center"
+
+                    if self.target_lost_time is None:
+                        # 타겟이 처음 사라진 시점 저장
+                        self.target_lost_time = time.time()
+                        self.tello.send_rc_control(0, self.cmd_fb//2, 0, self.cmd_yaw//2)
+                    else:
+                        # 타겟 사라진지 1초 지나면 회전 시작
+                        if time.time() - self.target_lost_time > 1:
+                            if lost_direction_y == "down":
+                                if not hasattr(self, 'descend_start_height'):
+                                    self.log('INFO', f'saving original height: {self.tello.get_distance_tof()}')
+                                    setattr(self, 'descend_start_height', self.tello.get_distance_tof())
+                                
+                                self.log("INFO", "Target lost DOWNWARD → descending to find target")
+                                
+                                if self.tello.get_distance_tof() > 80:
+                                    self.tello.send_rc_control(0, 0, -20, 0)  # 천천히 하강
+                                else:
+                                    # 하강한 고도에서 Hover
+                                    self.tello.send_rc_control(0, 0, 0, 0)
+
+                                # 하강 직후 잠깐 기다리면서 탐색
+                                time.sleep(0.5)
+                                continue
+                                
+                            if lost_direction_x in ("left", "right"):
+                                # --- 회전을 처음 시작할 때 yaw 초기화 ---
+                                if not hasattr(self, "yaw_started") or not self.yaw_started:
+                                    self.yaw_started = True
+                                    self.yaw_accumulated = 0  # 몇 도 회전했는지 누적
+                                    self.prev_yaw = self.tello.get_yaw()  # 시작 yaw 저장
+                                    self.spin_direction = 1 if self.cmd_yaw >= 0 else -1
+                                    self.log("INFO", f"Start 360 spin, dir={self.spin_direction}")
+
+                                # --- 현재 yaw 읽기 ---
+                                curr_yaw = self.tello.get_yaw()
+
+                                # --- yaw 변화량 계산 (wrap-around 처리) ---
+                                delta = curr_yaw - self.prev_yaw
+                                if delta > 180:
+                                    delta -= 360
+                                elif delta < -180:
+                                    delta += 360
+
+                                # 회전 방향에 맞는 yaw만 누적
+                                self.yaw_accumulated += delta
+                                self.prev_yaw = curr_yaw
+
+                                # --- 회전 명령 보내기 ---
+                                self.tello.send_rc_control(0, 0, 0, 60 * self.spin_direction)
+
+                                # --- 360도 회전 완료 체크 ---
+                                if abs(self.yaw_accumulated) >= 360:
+                                    self.log("INFO", "360 spin complete. Landing now...")
+
+                                    # RC 중지
+                                    self.tello.send_rc_control(0, 0, 0, 0)
+
+                                    # 상태 리셋
+                                    self.yaw_started = False
+                                    self.target_lost_time = None
+
+                                    # 착륙
+                                    self.tello.land()
+
+                                    time.sleep(0.5)
+                                    continue
+                            elif lost_direction_x == "center":
+                                self.log("INFO", "Target lost in CENTER → Hover & wait")
+                                # 제자리에서 정지
+                                self.tello.send_rc_control(0, 0, 0, 0)
+
+                                # 필요하면 천천히 위로 올라가서 시야 확보도 가능:
+                                # self.tello.send_rc_control(0, 0, 20, 0)
+
+                                # 회전 상태 초기화
+                                self.yaw_started = False
+
+                            else:
+                                # 방향 모르면 기본 hover
+                                self.tello.send_rc_control(0, 0, 0, 0)
+
+                    time.sleep(0.1)
+                    continue
+
+                elif self.target_lost_time is not None:
+                    # 타겟 다시 찾으면 리셋
+                    self.target_lost_time = None
+                    self.yaw_started = False
+
+
+                # ---------------------------
+                # 1) 타겟 탐색
+                # ---------------------------
+                target_det = self.get_target_detection(detections)
+
+                if target_det is None:
+                    self.log("info", "There is no target")
+                    if self.tello:
+                        self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.1)
+                    continue
+
+                # ---------------------------
+                # 2) Pose로 torso bbox 생성
+                # ---------------------------
+                pose = target_det.get("pose") if isinstance(target_det, dict) else getattr(target_det, "pose", None)
+                visible_parts = self.get_visible_torso_parts(pose)
+                body_bbox = self.get_body_bbox(pose, visible_parts)
+                self.target_body_bbox = body_bbox
+
+                if body_bbox is None:
+                    self.log("info", "Torso BBox not available, waiting...")
+                    if self.tello:
+                        self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.1)
+                    continue
+
+                x1, y1, x2, y2 = body_bbox
+                h, w = frame.shape[:2]
+
+                # ---------------------------
+                # A. Yaw 제어 (중앙 정렬)
+                # ---------------------------
+                target_cx = (x1 + x2) / 2
+                err_x = (target_cx - w/2) / w
                 
-                time.sleep(0.05)  # 20Hz 제어 루프
-                
+                # 마지막 본 위치 저장
+                self.last_seen_cx = target_cx / w
+                self.last_seen_cy = ((y1 + y2) / 2) / h
+
+                if abs(err_x) > 0.15:
+                    self.cmd_yaw = int(err_x * 100 * Kp_yaw_fast * 2)
+                else:
+                    self.cmd_yaw = int(err_x * 100 * Kp_yaw_normal * 2)
+
+                # ---------------------------
+                # B. Forward 제어 (면적 유지)
+                # ---------------------------
+                target_area = self.get_target_area_by_pose(visible_parts)
+                if target_area is None: target_area = None
+
+                current_area = (x2 - x1) * (y2 - y1)
+
+                if target_area is None:
+                    continue
+                elif current_area < target_area:
+                    diff = target_area - current_area
+                    self.cmd_fb = int(diff * Kp_area)
+                    self.cmd_fb = min(self.cmd_fb, 60)
+                else:
+                    self.cmd_fb = 0
+
+                # ---------------------------
+                # C. fb, yaw clipping
+                # ---------------------------
+                self.cmd_fb = int(np.clip(self.cmd_fb, 0, 100))
+                self.cmd_yaw = int(np.clip(self.cmd_yaw, -100, 100))
+
+                # ---------------------------
+                # D. UD 제어 (BBOX 외곽선)
+                # ---------------------------
+                pad = 15
+                need_u = y1 < pad
+                need_d = y2 >= h - pad
+                if need_u and not need_d:
+                    if self.tello.get_distance_tof() < 200: # max height around 200CM
+                        self.cmd_ud = 20
+                elif not need_u and need_d:
+                    if self.tello.get_distance_tof() > 40: # min height around 40CM
+                        self.cmd_ud = -20
+                else:
+                    self.cmd_ud = 0
+
+                if self.tello:
+                    self.tello.send_rc_control(0, 0, self.cmd_ud, self.cmd_yaw)
+
+                time.sleep(0.1)
+
             except Exception as e:
-                self.log("ERROR", f"Tracking error: {e}")
-                if self.use_rc_for_tracking:
-                    try:
+                self.log("ERROR", f"Tracking Error: {e}")
+                traceback.print_exc()
+                try:
+                    if self.tello:
                         self.tello.send_rc_control(0, 0, 0, 0)
-                    except:
-                        pass
-                time.sleep(0.5)
-        
-        # 추적 종료 시 정지
-        try:
-            self.tello.send_rc_control(0, 0, 0, 0)
-            self.log("INFO", "🛑 Tracking stopped - drone halted")
-        except:
-            pass
-        
-        self.log("INFO", "🎯 Tracking thread stopped")
+                except:
+                    pass
+                time.sleep(1)
 
 
     def video_stream_thread(self):
@@ -399,6 +668,56 @@ class TelloWebServer:
                 # 감지 결과 그리기
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_with_detections = draw_detections_on_frame(frame, detections)
+
+                # 디버깅용 출력 (Torso 기반)
+                if self.target_body_bbox is not None and best is not None:
+                    x1, y1, x2, y2 = map(int, self.target_body_bbox)
+
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+
+                    torso_area = (x2 - x1) * (y2 - y1)
+                    visible_parts = self.get_visible_torso_parts(best.get("pose", []))
+                    goal_area = self.get_target_area_by_pose(visible_parts)
+                    # visible_parts가 None일 가능성 방지
+                    if not visible_parts:
+                        visible_parts = []
+
+                    cv2.putText(frame_with_detections, 
+                                f"TORSO cx: {cx:.1f}, cy: {cy:.1f}", 
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8, (50, 255, 255), 4)
+
+                    if goal_area is not None:
+
+                        diff_area = goal_area - torso_area
+
+                        # visible_parts를 문자열로 합침
+                        parts_str = ",".join(visible_parts) if isinstance(visible_parts, list) else str(visible_parts)
+
+                        cv2.putText(
+                            frame_with_detections, 
+                            f"goal_area: {goal_area}, torso_area: {torso_area}, diff: {diff_area}", 
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (50, 255, 255), 4
+                        )
+
+                        # --- 추가된 부분: 어떤 부위 기준인지 표시 ---
+                        cv2.putText(
+                            frame_with_detections,
+                            f"visible: {parts_str}",
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (50, 255, 255), 4
+                        )
+
+                # 명령 출력
+                cv2.putText(
+                    frame_with_detections,
+                    f"CMD: FB={self.cmd_fb} YAW={self.cmd_yaw} | LR={self.cmd_lr} UD={self.cmd_ud}",
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (50, 255, 255), 4
+                )
+
                 
                 # 프레임 중심 십자선 표시
                 h, w = frame_with_detections.shape[:2]
