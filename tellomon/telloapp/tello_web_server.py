@@ -568,18 +568,33 @@ class TelloWebServer:
                 self.cmd_yaw = int(np.clip(self.cmd_yaw, -100, 100))
 
                 # ---------------------------
-                # D. recover original height
+                # D. UD 제어 (BBOX 외곽선)
                 # ---------------------------
-
-                if hasattr(self, 'descend_start_height'):
-                    self.cmd_ud = 20
-                    if self.tello.get_distance_tof() >= self.descend_start_height:
-                        del self.descend_start_height
+                pad = 15
+                need_u = y1 < pad
+                need_d = y2 >= h - pad
+                if need_u and not need_d:
+                    if self.tello.get_distance_tof() < 200: # max height around 200CM
+                        self.cmd_ud = 20
+                elif not need_u and need_d:
+                    if self.tello.get_distance_tof() > 40: # min height around 40CM
+                        self.cmd_ud = -20
                 else:
                     self.cmd_ud = 0
 
+                # # ---------------------------
+                # # D. recover original height
+                # # ---------------------------
+
+                # if hasattr(self, 'descend_start_height'):
+                #     self.cmd_ud = 20
+                #     if self.tello.get_distance_tof() >= self.descend_start_height:
+                #         del self.descend_start_height
+                # else:
+                #     self.cmd_ud = 0
+
                 if self.tello:
-                    self.tello.send_rc_control(0, self.cmd_fb, self.cmd_ud, self.cmd_yaw)
+                    self.tello.send_rc_control(0, 0, self.cmd_ud, self.cmd_yaw)
 
                 time.sleep(0.1)
 
