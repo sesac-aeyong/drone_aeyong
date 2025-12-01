@@ -4,17 +4,17 @@ import time
 
 
 def list_wifi_networks():
-    result = subprocess.run(["nmcli", "-t", "-f", "SSID", "dev", "wifi"], capture_output=True, text=True)
+    result = subprocess.run(["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list", "ifname", "wlan1"], capture_output=True, text=True)
     ssids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return ssids
 
 
 def disconnect_wifi():
-    subprocess.run(['nmcli', 'dev', 'disconnect', 'wlan0'])
+    subprocess.run(['nmcli', 'dev', 'wifi', 'disconnect', 'ifname', 'wlan1'])
 
 
 def connect_to_wifi(ssid, password=None):
-    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+    cmd = ["nmcli", "dev", "wifi", "connect", ssid, 'ifname', 'wlan1']
     if password:
         cmd.extend(["password", password])
     r = subprocess.run(cmd, capture_output=True)
@@ -26,7 +26,7 @@ def connect_to_wifi(ssid, password=None):
 def get_current_ssid():
     try:
         result = subprocess.run(
-            ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+            ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi", "list", "ifname", "wlan1"],
             capture_output=True,
             text=True,
             check=True
@@ -43,7 +43,7 @@ def get_current_ssid():
 
 def refresh_wifi_list() -> None:
     subprocess.run([
-        'nmcli', 'device', 'wifi', 'rescan'
+        'nmcli', 'device', 'wifi', 'rescan', 'ifname', 'wlan1'
     ])
     
 
@@ -51,7 +51,7 @@ def connect_to_tello_wifi():
     """Tello WiFi에 자동으로 연결"""
     ssid = get_current_ssid()
     print('Current SSID:', ssid)
-    if ssid and ssid.startswith('TELLO-'):
+    if ssid and ssid.startswith('TELLO-5F'):
         return True
     
     print('Looking for Tello WiFi...')
@@ -59,7 +59,7 @@ def connect_to_tello_wifi():
         refresh_wifi_list()
         networks = set(list_wifi_networks())
         for ssid in networks:
-            if ssid.startswith('TELLO-'):
+            if ssid.startswith('TELLO-5F'):
                 print(f'Connecting to {ssid}...')
                 if connect_to_wifi(ssid):
                     print(f'✅ Connected to {ssid}')

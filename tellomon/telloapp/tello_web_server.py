@@ -4,22 +4,19 @@ import cv2
 from djitellopy import Tello
 import threading
 import time
-import numpy as np
+import datetime
 import queue
 from hailorun import HailoRun
 from yolo_tools import draw_detections_on_frame
 from .app_tools import connect_to_tello_wifi
-from settings import settings as S
 
 # 제어/유틸 전부 모듈에서 가져오기
 from .control_fusion import (
-    ControlFusion,
-    select_thief_candidate,
-    clip_bbox_to_frame,
-    compute_flow_from_spine_strip,
-    update_pose_stats,
-    spine_depth_mode_and_brake,
-    SearchManager, SearchParams,
+    ControlFusion, clip_bbox_to_frame,
+    compute_flow_from_spine_strip, update_pose_stats,
+    spine_depth_mode_and_brake, SearchManager, SearchParams,
+    want_depth, want_pose, want_flow, feature_alpha, prepare_pose_for_rc,
+    depth_to_vis, overlay_flow_arrow, overlay_pose_points_min9
 )
 
 
@@ -40,18 +37,14 @@ class TelloWebServer:
         self.battery = 0
         self.height = 0
         self.lock = threading.Lock()
-        self.frame_center = (480, 360)
 
         # 이륙 안정화 시간
         self.last_takeoff_time = None
         self.takeoff_stabilization_time = 3.0
 
         # RC 설정
-        self.use_rc_for_manual = False
         self.use_rc_for_tracking = True
-        self.rc_speed = 40
         self.tracking_rc_speed = 30
-        self.rc_command_duration = 0.4
 
         # 웹 로그
         self.log_queue = queue.Queue(maxsize=100)
@@ -62,7 +55,7 @@ class TelloWebServer:
         # 추론 엔진
         self.log("INFO", "Loading inference engine...")
         try:
-            self.inference_engine = HailoRun()
+            self.inference_engine = HailoRun(feature_state_getter=self.get_feature_state) # 프론트 토글 상태 제공 콜백 연결
             self.inference_engine.load()
             self.log("SUCCESS", "✅ Inference engine loaded successfully")
         except Exception as e:
@@ -92,12 +85,21 @@ class TelloWebServer:
         # 제어 융합기 & 유실 검색 매니저
         self.fuser = ControlFusion(tracking_rc_speed=self.tracking_rc_speed)
         self.search = SearchManager(params=SearchParams())
+        
+        # 웹 토글(라우트에서 set_features로 갱신) - OFF이면 연산/오버레이/제어 반영 모두 중지
+        self.features = {'depth': False, 'pose':  False, 'flow':  False, 
+                         'alpha': 0.5,}
+        self._miss_cnt = 0
+        self._miss_hold = 3  # 연속 3프레임 미스 시에만 해제
+    # 프론트 토글 getter (스레드 안전)
+    def get_feature_state(self):
+        with self.lock:
+            return dict(self.features)
 
     # ──────────────────────────────────────────────────────────────────────
     # 로깅
     # ──────────────────────────────────────────────────────────────────────
     def log(self, level, message):
-        import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         log_entry = {'timestamp': timestamp,'level': level,'message': message}
         if level == "ERROR":
@@ -224,6 +226,11 @@ class TelloWebServer:
                         self.log("SUCCESS", "✅ Stabilization complete - starting tracking")
                         self.last_takeoff_time = None
 
+                with self.lock:
+                    feat = dict(self.features)
+                use_depth = want_depth(feat)
+                use_pose  = want_pose(feat)
+                use_flow  = want_flow(feat)
                 # 타깃 있음 → 제어
                 if self.target_bbox and self.current_frame is not None:
                     # 재획득 시 검색리셋
@@ -233,20 +240,25 @@ class TelloWebServer:
                         target_lost_warning_sent = False
                         self.search.reset()
 
-                    pose_dict = None
-                    if self.USE_POSE and (self.pose_should_ref is not None or self.pose_spine_ref is not None):
-                        pose_dict = {
-                            'quality': self.pose_quality,
-                            'shoulder': {'ref': self.pose_should_ref, 'ema': self.pose_should_ema} if self.pose_should_ref else None,
-                            'spine':    {'ref': self.pose_spine_ref,  'ema': self.pose_spine_ema}  if self.pose_spine_ref  else None,
-                        }
-
-                    obstacle_brake = getattr(self, "_obstacle_brake", False)
+                    # ▶ 포즈: 토글 ON 이고 ref/ema가 있을 때만 제어에 반영
+                    pose_dict = prepare_pose_for_rc(
+                        self.USE_POSE and use_pose,
+                        self.pose_quality,
+                        self.pose_should_ref, self.pose_should_ema,
+                        self.pose_spine_ref,  self.pose_spine_ema
+                    )
+                    
+                    # ▶ 깊이 브레이크: 토글 ON일 때만 반영
+                    obstacle_brake = (
+                        getattr(self, "_obstacle_brake", False)
+                        if (self.USE_OBS_BRAKE and use_depth)
+                        else False
+                    )
 
                     lr, fb, ud, yaw = self.fuser.compute_rc(
                         self.current_frame.shape, self.target_bbox,
                         pose_dict=pose_dict,
-                        flow_vec=(self.last_flow_vec if self.USE_FLOW else None),
+                        flow_vec=(self.last_flow_vec if (self.USE_FLOW and use_flow) else None),
                         size_target_range=(0.20, 0.30),
                         obstacle_brake=obstacle_brake
                     )
@@ -324,76 +336,142 @@ class TelloWebServer:
                         self.socketio.emit('stream_error', {'message': 'Video stream lost. Please reconnect.'})
                         break
                     continue
-
                 error_count = 0
 
-                # ── 추론
-                detections, depth_map, *_ = self.inference_engine.run(frame)
+                # ── 토글 스냅샷
+                with self.lock:
+                    feat = dict(self.features)
+                use_depth = want_depth(feat)
+                use_pose  = want_pose(feat)
+                use_flow  = want_flow(feat)
 
+                # ── 추론 (Thief 모드 전제: 0개 또는 1개)
+                detections, depth_map, extra = self.inference_engine.run(frame)
+                alpha_from_engine = (extra[0].get("alpha") if isinstance(extra, list) and extra else None)
+
+                # if self.is_tracking:
+                #     self.log("DEBUG", f"[THIEF] detections_len={len(detections)} (expected 0 or 1)")
+
+                det = (detections[0] if (self.is_tracking and len(detections) == 1) else None)
+
+                # ── 타깃 bbox/클래스/포즈 스냅샷
+                target_bbox = None
+                target_class = None
+                pose_obj = None
+                if det is not None:
+                    if isinstance(det, dict):
+                        target_bbox = det.get("bbox")
+                        target_class = det.get("class", "person")
+                        if use_pose:  # 🔸 pose 토글 ON일 때만 읽음
+                            pose_obj = det.get("pose", None)
+                    else:
+                        target_bbox = getattr(det, "bbox", None)
+                        target_class = getattr(det, "cls", "person")
+                        if use_pose:  # 🔸 pose 토글 ON일 때만 읽음
+                            pose_obj = getattr(det, "pose", None)
+
+                    if target_bbox is not None:
+                        h, w = frame.shape[:2]
+                        target_bbox = clip_bbox_to_frame(target_bbox, w, h)
+
+                # ── 상태 저장(최소 락)
                 with self.lock:
                     self.current_detections = detections
-
-                    if self.is_tracking:
-                        # 1) 도둑 후보 선택
-                        best = select_thief_candidate(detections)
-                        if best is not None:
-                            bb = (best["bbox"] if isinstance(best, dict) else getattr(best, "bbox", None))
-                            if bb is not None:
-                                h, w = frame.shape[:2]
-                                bb = clip_bbox_to_frame(bb, w, h)
-                                if bb:
-                                    self.target_bbox = bb
-                                    self.target_class = (best.get("class", "person") if isinstance(best, dict)
-                                                         else getattr(best, "cls", "person"))
-
-                                    # 2) 포즈 업데이트 (어깨/척추 EMA/Ref)
-                                    if self.USE_POSE and hasattr(self.inference_engine, 'pose_on_bbox'):
-                                        try:
-                                            pose = self.inference_engine.pose_on_bbox(frame, self.target_bbox)  # BGR OK
-                                        except Exception as e:
-                                            self.log("WARNING", f"pose_on_bbox error: {e}")
-                                            pose = None
-                                    else:
-                                        pose = None
-
-                                    (self.pose_quality,
-                                     self.pose_should_ref, self.pose_should_ema,
-                                     self.pose_spine_ref,  self.pose_spine_ema) = update_pose_stats(
-                                         pose, self.pose_quality,
-                                         self.pose_should_ref, self.pose_should_ema,
-                                         self.pose_spine_ref,  self.pose_spine_ema,
-                                         alpha=0.25
-                                     )
-
-                                    # 3) 플로우 업데이트(척추 스트립 기반)
-                                    if self.USE_FLOW:
-                                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                        if self.prev_gray is not None:
-                                            fv = compute_flow_from_spine_strip(self.prev_gray, gray, self.target_bbox, frame.shape)
-                                            if fv is not None:
-                                                self.last_flow_vec = fv
-                                        self.prev_gray = gray
-
-                                    # 4) 뎁스(표시/브레이크)
-                                    self._obstacle_brake = False
-                                    self._last_depth_mode_spine = None
-                                    if self.USE_DEPTH_VIEW and depth_map is not None:
-                                        mode, brake = spine_depth_mode_and_brake(depth_map, self.target_bbox, use_brake=self.USE_OBS_BRAKE)
-                                        self._last_depth_mode_spine = mode
-                                        self._obstacle_brake = brake
-                                        self.current_depth_map = depth_map
-
+                    if target_bbox is not None:
+                        self._miss_cnt = 0
+                        self.target_bbox = target_bbox
+                        self.target_class = target_class
+                    else:
+                        if self.is_tracking:
+                            self._miss_cnt += 1
+                            if self._miss_cnt >= self._miss_hold:
+                                if self.target_bbox is not None:
+                                    self.log("WARNING", "⚠️ Thief not found; holding position")
+                                self.target_bbox = None
                         else:
-                            # 매칭 실패 → 타깃 해제(트래킹 쓰레드가 검색)
-                            if self.target_bbox is not None:
-                                self.log("WARNING", "⚠️ Thief not found under gate; holding position")
                             self.target_bbox = None
 
-                # ── 오버레이 (RGB 기대)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_with_detections = draw_detections_on_frame(frame_rgb, detections)
+                # ── Pose (토글 ON + bbox 존재 시에만)
+                if self.USE_POSE and use_pose and (self.target_bbox is not None):
+                    try:
+                        (self.pose_quality,
+                        self.pose_should_ref, self.pose_should_ema,
+                        self.pose_spine_ref,  self.pose_spine_ema) = update_pose_stats(
+                            pose_obj, self.pose_quality,
+                            self.pose_should_ref, self.pose_should_ema,
+                            self.pose_spine_ref,  self.pose_spine_ema,
+                            alpha=0.25
+                        )
+                    except Exception as e:
+                        self.log("DEBUG", f"[POSE] update error: {e}")
+                        traceback.print_exc()
 
-                # 중앙 십자 & 텍스트
+                # ── Optical Flow (토글 ON + bbox 존재 시에만)
+                if self.USE_FLOW and use_flow and (self.target_bbox is not None):
+                    gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if self.prev_gray is not None:
+                        fv = compute_flow_from_spine_strip(self.prev_gray, gray_now, tuple(self.target_bbox), frame.shape)
+                        if fv is not None:
+                            with self.lock:
+                                self.last_flow_vec = fv
+                    with self.lock:
+                        self.prev_gray = gray_now
+                else:
+                    with self.lock:
+                        self.prev_gray = None
+                        self.last_flow_vec = (0.0, 0.0)
+
+                # ── Depth (토글 ON + bbox + depth_map 존재 시에만)
+                depth_mode_local = None
+                obstacle_brake_local = False
+                if self.USE_DEPTH_VIEW and use_depth and (self.target_bbox is not None) and (depth_map is not None):
+                    try:
+                        depth_mode_local, obstacle_brake_local = spine_depth_mode_and_brake(
+                            depth_map, tuple(self.target_bbox), use_brake=self.USE_OBS_BRAKE
+                        )
+                    except Exception as e:
+                        self.log("WARNING", f"Depth compute error: {e}")
+                        traceback.print_exc()
+
+                with self.lock:
+                    if self.USE_DEPTH_VIEW and use_depth and (self.target_bbox is not None) and (depth_map is not None):
+                        self._last_depth_mode_spine = depth_mode_local
+                        self._obstacle_brake = obstacle_brake_local
+                        self.current_depth_map = depth_map
+                    else:
+                        self._last_depth_mode_spine = None
+                        self._obstacle_brake = False
+                        self.current_depth_map = None
+
+                # ── 오버레이
+                alpha = alpha_from_engine if isinstance(alpha_from_engine, (int, float)) else feature_alpha(feat, 0.5)
+                frame_with_detections = draw_detections_on_frame(frame, detections)
+
+                if use_depth and depth_map is not None and alpha > 0:
+                    try:
+                        depth_vis_bgr = depth_to_vis(depth_map)
+                        frame_with_detections = cv2.addWeighted(frame_with_detections, 1.0 - alpha, depth_vis_bgr, alpha, 0)
+                        self.log("DEBUG", f"overlay depth alpha={alpha:.2f}, dm={depth_map.shape}")
+                    except Exception as e:
+                        self.log("WARNING", f"Depth overlay error: {e}")
+                        traceback.print_exc()
+
+                if use_pose and (self.target_bbox is not None):
+                    frame_with_detections = overlay_pose_points_min9(
+                        frame_with_detections,
+                        self.pose_should_ema, self.pose_spine_ema, alpha,
+                        pose_kpts=(pose_obj if (self.target_bbox is not None) else None),
+                        conf_thresh=60,
+                        draw_indices=False,     # 필요하면 True
+                        draw_midpoints=True
+                    )
+
+                if use_flow and (self.target_bbox is not None) and (self.last_flow_vec is not None):
+                    frame_with_detections = overlay_flow_arrow(
+                        frame_with_detections, self.target_bbox, self.last_flow_vec, alpha
+                    )
+
+                # ── 중앙 십자 & 텍스트
                 h, w = frame_with_detections.shape[:2]
                 cx, cy = w // 2, h // 2
                 cv2.line(frame_with_detections, (cx - 30, cy), (cx + 30, cy), (255, 255, 255), 2)
@@ -402,13 +480,13 @@ class TelloWebServer:
 
                 try:
                     txt = []
-                    if self._last_depth_mode_spine is not None:
+                    if use_depth and self._last_depth_mode_spine is not None:
                         txt.append(f"spine-depth(mode): {self._last_depth_mode_spine:.3f}")
-                    if self.USE_FLOW and self.last_flow_vec is not None:
+                    if self.USE_FLOW and use_flow and self.last_flow_vec is not None:
                         vx, vy = self.last_flow_vec; txt.append(f"flow(vx,vy): ({vx:.1f},{vy:.1f})")
-                    if self.USE_POSE:
+                    if self.USE_POSE and use_pose:
                         txt.append(f"poseQ: {self.pose_quality:.2f}")
-                    if getattr(self, "_obstacle_brake", False):
+                    if use_depth and getattr(self, "_obstacle_brake", False):
                         txt.append("BRAKE")
                     if txt:
                         cv2.putText(frame_with_detections, " | ".join(txt), (10, 30),
@@ -416,7 +494,7 @@ class TelloWebServer:
                 except:
                     pass
 
-                # 배터리/고도
+                # ── 배터리/고도
                 try:
                     old_battery = self.battery
                     self.battery = self.tello.get_battery()
@@ -428,12 +506,12 @@ class TelloWebServer:
                 except:
                     pass
 
-                # 프레임 저장
+                # ── 프레임 저장
                 with self.lock:
                     self.current_frame = frame_with_detections
                     self.current_frame_updated = True
 
-                # UI 업데이트
+                # ── UI 업데이트
                 self.socketio.emit('detections_update', {
                     'detections': detections,
                     'battery': self.battery,
@@ -476,29 +554,18 @@ class TelloWebServer:
     def start_tracking(self):
         if self.is_tracking:
             self.log("WARNING", "Already tracking. Ignoring start request.")
-            self._emit_tracking_status(True, target_identity_id=self.target_identity_id)
             return True
-
         iid = None if self.target_identity_id is None else int(self.target_identity_id)
-        bbox = self.target_bbox
 
-        if iid is not None:
+        if iid is not None and iid > 0:
             if self.inference_engine.enter_thief_mode(iid):
+                self._miss_cnt = 0        # ⬅️ 시작 시 리셋
                 self.is_tracking = True
                 self._spawn_tracking_thread()
-                self._emit_tracking_status(True, target_identity_id=iid)
                 self.log("SUCCESS", f"🎯 Started tracking: ID {iid} ({self.target_class})")
                 return True
-            self.log("WARNING", f"enter_thief_mode failed for ID {iid}; trying bbox fallback...")
+            self.log("WARNING", f"enter_thief_mode failed for ID {iid}.")
 
-        if bbox is not None and self.inference_engine.lock_by_bbox(bbox):
-            self.is_tracking = True
-            self._spawn_tracking_thread()
-            self._emit_tracking_status(True, target_identity_id=None)
-            self.log("SUCCESS", "🎯 Started tracking by bbox-lock (ID pending)")
-            return True
-
-        self._emit_tracking_status(False, message="lock_by_identity and bbox fallback both failed")
         self.log("ERROR", "Failed to start tracking")
         return False
 
@@ -533,7 +600,7 @@ class TelloWebServer:
         if frame is None:
             return None
         try:
-            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            ok, buf = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not ok:
                 with self.lock:
                     self.current_frame_updated = True
@@ -615,6 +682,7 @@ class TelloWebServer:
         try:
             if hasattr(self.inference_engine, "exit_thief_mode"):
                 self.inference_engine.exit_thief_mode()
+                self._miss_cnt = 0                # ⬅️ 종료 시 리셋
         except Exception as e:
             self.log("WARNING", f"exit_thief_mode error: {e}")
 
@@ -622,6 +690,11 @@ class TelloWebServer:
         self.target_identity_id = None
         self.target_bbox = None
         self.target_class = None
+        # 보조 상태 리셋
+        self.prev_gray = None
+        self.last_flow_vec = (0.0, 0.0)
+        self._obstacle_brake = False
+        self._last_depth_mode_spine = None
 
         try:
             if self.tello:
@@ -629,5 +702,4 @@ class TelloWebServer:
         except Exception:
             pass
 
-        self._emit_tracking_status(False, message="Back to normal mode")
         self.log("INFO", "Stopped tracking and returned to normal mode.")
