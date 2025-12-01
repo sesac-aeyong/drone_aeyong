@@ -26,7 +26,7 @@ class BoTSORT: # 이전 프레임 상태(Track: pred, last_emb) ↔ 현재 프�
                  max_kf_life=30,          # 관측 없이 예측만 허용할 최대 프레임 수
                  min_match_frames=3,      # 연속 매칭 몇 프레임부터 “진짜 트랙”으로 인정할지
                  iou_gate=0.1,            # IoU 기준 최소값
-                 cos_gate=0.3,            # ReID 거리 기준 최대값 (None 이면 사용 안 함)
+                 cos_gate=0.2,            # ReID 거리 기준 최대값 (None 이면 사용 안 함)
                  cos_weight=2.0,          # cost에 들어가는 ReID 거리 가중치
                  high_yolo_thresh=0.7,    # 새 Track 생성에 쓸 최소 YOLO score
                  low_yolo_thresh=0.5):    # 기존 Track 연결에만 쓸 YOLO score 하한
@@ -305,13 +305,13 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
     갤러리는 한 번 신중하게 저장 후 업데이트 금지
     """
     def __init__(self, botsort_tracker,
-        gal_match_cos_dist=0.3,          # 기존 ID 재사용 한계 
+        gal_match_cos_dist=0.15,          # 기존 ID 재사용 한계 
         max_memory=20,                   # 전체 identity 갯수 상한
-        max_gal_emb_per_id=10,           # ID 하나당 gal_emb 최대 개수
+        max_gal_emb_per_id=20,           # ID 하나당 gal_emb 최대 개수
         conf_thresh=0.7,                 # YOLO score 이 이상일 때만 prototype 후보로 인정
         iou_no_overlap=0.1,              # 다른 Track과 IoU가 이 값 이하일 때만 prototype 저장 허용
-        gal_update_min_cos_dist=0.15,    # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
-        gal_update_max_cos_dist=0.25,):  # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
+        gal_update_min_cos_dist=0.10,    # 기존 gal_emb들과의 최소 거리 < 이면 너무 비슷 → 안 넣음
+        gal_update_max_cos_dist=0.20,):  # 기존 gal_emb들과의 최소 거리 > 이면 너무 다름 → 안 넣음
     
         # 단기 추적기 (BoTSORT 인스턴스)
         self.tracker = botsort_tracker
@@ -522,18 +522,18 @@ class LongTermBoTSORT: # BoTSORT가 이어놓은 각 track의 last_emb을 갤러
                 else:
                     track.identity_id = None
             
-            # 디버그용
-            gid = track.identity_id
-            info = self.gallery.get(gid, {"gal_embs": []})
-            gal_emb_list = info.get("gal_embs", [])
-            min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if (gal_emb_list and last_emb is not None) else 1.0
-            print(
-                f"[LT-FRAME] track_id={track.track_id:3d} "
-                f"identity_id={(gid if gid is not None else -1):3d} "
-                f"conf={track.score:.2f} "
-                f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
-                f"min_cos_dist={min_cos_dist:.3f}"
-            )
+            # # 디버그용
+            # gid = track.identity_id
+            # info = self.gallery.get(gid, {"gal_embs": []})
+            # gal_emb_list = info.get("gal_embs", [])
+            # min_cos_dist = min_cos_dist_to_list(last_emb, gal_emb_list) if (gal_emb_list and last_emb is not None) else 1.0
+            # print(
+            #     f"[LT-FRAME] track_id={track.track_id:3d} "
+            #     f"identity_id={(gid if gid is not None else -1):3d} "
+            #     f"conf={track.score:.2f} "
+            #     f"gal_size={len(gal_emb_list)}/{self.max_gal_emb_per_id} "
+            #     f"min_cos_dist={min_cos_dist:.3f}"
+            # )
 
         # 4) 메모리 관리 – 이번 프레임에 쓰이지 않은 오래된 identity 일부 제거 (선택)
         if len(self.gallery) > self.max_memory:
@@ -571,12 +571,12 @@ class ThiefTracker:
                  iou_gate=0.1,           # 예측 bbox vs 현재 bbox 최소 IoU               
                  cos_weight=2.0,         # cost에 들어가는 cos_dist(thief) 가중치
                  
-                 thief_cos_dist=0.2,              # 도둑 갤러리와의 최대 코사인 거리 (2차 필터링)
+                 thief_cos_dist=0.15,              # 도둑 갤러리와의 최대 코사인 거리 (2차 필터링)
                  max_memory=100,                  # 도둑 갤러리에 저장할 최대 임베딩 수
-                 conf_thresh=0.5,                 # YOLO score 이 이상인 dets만 도둑 후보로 인정 (1차 필터링)
+                 conf_thresh=0.7,                 # YOLO score 이 이상인 dets만 도둑 후보로 인정 (1차 필터링)
                  iou_no_overlap=0.1,              # 다른 yolo bbox와 IoU가 이 값 이하일 때만 저장
                  gal_update_min_cos_dist=0.10,    # 너무 비슷하면 추가 안 함 (중복 방지)
-                 gal_update_max_cos_dist=0.30,):  # 너무 다르면 추가 안 함 (오인 방지)
+                 gal_update_max_cos_dist=0.20,):  # 너무 다르면 추가 안 함 (오인 방지)
         
         """
         Parameters
