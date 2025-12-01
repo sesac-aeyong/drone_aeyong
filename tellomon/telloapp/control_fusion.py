@@ -67,76 +67,59 @@ def overlay_blend(base_bgr: np.ndarray, layer_bgr: np.ndarray, alpha: float) -> 
     return cv2.addWeighted(base_bgr, 1.0 - alpha, layer_bgr, alpha, 0)
 
 
-_LIMBS = [
-    (0, 1), (0, 2),       # Nose → eyes
-    (1, 3), (2, 4),       # Eyes → ears
-    (0, 5), (0, 6),       # Nose → shoulders
-    (5, 7), (7, 9),       # Left arm
-    (6, 8), (8, 10),      # Right arm
-    (5, 11), (6, 12),     # Shoulders → hips
-    (11, 12),             # Hip line
-    (11, 13), (13, 15),   # Left leg
-    (12, 14), (14, 16)    # Right leg
-]
-
 def overlay_pose_points(
-    img,
-    should_ema=None, spine_ema=None, alpha: float = 0.0,
-    pose_kpts=None,            # [[x,y,conf_uint8], ...] length=17
-    bbox=None,                 # (호출 시그니처 호환용, 사용 안 함)
-    conf_thresh: int = 60,     # 당신이 쓰던 기준
-    draw_indices: bool = True  # 인덱스 숫자도 표시할지
+    frame_vis,
+    should_ema=None, spine_ema=None, alpha=0.0,
+    pose_kpts=None,
+    bbox=None
 ):
     """
-    당신이 '됐었다'고 한 그 방식 그대로 17포인트와 연결선만 그립니다.
-    - 좌표는 프레임 픽셀 좌표라고 가정 (이미 점 찍으면 맞다고 하셨음)
-    - confidence는 uint8/정수(0~255) 가정, conf_thresh(기본 60)보다 클 때만 사용
+    ★★ 네가 준 코드 100% 그대로 사용 ★★
+    - keypoints = pose_kpts
+    - limbs = 네가 올린 그대로
+    - conf_thresh = 60
     """
+
     if pose_kpts is None or len(pose_kpts) < 17:
-        return img
+        return frame_vis
 
-    h, w = img.shape[:2]
-    # 1) 포인트 찍기
-    for i, kp in enumerate(pose_kpts):
-        if not kp or len(kp) < 3:
-            continue
-        x, y, conf = kp[0], kp[1], kp[2]
+    keypoints = pose_kpts
+    conf_thresh = 60
+
+    limbs = [
+        (0, 1), (0, 2),       # Nose → eyes
+        (1, 3), (2, 4),       # Eyes → ears
+        (0, 5), (0, 6),       # Nose → shoulders
+        (5, 7), (7, 9),       # Left arm
+        (6, 8), (8, 10),      # Right arm
+        (5, 11), (6, 12),     # Shoulders → hips
+        (11, 12),             # Hip line
+        (11, 13), (13, 15),   # Left leg
+        (12, 14), (14, 16)    # Right leg
+    ]
+
+    # ---- Draw keypoints ----
+    for i, (x, y, conf) in enumerate(keypoints):
         try:
-            if int(conf) <= conf_thresh:
-                continue
-        except Exception:
-            continue
+            if conf > conf_thresh:
+                cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+                cv2.putText(frame_vis, str(i), (int(x)+2, int(y)+2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,255,255), 1)
+        except:
+            pass
 
-        xi = int(max(0, min(w - 1, int(x))))
-        yi = int(max(0, min(h - 1, int(y))))
-
-        cv2.circle(img, (xi, yi), 3, (0, 255, 0), -1)
-        if draw_indices:
-            cv2.putText(img, str(i), (xi + 2, yi + 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
-
-    # 2) 연결선 그리기
-    for a, b in _LIMBS:
-        if a >= len(pose_kpts) or b >= len(pose_kpts):
-            continue
-        kpa = pose_kpts[a]
-        kpb = pose_kpts[b]
-        if (not kpa or len(kpa) < 3 or not kpb or len(kpb) < 3):
-            continue
+    # ---- Draw limbs ----
+    for a, b in limbs:
         try:
-            if int(kpa[2]) <= conf_thresh or int(kpb[2]) <= conf_thresh:
-                continue
-        except Exception:
-            continue
+            if keypoints[a][2] > conf_thresh and keypoints[b][2] > conf_thresh:
+                pt1 = (int(keypoints[a][0]), int(keypoints[a][1]))
+                pt2 = (int(keypoints[b][0]), int(keypoints[b][1]))
+                cv2.line(frame_vis, pt1, pt2, (255, 0, 0), 2)
+        except:
+            pass
 
-        x1 = int(max(0, min(w - 1, int(kpa[0]))))
-        y1 = int(max(0, min(h - 1, int(kpa[1]))))
-        x2 = int(max(0, min(w - 1, int(kpb[0]))))
-        y2 = int(max(0, min(h - 1, int(kpb[1]))))
+    return frame_vis
 
-        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
-    return img
 
 def overlay_flow_arrow(base_bgr: np.ndarray,
                        bbox: Optional[Tuple[int,int,int,int]],
